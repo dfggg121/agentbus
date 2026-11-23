@@ -1,0 +1,53 @@
+{
+  "name": "agentbus-mcp",
+  "version": "0.1.0",
+  "description": "Pointer-based handoff bus for multi-agent workflows: pass references + SHA-256 instead of copying payloads. MCP stdio server + CLI, zero dependencies.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "bin": {
+    "agentbus": "./bin/bus.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "test/accept.mjs",
+    "docs/",
+    "README.md",
+    "README.zh-CN.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "SECURITY.md",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "test": "node test/accept.mjs",
+    "test:compat": "node test/accept.mjs",
+    "setup": "node bin/bus.js setup",
+    "doctor": "node bin/bus.js doctor"
+  },
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "multi-agent",
+    "agent-orchestration",
+    "agent-handoff",
+    "codex",
+    "claude-code",
+    "gemini-cli",
+    "opencode",
+    "cursor",
+    "sqlite",
+    "zero-dependency"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/USERNAME/agentbus.git"
+  },
+  "bugs": {
+    "url": "https://github.com/USERNAME/agentbus/issues"
+  },
+  "homepage": "https://github.com/USERNAME/agentbus#readme"
+}

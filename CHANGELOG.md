@@ -1,0 +1,32 @@
+# Changelog
+
+All notable changes to this project are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
+
+## [Unreleased]
+
+## [0.1.0] — 2026-11-23
+
+First public release.
+
+### Added
+
+- Pointer-based task envelope (`agentbus/task@1`): goal, refs (`uri` + `sha256` + `bytes`), acceptance rules.
+- Artifact registry that stores metadata only — registering a 4 MB file adds ~48 KB to the database.
+- SQLite storage via Node's built-in `node:sqlite`, WAL mode, `BEGIN IMMEDIATE` transactions.
+- Lease-based claiming with heartbeat, lazy expiry, and `attempt`/`max_attempts` handling.
+- Idempotent task creation via `(from_agent, idempotency_key)` unique index.
+- Acceptance checks: `json`, `must_contain`, `must_not_contain`, `min_bytes`, `max_bytes`, `fields`.
+- MCP stdio server with nine tools: `bus_register`, `bus_task_create`, `bus_task_claim`, `bus_task_heartbeat`, `bus_ref_read`, `bus_task_complete`, `bus_task_fail`, `bus_task_list`, `bus_verify`.
+- Pointer semantics in `bus_ref_read`: inline up to 64 KB, `resource_link` above it.
+- CLI with JSON-only stdout and exit codes `0` / `1` / `2`.
+- `agentbus setup` auto-configures Codex, Claude Code, Gemini CLI, Antigravity, Cursor, OpenCode, and Claude Desktop (with timestamped backups).
+- `agentbus doctor` and `agentbus clients`.
+- Path allowlist enforced through `realpath`, blocking symlink and junction escapes.
+- Self-contained acceptance suite: 31 assertions (32 with optional legacy fixtures), no framework, no shell pipes.
+- GitHub Actions matrix across Linux/macOS/Windows and Node 22/24/26.
+
+### Known limitations
+
+- Same-machine only (`file://` references).
+- CLI messages are Chinese; English localization planned.
+- No background daemon; lease expiry is reclaimed lazily.

@@ -1,0 +1,11 @@
+{
+  "root": "var",
+  "allowed_roots": [
+    "..",
+    "var"
+  ],
+  "lease_ttl_s": 900,
+  "max_attempts": 3,
+  "max_ref_bytes": 2147483648,
+  "ref_read_inline_max": 65536
+}

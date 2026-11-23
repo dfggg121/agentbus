@@ -1,0 +1,453 @@
+// agentbus: MCP stdio (and optional loopback HTTP) JSON-RPC 2.0 server (§4)
+// Zero third-party dependencies. Exactly 9 tools; stdout strictly JSON-RPC lines only.
+
+import http from 'node:http';
+import readline from 'node:readline';
+
+import { registerArtifact } from './store.js';
+import {
+  createTask,
+  claimTask,
+  heartbeatTask,
+  readTaskRef,
+  completeTask,
+  failTask,
+  listTasks,
+  verifyTasks,
+} from './tasks.js';
+
+const SUPPORTED_PROTOCOL_VERSIONS = new Set(['2025-06-18', '2025-03-26']);
+const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
+
+export const MCP_TOOLS = [
+  {
+    name: 'bus_register',
+    description: '登记本地文件指针（只写地址与 sha256，不复制正文）。同一文件重复登记返回同一行。',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['path'],
+      properties: {
+        path: { type: 'string', description: '本地绝对路径或 file:// URI（必须在 allowed_roots 内）' },
+        name: { type: 'string', description: '展示名，默认取文件名' },
+        by: { type: 'string', description: '登记方 agent 名' },
+      },
+    },
+  },
+  {
+    name: 'bus_task_create',
+    description: '创建指针式任务信封（仅引用已登记 sha256，支持幂等键）。',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['to', 'goal', 'refs'],
+      properties: {
+        to: { type: 'string', description: '目标 agent 名，或 "*" 表示任意 agent 可领' },
+        goal: { type: 'string', description: '任务目标说明' },
+        refs: {
+          type: 'array',
+          description: '已登记资料引用列表（元素为 {sha256, note?} 或 "<sha256>" 字符串）',
+          items: {
+            oneOf: [
+              { type: 'string' },
+              {
+                type: 'object',
+                required: ['sha256'],
+                properties: {
+                  sha256: { type: 'string' },
+                  note: { type: 'string' },
+                },
+              },
+            ],
+          },
+        },
+        constraints: { type: 'array', items: { type: 'string' }, description: '约束列表' },
+        acceptance: { type: 'object', description: '验收条款：json / must_contain / must_not_contain / min_bytes / max_bytes / fields' },
+        from: { type: 'string', description: '发起方 agent 名' },
+        idempotency_key: { type: 'string', description: '幂等键，同 from 重复提交返回同一任务 id' },
+      },
+    },
+  },
+  {
+    name: 'bus_task_claim',
+    description: '原子领取 open 任务并获得租约令牌 lease_token。',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['id', 'by'],
+      properties: {
+        id: { type: 'string', description: '任务 id 或唯一前缀' },
+        by: { type: 'string', description: '领取方 agent 名' },
+        ttl_s: { type: 'number', description: '租约 TTL（秒），默认 900' },
+      },
+    },
+  },
+  {
+    name: 'bus_task_heartbeat',
+    description: '凭有效 lease_token 延展任务租约有效期。',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['id', 'by', 'lease_token'],
+      properties: {
+        id: { type: 'string', description: '任务 id 或唯一前缀' },
+        by: { type: 'string', description: '领取方 agent 名' },
+        lease_token: { type: 'string', description: 'claim 返回的租约令牌' },
+        ttl_s: { type: 'number', description: '延展 TTL（秒），默认 900' },
+      },
+    },
+  },
+  {
+    name: 'bus_ref_read',
+    description: '校验引用 sha256 后读取资料；超过 max_bytes（默认 64KB）只返回 resource_link 指针，不返回正文。',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['id', 'name'],
+      properties: {
+        id: { type: 'string', description: '任务 id 或唯一前缀' },
+        name: { type: 'string', description: '引用展示名' },
+        max_bytes: { type: 'number', description: '内联上限字节数，默认 65536' },
+        encoding: { type: 'string', enum: ['utf8', 'base64'], description: '期望返回编码' },
+      },
+    },
+  },
+  {
+    name: 'bus_task_complete',
+    description: '核验租约、全部引用哈希与验收条款后交付任务结果，置状态为 done。',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['id', 'by', 'lease_token', 'result_path'],
+      properties: {
+        id: { type: 'string', description: '任务 id 或唯一前缀' },
+        by: { type: 'string', description: '领取方 agent 名' },
+        lease_token: { type: 'string', description: 'claim 返回的租约令牌' },
+        result_path: { type: 'string', description: '结果文件绝对路径或 file:// URI' },
+        fields: { type: 'object', description: '额外顶层 JSON 字段严格等值校验' },
+      },
+    },
+  },
+  {
+    name: 'bus_task_fail',
+    description: '凭有效租约将任务标记为终态 failed 并记录原因。',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['id', 'by', 'lease_token', 'reason'],
+      properties: {
+        id: { type: 'string', description: '任务 id 或唯一前缀' },
+        by: { type: 'string', description: '领取方 agent 名' },
+        lease_token: { type: 'string', description: 'claim 返回的租约令牌' },
+        reason: { type: 'string', description: '失败原因' },
+      },
+    },
+  },
+  {
+    name: 'bus_task_list',
+    description: '列出任务摘要列表（自动回收已过期租约）。',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        state: { type: 'string', enum: ['open', 'claimed', 'done', 'failed'], description: '按状态过滤' },
+        to: { type: 'string', description: '按目标 agent 过滤' },
+        limit: { type: 'number', description: '返回条数上限，默认 50，最大 500' },
+      },
+    },
+  },
+  {
+    name: 'bus_verify',
+    description: '校验单条或全量任务的引用与结果文件完整性；发现漂移或缺失时 isError=true。',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        id: { type: 'string', description: '任务 id 或前缀；省略则全量校验' },
+      },
+    },
+  },
+];
+
+function toolSuccess(structuredContent) {
+  return {
+    content: [{ type: 'text', text: JSON.stringify(structuredContent) }],
+    structuredContent,
+  };
+}
+
+function toolError(err) {
+  const msg = String(err?.message || err || 'unknown error');
+  return {
+    content: [{ type: 'text', text: msg }],
+    isError: true,
+    structuredContent: { error: msg },
+  };
+}
+
+function invokeTool(bus, name, args = {}) {
+  const a = args && typeof args === 'object' ? args : {};
+  try {
+    switch (name) {
+      case 'bus_register': {
+        const res = registerArtifact(bus, {
+          filePath: a.path,
+          name: a.name || null,
+          by: a.by || 'mcp',
+        });
+        return toolSuccess({
+          sha256: res.sha256,
+          uri: res.uri,
+          bytes: res.bytes,
+          name: res.name,
+          reused: res.reused,
+        });
+      }
+
+      case 'bus_task_create': {
+        const res = createTask(bus, {
+          to: a.to,
+          goal: a.goal,
+          refs: a.refs,
+          constraints: a.constraints || [],
+          acceptance: a.acceptance || {},
+          from: a.from || 'mcp',
+          idempotency_key: a.idempotency_key || null,
+        });
+        return toolSuccess(res);
+      }
+
+      case 'bus_task_claim': {
+        const res = claimTask(bus, {
+          id: a.id,
+          by: a.by,
+          ttl_s: a.ttl_s !== undefined ? Number(a.ttl_s) : null,
+        });
+        return toolSuccess({
+          id: res.id,
+          state: res.state,
+          lease_token: res.lease_token,
+          expires_at: res.expires_at,
+          lease_expires_at: res.lease_expires_at,
+        });
+      }
+
+      case 'bus_task_heartbeat': {
+        const res = heartbeatTask(bus, {
+          id: a.id,
+          by: a.by,
+          lease_token: a.lease_token,
+          ttl_s: a.ttl_s !== undefined ? Number(a.ttl_s) : null,
+        });
+        return toolSuccess({ expires_at: res.expires_at, lease_expires_at: res.lease_expires_at });
+      }
+
+      case 'bus_ref_read': {
+        const res = readTaskRef(bus, {
+          id: a.id,
+          name: a.name,
+          max_bytes: a.max_bytes !== undefined ? Number(a.max_bytes) : null,
+          encoding: a.encoding || null,
+        });
+        return {
+          content: res.content,
+          structuredContent: res.structuredContent,
+        };
+      }
+
+      case 'bus_task_complete': {
+        const res = completeTask(bus, {
+          id: a.id,
+          by: a.by,
+          lease_token: a.lease_token,
+          result_path: a.result_path,
+          fields: a.fields || null,
+        });
+        return toolSuccess(res);
+      }
+
+      case 'bus_task_fail': {
+        const res = failTask(bus, {
+          id: a.id,
+          by: a.by,
+          lease_token: a.lease_token,
+          reason: a.reason,
+        });
+        return toolSuccess({ state: res.state, id: res.id, reason: res.reason });
+      }
+
+      case 'bus_task_list': {
+        const rows = listTasks(bus, {
+          state: a.state || null,
+          to: a.to || null,
+          limit: a.limit !== undefined ? Number(a.limit) : 50,
+        });
+        return {
+          content: [{ type: 'text', text: JSON.stringify(rows) }],
+          structuredContent: rows,
+        };
+      }
+
+      case 'bus_verify': {
+        const res = verifyTasks(bus, { id: a.id || null });
+        return {
+          content: [{ type: 'text', text: JSON.stringify(res) }],
+          isError: res.bad > 0 ? true : undefined,
+          structuredContent: res,
+        };
+      }
+
+      default:
+        return toolError(new Error(`未知工具: ${name}`));
+    }
+  } catch (err) {
+    return toolError(err);
+  }
+}
+
+export function handleJsonRpcMessage(bus, msg) {
+  if (!msg || typeof msg !== 'object') {
+    return { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid Request' } };
+  }
+
+  const hasId = Object.prototype.hasOwnProperty.call(msg, 'id') && msg.id !== undefined;
+  const method = msg.method;
+
+  // Notifications (no id) -> no response
+  if (!hasId) {
+    return null;
+  }
+
+  switch (method) {
+    case 'initialize': {
+      const clientVer = msg.params?.protocolVersion;
+      const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.has(clientVer)
+        ? clientVer
+        : DEFAULT_PROTOCOL_VERSION;
+      return {
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: {
+          protocolVersion,
+          serverInfo: { name: 'agentbus', version: '1.0.0' },
+          capabilities: { tools: { listChanged: false } },
+        },
+      };
+    }
+
+    case 'ping':
+      return { jsonrpc: '2.0', id: msg.id, result: {} };
+
+    case 'tools/list':
+      return {
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: { tools: MCP_TOOLS },
+      };
+
+    case 'tools/call': {
+      const toolName = msg.params?.name;
+      const toolArgs = msg.params?.arguments || {};
+      if (!toolName || !MCP_TOOLS.some((t) => t.name === toolName)) {
+        return {
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: toolError(new Error(`未知工具: ${toolName || ''}`)),
+        };
+      }
+      return {
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: invokeTool(bus, toolName, toolArgs),
+      };
+    }
+
+    default:
+      return {
+        jsonrpc: '2.0',
+        id: msg.id,
+        error: { code: -32601, message: 'Method not found' },
+      };
+  }
+}
+
+export function startMcpStdio(bus) {
+  return new Promise((resolve) => {
+    let closed = false;
+    const shutdown = () => {
+      if (closed) return;
+      closed = true;
+      bus.close();
+      resolve();
+    };
+
+    const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+    rl.on('line', (line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      let msg;
+      try {
+        msg = JSON.parse(trimmed);
+      } catch {
+        process.stdout.write(
+          JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }) + '\n'
+        );
+        return;
+      }
+      const resp = handleJsonRpcMessage(bus, msg);
+      if (resp !== null) {
+        process.stdout.write(JSON.stringify(resp) + '\n');
+      }
+    });
+
+    rl.on('close', shutdown);
+    process.on('SIGINT', () => { shutdown(); process.exit(0); });
+    process.on('SIGTERM', () => { shutdown(); process.exit(0); });
+  });
+}
+
+/**
+ * Optional explicit loopback-only HTTP JSON-RPC endpoint (--http 127.0.0.1:<port>).
+ * Never started by default (§1).
+ */
+export function startMcpHttp(bus, bindSpec) {
+  const m = /^127\.0\.0\.1:(\d+)$/.exec(String(bindSpec || '').trim());
+  if (!m) {
+    throw Object.assign(new Error('--http 仅允许绑定 127.0.0.1:<port>'), { code: 1 });
+  }
+  const port = Number(m[1]);
+  const server = http.createServer((req, res) => {
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Method Not Allowed' }));
+      return;
+    }
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 1024 * 1024) req.destroy(); });
+    req.on('end', () => {
+      let msg;
+      try {
+        msg = JSON.parse(body);
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }));
+        return;
+      }
+      const resp = handleJsonRpcMessage(bus, msg);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(resp ? JSON.stringify(resp) : '');
+    });
+  });
+
+  return new Promise((resolve, reject) => {
+    server.on('error', (e) => { bus.close(); reject(e); });
+    server.listen(port, '127.0.0.1', () => {
+      process.stderr.write(`agentbus MCP HTTP listening on http://127.0.0.1:${port}\n`);
+    });
+    const stop = () => {
+      server.close(() => { bus.close(); resolve(); process.exit(0); });
+    };
+    process.on('SIGINT', stop);
+    process.on('SIGTERM', stop);
+  });
+}
