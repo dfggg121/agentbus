@@ -147,16 +147,17 @@ function resolveAdapter(to, ctx) {
   return build(ctx);
 }
 
-function buildPrompt(id, goal, to) {
+function buildPrompt(id, goal, to, cwd) {
   return [
     `你是被主动调用的执行方。任务 id=${id}。`,
     `目标：${goal}`,
+    cwd ? `工作目录：${cwd}（所有产出必须写在这个目录下，不要到别的盘或用户目录里探索）` : null,
     `步骤：1) bus_task_claim 领取，by 必须写 "${to}"；`,
     '2) bus_ref_read 逐个读 refs，返回 resource_link 的按 uri 自己读文件；',
     '3) 按需求产出结果文件；',
     '4) bus_task_complete 交回，fields 用你实际算出的值。',
     '不要跳过 complete；完不成用 bus_task_fail 说明原因。',
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 }
 
 function winQuote(s) {
@@ -274,7 +275,7 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 700, 
   for (const [k, v] of Object.entries(env)) process.env[k] = v;
   const session = thread ? getThread(bus, task.to, thread) : null;
   const spec = resolveAdapter(task.to, {
-    prompt: buildPrompt(task.id, task.goal, task.to),
+    prompt: buildPrompt(task.id, task.goal, task.to, workdir),
     cwd: workdir,
     busRoot: bus.config.rootDir,
     session,
