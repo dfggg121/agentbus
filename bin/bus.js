@@ -19,6 +19,7 @@ import {
 import { startMcpStdio, startMcpHttp } from '../src/mcp.js';
 import { setupClients, doctor, listClients, defaultRoot } from '../src/setup.js';
 import { dispatchTask, dispatchEnabled } from '../src/dispatch.js';
+import { exportAgySession, defaultAgySessionPath } from '../src/agy.js';
 
 const VERSION = '0.1.0';
 
@@ -101,6 +102,7 @@ function printHelp() {
       'verify [--task <id>]',
       'list [--state <state>] [--to <agent>] [--limit <n>]',
       'dispatch <id> [--cwd <dir>] [--wait <seconds>] [--thread <name>] [--allow-dispatch]',
+      'agy-session [--out <file>]   # 在 Antigravity 集成终端里运行，导出会话地址与令牌',
       'mcp [--root <dir>] [--http 127.0.0.1:<port>]',
     ],
     exit_codes: { '0': 'success', '1': 'validation/arg/drift error', '2': 'state/lease disallowed' },
@@ -261,6 +263,12 @@ async function main() {
           lease_token: typeof args.lease === 'string' ? args.lease : null,
           reason: typeof args.reason === 'string' ? args.reason : null,
         });
+        break;
+      }
+
+      case 'agy-session': {
+        const out = typeof args.out === 'string' ? args.out : defaultAgySessionPath(bus.config.rootDir);
+        result = exportAgySession(out);
         break;
       }
 

@@ -11,6 +11,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { showTask } from './tasks.js';
+import { defaultAgySessionPath, readAgySession, detectAgentApi } from './agy.js';
 
 export function dispatchEnabled(flag) {
   return !!flag || process.env.AGENTBUS_ENABLE_DISPATCH === '1';
@@ -66,13 +67,33 @@ const BUILTIN = {
     command: 'gemini',
     args: ['-p', prompt, '--yolo'],
   }),
-  antigravity: ({ prompt }) => {
-    const bin = process.env.AGENTBUS_ANTIGRAVITY_BIN
-      || 'E:/ai/AntigravityApp/resources/bin/language_server.exe';
+  antigravity: ({ prompt, busRoot, id }) => {
+    const bin = detectAgentApi();
+    if (!bin) {
+      throw Object.assign(new Error(
+        '找不到 Antigravity 的 agentapi（预期 ~/.gemini/antigravity/bin/agentapi.bat）；可用 AGENTBUS_ANTIGRAVITY_BIN 指定',
+      ), { code: 1 });
+    }
+    const sessionFile = defaultAgySessionPath(busRoot);
+    const sess = readAgySession(sessionFile);
+    // agentapi takes the prompt as one positional argument; newlines would break
+    // the Windows command line, so collapse them into separators.
+    const oneLine = String(prompt).replace(/\s*\n+\s*/g, '；');
+    const isWrapper = /\.(bat|cmd)$/i.test(bin);
+    const args = [
+      ...(isWrapper ? [] : ['agentapi']),
+      'new-conversation',
+      `--title=agentbus ${id || ''}`.trim(),
+      oneLine,
+    ];
     return {
       command: bin,
-      args: ['agentapi', 'new-conversation', prompt],
-      requires: ['ANTIGRAVITY_LS_ADDRESS', 'ANTIGRAVITY_CSRF_TOKEN'],
+      args,
+      env: {
+        ANTIGRAVITY_LS_ADDRESS: sess.ls_address,
+        ANTIGRAVITY_CSRF_TOKEN: sess.csrf_token,
+      },
+      sessionFile,
     };
   },
 };
@@ -152,7 +173,7 @@ function runAdapter(spec, { cwd, timeout_s }) {
     try {
       child = spawn(command, args, {
         cwd,
-        env: { ...process.env },
+        env: { ...process.env, ...(spec.env || {}) },
         stdio: [spec.stdinPrompt ? 'pipe' : 'ignore', 'pipe', 'pipe'],
         windowsHide: true,
         ...extra,
@@ -203,6 +224,7 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 700, 
     cwd: workdir,
     busRoot: bus.config.rootDir,
     session,
+    id: task.id,
   });
 
   const run = runAdapter(spec, { cwd: workdir, timeout_s: Math.max(5, wait_s) });

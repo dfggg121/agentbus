@@ -140,7 +140,13 @@ Dispatch trusts the bus, not the child process: if the spawned agent exits witho
 
 **Threads (session affinity).** `--thread <name>` keeps a conversation: the first run records the agent's session id, later tasks in the same thread resume it instead of starting cold. Codex's `exec resume` has no `--approve-for-me`, so resumed runs pass `--dangerously-bypass-approvals-and-sandbox` — see SECURITY.md before using threads.
 
-Antigravity's adapter needs `ANTIGRAVITY_LS_ADDRESS` and `ANTIGRAVITY_CSRF_TOKEN`, which only exist inside its integrated terminal — export them to a session file, or use the pull path (task created, agent claims it).
+Antigravity cannot be started from an outside shell: its `agentapi` needs `ANTIGRAVITY_LS_ADDRESS` and `ANTIGRAVITY_CSRF_TOKEN`, which exist only inside its integrated terminal. Export them once from there:
+
+```bash
+node <agentbus>/bin/bus.js agy-session --out <bus-root>/antigravity-session.json
+```
+
+The file is written 0600 and read by the adapter; it is session-scoped and must be re-exported after Antigravity restarts. Nothing secret is put on a command line.
 
 ---
 
