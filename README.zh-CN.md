@@ -138,6 +138,8 @@ AGENTBUS_ENABLE_DISPATCH=1 agentbus dispatch <task-id> --cwd . --wait 600
 
 dispatch **只信总线，不信子进程**：子进程退出但没调 `bus_task_complete`，结果是 `state=claimed`，不算成功。
 
+**线程（会话亲和）**：`--thread <name>` 保持同一段对话——首轮记下 agent 的会话 id，同线程的后续任务会 resume 它，而不是从零开始。Codex 的 `exec resume` 没有 `--approve-for-me`，所以 resume 分支带 `--dangerously-bypass-approvals-and-sandbox`；用线程前先看 SECURITY.md。
+
 Antigravity 适配器需要 `ANTIGRAVITY_LS_ADDRESS` 和 `ANTIGRAVITY_CSRF_TOKEN`，这两个变量只存在于它的集成终端里——要么导到会话文件，要么继续用"建任务等认领"的拉取模式。
 
 ---

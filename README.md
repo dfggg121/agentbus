@@ -138,6 +138,8 @@ It is off by default because it gives the bus the ability to start processes. Ad
 
 Dispatch trusts the bus, not the child process: if the spawned agent exits without calling `bus_task_complete`, the result is `state=claimed`, not success.
 
+**Threads (session affinity).** `--thread <name>` keeps a conversation: the first run records the agent's session id, later tasks in the same thread resume it instead of starting cold. Codex's `exec resume` has no `--approve-for-me`, so resumed runs pass `--dangerously-bypass-approvals-and-sandbox` — see SECURITY.md before using threads.
+
 Antigravity's adapter needs `ANTIGRAVITY_LS_ADDRESS` and `ANTIGRAVITY_CSRF_TOKEN`, which only exist inside its integrated terminal — export them to a session file, or use the pull path (task created, agent claims it).
 
 ---

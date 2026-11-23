@@ -178,6 +178,7 @@ export const MCP_TOOLS = [
         id: { type: 'string', description: '要交办的任务 id' },
         cwd: { type: 'string', description: '被唤起 agent 的工作目录，默认当前进程 cwd' },
         wait_s: { type: 'number', description: '最长等待秒数，默认 600' },
+        thread: { type: 'string', description: '会话名：同名线程复用同一 agent 会话（会话亲和）' },
       },
       required: ['id'],
     },

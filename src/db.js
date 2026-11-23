@@ -73,6 +73,14 @@ CREATE INDEX IF NOT EXISTS idx_tasks_state_to
 CREATE INDEX IF NOT EXISTS idx_tasks_created
   ON tasks(created_at DESC);
 
+CREATE TABLE IF NOT EXISTS threads (
+  agent TEXT NOT NULL,
+  name TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (agent, name)
+);
+
 CREATE TABLE IF NOT EXISTS events (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   at TEXT NOT NULL,

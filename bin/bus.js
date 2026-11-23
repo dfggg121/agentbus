@@ -100,7 +100,7 @@ function printHelp() {
       'fail <id> --by <agent> --lease <token> --reason "..."',
       'verify [--task <id>]',
       'list [--state <state>] [--to <agent>] [--limit <n>]',
-      'dispatch <id> [--cwd <dir>] [--wait <seconds>] [--allow-dispatch]',
+      'dispatch <id> [--cwd <dir>] [--wait <seconds>] [--thread <name>] [--allow-dispatch]',
       'mcp [--root <dir>] [--http 127.0.0.1:<port>]',
     ],
     exit_codes: { '0': 'success', '1': 'validation/arg/drift error', '2': 'state/lease disallowed' },
@@ -272,6 +272,7 @@ async function main() {
           id: args._[1],
           cwd: typeof args.cwd === 'string' ? args.cwd : null,
           wait_s: args.wait !== undefined ? Number(args.wait) : 600,
+          thread: typeof args.thread === 'string' ? args.thread : null,
         });
         if (result.state !== 'done') exitCode = 1;
         break;

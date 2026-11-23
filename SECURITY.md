@@ -39,6 +39,7 @@ Dispatch starts another agent's CLI so a caller can hand off work without a huma
 - Success is decided by the bus, not the child: the task must reach `state=done` through `bus_task_complete`. A clean child exit without completion is reported as `state=claimed`.
 - On Windows, `.cmd`/`.bat` adapters are launched through `cmd.exe /d /s /c` with explicit quoting; the prompt is passed on stdin, never interpolated into a shell string.
 - Antigravity's adapter needs `ANTIGRAVITY_LS_ADDRESS` and `ANTIGRAVITY_CSRF_TOKEN`. Do not commit these; they are session-scoped.
+- **Threads are weaker than they look.** Codex's `exec resume` does not accept `--approve-for-me`, so resuming a conversation requires `--dangerously-bypass-approvals-and-sandbox`, which strips Codex's own sandbox for that run. If you are not willing to accept that, do not use `--thread` with Codex; use a fresh run with a pointer to the previous result instead.
 
 ## Reporting a vulnerability
 

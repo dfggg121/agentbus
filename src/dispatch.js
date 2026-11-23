@@ -16,13 +16,45 @@ export function dispatchEnabled(flag) {
   return !!flag || process.env.AGENTBUS_ENABLE_DISPATCH === '1';
 }
 
+// Session affinity, borrowed from magpie's Claude bridge: a conversation's
+// turns must find the same underlying session, not start cold each time.
+function getThread(bus, agent, name) {
+  const row = bus.db.prepare('SELECT session_id FROM threads WHERE agent = ? AND name = ?').get(agent, name);
+  return row ? row.session_id : null;
+}
+
+function setThread(bus, agent, name, sessionId) {
+  bus.db.prepare(
+    'INSERT INTO threads (agent, name, session_id, updated_at) VALUES (?, ?, ?, ?) ' +
+    'ON CONFLICT(agent, name) DO UPDATE SET session_id = excluded.session_id, updated_at = excluded.updated_at',
+  ).run(agent, name, sessionId, new Date().toISOString());
+}
+
+function extractSession(stdout) {
+  const m = stdout.match(/"thread_id"\s*:\s*"([^"]+)"/) || stdout.match(/"session_id"\s*:\s*"([^"]+)"/);
+  return m ? m[1] : null;
+}
+
 const BUILTIN = {
-  codex: ({ prompt, cwd }) => {
+  codex: ({ prompt, cwd, session }) => {
     const bin = process.env.AGENTBUS_CODEX_BIN || (process.platform === 'win32' ? 'codex.cmd' : 'codex');
+    const base = ['exec'];
+    if (session) {
+      // Session affinity (the magpie idea): a thread's next task resumes the
+      // same Codex conversation instead of starting cold and re-reading context.
+      return {
+        command: bin,
+        // `resume` has no --approve-for-me; MCP calls need approvals bypassed.
+        // Documented in SECURITY.md: resume runs unsandboxed by Codex's own rules.
+        args: [...base, 'resume', session, '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', '-'],
+        stdinPrompt: prompt,
+        keepsSession: true,
+      };
+    }
     return {
       // The prompt goes over stdin ("-"): no quoting problems on any platform.
       command: bin,
-      args: ['exec', '--approve-for-me', '--skip-git-repo-check', '-C', cwd, '-'],
+      args: [...base, '--json', '--approve-for-me', '--skip-git-repo-check', '-C', cwd, '-'],
       stdinPrompt: prompt,
     };
   },
@@ -155,7 +187,7 @@ function runAdapter(spec, { cwd, timeout_s }) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 700, env = {} }) {
+export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 700, env = {}, thread = null }) {
   const task = showTask(bus, id);
   if (!task) throw Object.assign(new Error(`找不到任务: ${id}`), { code: 1 });
   if (task.state === 'done' || task.state === 'failed') {
@@ -165,7 +197,13 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 700, 
   if (!existsSync(workdir)) throw Object.assign(new Error(`cwd 不存在: ${workdir}`), { code: 1 });
 
   for (const [k, v] of Object.entries(env)) process.env[k] = v;
-  const spec = resolveAdapter(task.to, { prompt: buildPrompt(task.id, task.goal), cwd: workdir, busRoot: bus.config.rootDir });
+  const session = thread ? getThread(bus, task.to, thread) : null;
+  const spec = resolveAdapter(task.to, {
+    prompt: buildPrompt(task.id, task.goal),
+    cwd: workdir,
+    busRoot: bus.config.rootDir,
+    session,
+  });
 
   const run = runAdapter(spec, { cwd: workdir, timeout_s: Math.max(5, wait_s) });
 
@@ -186,12 +224,22 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 700, 
   const adapterResult = await run;
   await watcher;
 
+  let sessionId = session;
+  if (thread && !sessionId) {
+    const found = extractSession(adapterResult.stdout || '');
+    if (found) {
+      setThread(bus, task.to, thread, found);
+      sessionId = found;
+    }
+  }
+
   return {
     id: task.id,
     to: task.to,
     state: latest.state,
     ok: latest.state === 'done',
     dispatched: true,
+    thread: thread ? { name: thread, session: sessionId, resumed: !!session } : undefined,
     adapter: { command: spec.command, exit: adapterResult.exit ?? null, seconds: adapterResult.seconds ?? null },
     result: latest.result || null,
     stdout_tail: (adapterResult.stdout || '').slice(-1500),
