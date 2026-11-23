@@ -112,6 +112,10 @@ const BUILTIN = {
       args: [
         ...base,
         'new-conversation',
+        // The default tier can be out of capacity (503 "No capacity available
+        // for model gemini-4-hydrogen-tiered-high"); AGENTBUS_AGY_MODEL=flash
+        // pins a cheaper tier that answers instead of retrying forever.
+        ...(process.env.AGENTBUS_AGY_MODEL ? [`--model=${process.env.AGENTBUS_AGY_MODEL}`] : []),
         `--title=agentbus ${id || ''}`.trim(),
         oneLine,
       ],
