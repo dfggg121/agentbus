@@ -11,7 +11,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { showTask } from './tasks.js';
-import { defaultAgySessionPath, readAgySession, detectAgentApi } from './agy.js';
+import { defaultAgySessionPath, readAgySession, detectAgentApi, discoverAgySession } from './agy.js';
 
 export function dispatchEnabled(flag) {
   return !!flag || process.env.AGENTBUS_ENABLE_DISPATCH === '1';
@@ -75,7 +75,16 @@ const BUILTIN = {
       ), { code: 1 });
     }
     const sessionFile = defaultAgySessionPath(busRoot);
-    const sess = readAgySession(sessionFile);
+    let sess;
+    try {
+      sess = readAgySession(sessionFile);
+    } catch (err) {
+      // No exported file: fall back to the daemon hub, which the running app
+      // rewrites on every start. If both are missing, surface the export hint.
+      const found = discoverAgySession();
+      if (!found) throw err;
+      sess = found;
+    }
     // agentapi takes the prompt as one positional argument; newlines would break
     // the Windows command line, so collapse them into separators.
     const oneLine = String(prompt).replace(/\s*\n+\s*/g, '；');
@@ -123,11 +132,11 @@ function resolveAdapter(to, ctx) {
   return build(ctx);
 }
 
-function buildPrompt(id, goal) {
+function buildPrompt(id, goal, to) {
   return [
     `你是被主动调用的执行方。任务 id=${id}。`,
     `目标：${goal}`,
-    '步骤：1) bus_task_claim 领取（by 用你自己的 agent 名）；',
+    `步骤：1) bus_task_claim 领取，by 必须写 "${to}"；`,
     '2) bus_ref_read 逐个读 refs，返回 resource_link 的按 uri 自己读文件；',
     '3) 按需求产出结果文件；',
     '4) bus_task_complete 交回，fields 用你实际算出的值。',
@@ -208,6 +217,27 @@ function runAdapter(spec, { cwd, timeout_s }) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Async agents (Antigravity) may start the conversation minutes after the CLI
+// returns. This lets the caller wait on the bus instead of on the child process.
+export async function waitForTask(bus, id, timeout_s = 900, poll_ms = 1000) {
+  const started = Date.now();
+  const deadline = started + Math.max(1, timeout_s) * 1000;
+  let latest = showTask(bus, id);
+  if (!latest) throw Object.assign(new Error(`找不到任务: ${id}`), { code: 1 });
+  while (latest.state !== 'done' && latest.state !== 'failed' && Date.now() < deadline) {
+    await sleep(poll_ms);
+    latest = showTask(bus, id);
+    if (!latest) break;
+  }
+  return {
+    id,
+    state: latest ? latest.state : 'missing',
+    ok: latest ? latest.state === 'done' : false,
+    result: latest ? latest.result || null : null,
+    waited_s: Math.round((Date.now() - started) / 100) / 10,
+  };
+}
+
 export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 700, env = {}, thread = null }) {
   const task = showTask(bus, id);
   if (!task) throw Object.assign(new Error(`找不到任务: ${id}`), { code: 1 });
@@ -220,7 +250,7 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 700, 
   for (const [k, v] of Object.entries(env)) process.env[k] = v;
   const session = thread ? getThread(bus, task.to, thread) : null;
   const spec = resolveAdapter(task.to, {
-    prompt: buildPrompt(task.id, task.goal),
+    prompt: buildPrompt(task.id, task.goal, task.to),
     cwd: workdir,
     busRoot: bus.config.rootDir,
     session,
@@ -264,6 +294,9 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 700, 
     thread: thread ? { name: thread, session: sessionId, resumed: !!session } : undefined,
     adapter: { command: spec.command, exit: adapterResult.exit ?? null, seconds: adapterResult.seconds ?? null },
     result: latest.result || null,
+    hint: latest.state === 'open' || latest.state === 'claimed'
+      ? `任务还在进行；用 agentbus wait ${task.id} --timeout 900 继续等`
+      : undefined,
     stdout_tail: (adapterResult.stdout || '').slice(-1500),
     stderr_tail: (adapterResult.stderr || '').slice(-800),
     error: adapterResult.ok === false ? adapterResult.error || `adapter exit ${adapterResult.exit}` : undefined,

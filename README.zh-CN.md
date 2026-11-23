@@ -140,13 +140,19 @@ dispatch **只信总线，不信子进程**：子进程退出但没调 `bus_task
 
 **线程（会话亲和）**：`--thread <name>` 保持同一段对话——首轮记下 agent 的会话 id，同线程的后续任务会 resume 它，而不是从零开始。Codex 的 `exec resume` 没有 `--approve-for-me`，所以 resume 分支带 `--dangerously-bypass-approvals-and-sandbox`；用线程前先看 SECURITY.md。
 
-Antigravity 没法从外部 shell 直接起：它的 `agentapi` 需要 `ANTIGRAVITY_LS_ADDRESS` 和 `ANTIGRAVITY_CSRF_TOKEN`，这两个变量只存在于它的集成终端。在那边导出一次：
+Antigravity 的坐标（`ANTIGRAVITY_LS_ADDRESS`、`ANTIGRAVITY_CSRF_TOKEN`）只活在它自己的运行时里。适配器先读导出的会话文件，没有就回退到运行中应用的 `daemon/hub_*.json`（里面有 CSRF 令牌和 HTTP 端口）。两边都没有时，在它的集成终端里跑一次：
 
 ```bash
 node <agentbus>/bin/bus.js agy-session --out <总线根目录>/antigravity-session.json
 ```
 
-文件按 0600 落盘，由适配器读取；只对本次会话有效，Antigravity 重启后要重新导出。令牌不会出现在任何命令行上。
+文件按 0600 落盘，应用重启即失效。注意端口每次重启都会变，不要硬编码。
+
+Antigravity 是异步起会话的，`dispatch` 可能在任务还 `open` 时就返回。这时等总线，不要等子进程：
+
+```bash
+agentbus wait <task-id> --timeout 900
+```
 
 ---
 

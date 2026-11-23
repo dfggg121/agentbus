@@ -32,12 +32,21 @@ function tighten(file) {
 // Run this inside Antigravity's own integrated terminal, where the two
 // variables exist. Nothing is printed but the path and the token length.
 export function exportAgySession(outPath) {
-  const address = process.env.ANTIGRAVITY_LS_ADDRESS;
-  const csrf = process.env.ANTIGRAVITY_CSRF_TOKEN;
+  let address = process.env.ANTIGRAVITY_LS_ADDRESS;
+  let csrf = process.env.ANTIGRAVITY_CSRF_TOKEN;
+  let source = 'env';
+  if (!address || !csrf) {
+    const found = discoverAgySession();
+    if (found) {
+      address = found.ls_address;
+      csrf = found.csrf_token;
+      source = found.source;
+    }
+  }
   if (!address || !csrf) {
     throw Object.assign(new Error(
-      '当前环境没有 ANTIGRAVITY_LS_ADDRESS / ANTIGRAVITY_CSRF_TOKEN。'
-      + '这两个变量只存在于 Antigravity 的集成终端里，请在那里面运行本命令。',
+      '找不到 Antigravity 的会话坐标：环境变量没有，daemon 目录里也没有 hub_*.json。'
+      + '请在 Antigravity 的集成终端里运行本命令，或用 AGENTBUS_AGY_SESSION 指向已导出的文件。',
     ), { code: 1 });
   }
   const target = path.resolve(outPath);
@@ -47,10 +56,11 @@ export function exportAgySession(outPath) {
     ls_address: address,
     csrf_token: csrf,
     exported_at: new Date().toISOString(),
+    source,
   };
   fs.writeFileSync(target, JSON.stringify(payload, null, 2) + '\n', { mode: 0o600 });
   tighten(target);
-  return { path: target, ls_address: address, token_chars: csrf.length, note: '重启 Antigravity 后需重新导出' };
+  return { path: target, ls_address: address, token_chars: csrf.length, source, note: '重启 Antigravity 后需重新导出' };
 }
 
 export function readAgySession(file) {
@@ -74,4 +84,45 @@ export function detectAgentApi() {
   if (process.env.AGENTBUS_ANTIGRAVITY_BIN) return process.env.AGENTBUS_ANTIGRAVITY_BIN;
   const wrapper = path.join(os.homedir(), '.gemini', 'antigravity', 'bin', 'agentapi.bat');
   return fs.existsSync(wrapper) ? wrapper : null;
+}
+
+// Antigravity keeps its live coordinates in a daemon hub file. Reading it beats
+// asking the user to export env vars by hand, and the file is per-run so a stale
+// copy is detected by its pid.
+function daemonDirs() {
+  const dirs = [];
+  if (process.env.AGENTBUS_AGY_DAEMON_DIR) dirs.push(process.env.AGENTBUS_AGY_DAEMON_DIR);
+  dirs.push(path.join(os.homedir(), '.gemini', 'antigravity', 'daemon'));
+  if (process.env.APPDATA) dirs.push(path.join(process.env.APPDATA, 'Antigravity', 'daemon'));
+  dirs.push('E:/ai/AntigravityApp_data/dot_gemini/antigravity/daemon');
+  return dirs.filter((d) => fs.existsSync(d));
+}
+
+export function discoverAgySession() {
+  let best = null;
+  for (const dir of daemonDirs()) {
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir).filter((f) => /^hub_\d+\.json$/.test(f));
+    } catch { continue; }
+    for (const name of entries) {
+      const full = path.join(dir, name);
+      let data;
+      try {
+        data = JSON.parse(fs.readFileSync(full, 'utf8'));
+      } catch { continue; }
+      if (!data.csrfToken || !data.httpPort) continue;
+      const mtime = fs.statSync(full).mtimeMs;
+      if (!best || mtime > best.mtime) {
+        best = {
+          mtime,
+          source: full,
+          ls_address: `http://127.0.0.1:${data.httpPort}`,
+          csrf_token: data.csrfToken,
+          pid: data.pid,
+        };
+      }
+    }
+  }
+  return best;
 }

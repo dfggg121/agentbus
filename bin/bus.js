@@ -18,7 +18,7 @@ import {
 } from '../src/tasks.js';
 import { startMcpStdio, startMcpHttp } from '../src/mcp.js';
 import { setupClients, doctor, listClients, defaultRoot } from '../src/setup.js';
-import { dispatchTask, dispatchEnabled } from '../src/dispatch.js';
+import { dispatchTask, dispatchEnabled, waitForTask } from '../src/dispatch.js';
 import { exportAgySession, defaultAgySessionPath } from '../src/agy.js';
 
 const VERSION = '0.1.0';
@@ -102,6 +102,7 @@ function printHelp() {
       'verify [--task <id>]',
       'list [--state <state>] [--to <agent>] [--limit <n>]',
       'dispatch <id> [--cwd <dir>] [--wait <seconds>] [--thread <name>] [--allow-dispatch]',
+      'wait <id> [--timeout <seconds>]   # 等异步 agent 把任务做完',
       'agy-session [--out <file>]   # 在 Antigravity 集成终端里运行，导出会话地址与令牌',
       'mcp [--root <dir>] [--http 127.0.0.1:<port>]',
     ],
@@ -263,6 +264,12 @@ async function main() {
           lease_token: typeof args.lease === 'string' ? args.lease : null,
           reason: typeof args.reason === 'string' ? args.reason : null,
         });
+        break;
+      }
+
+      case 'wait': {
+        result = await waitForTask(bus, args._[1], args.timeout !== undefined ? Number(args.timeout) : 900);
+        if (result.state !== 'done') exitCode = 1;
         break;
       }
 
