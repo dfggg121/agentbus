@@ -89,20 +89,35 @@ const BUILTIN = {
     // the Windows command line, so collapse them into separators.
     const oneLine = String(prompt).replace(/\s*\n+\s*/g, '；');
     const isWrapper = /\.(bat|cmd)$/i.test(bin);
-    const args = [
-      ...(isWrapper ? [] : ['agentapi']),
-      'new-conversation',
-      `--title=agentbus ${id || ''}`.trim(),
-      oneLine,
-    ];
+    const base = isWrapper ? [] : ['agentapi'];
+    const env = {
+      ANTIGRAVITY_LS_ADDRESS: sess.ls_address,
+      ANTIGRAVITY_CSRF_TOKEN: sess.csrf_token,
+    };
+    // `new-conversation` only CREATES the conversation: the app shows it in the
+    // sidebar and leaves it idle until a message arrives. A second send-message
+    // is what actually starts the agent (verified 2026-11-23: task stayed `open`
+    // for 3+ minutes after new-conversation alone, claimed within 30s of the kick).
+    const followUp = (stdout) => {
+      const m = String(stdout || '').match(/"conversationId"\s*:\s*"([^"]+)"/);
+      if (!m) return null;
+      return {
+        command: bin,
+        args: [...base, 'send-message', m[1], '开始执行：立即执行上述 agentbus 任务。'],
+        env,
+      };
+    };
     return {
       command: bin,
-      args,
-      env: {
-        ANTIGRAVITY_LS_ADDRESS: sess.ls_address,
-        ANTIGRAVITY_CSRF_TOKEN: sess.csrf_token,
-      },
+      args: [
+        ...base,
+        'new-conversation',
+        `--title=agentbus ${id || ''}`.trim(),
+        oneLine,
+      ],
+      env,
       sessionFile,
+      followUp,
     };
   },
 };
@@ -208,9 +223,18 @@ function runAdapter(spec, { cwd, timeout_s }) {
     child.stdout.on('data', (d) => { out += d.toString('utf8'); if (out.length > 200000) out = out.slice(-200000); });
     child.stderr.on('data', (d) => { err += d.toString('utf8'); if (err.length > 200000) err = err.slice(-200000); });
     child.on('error', (e) => { clearTimeout(timer); resolve({ ok: false, error: String(e.message || e), code: 'spawn_failed' }); });
-    child.on('exit', (code) => {
+    child.on('exit', async (code) => {
       clearTimeout(timer);
-      resolve({ ok: code === 0, exit: code, seconds: Math.round((Date.now() - started) / 100) / 10, stdout: out, stderr: err });
+      const base = { ok: code === 0, exit: code, seconds: Math.round((Date.now() - started) / 100) / 10, stdout: out, stderr: err };
+      if (code !== 0 || typeof spec.followUp !== 'function') { resolve(base); return; }
+      // Some CLIs (Antigravity) only stage the work on the first call; a second
+      // call against the returned handle is what actually starts the run.
+      let next = null;
+      try { next = spec.followUp(out); } catch (e) { base.follow_up = { ok: false, error: String(e.message || e) }; resolve(base); return; }
+      if (!next) { base.follow_up = { ok: false, error: 'followUp 未从输出里解析到句柄' }; resolve(base); return; }
+      const fu = await runAdapter(next, { cwd, timeout_s });
+      base.follow_up = { ok: fu.ok, exit: fu.exit, error: fu.error, seconds: fu.seconds, stderr: (fu.stderr || '').slice(-400) };
+      resolve(base);
     });
   });
 }
