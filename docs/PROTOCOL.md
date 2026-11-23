@@ -141,6 +141,7 @@ Transport: newline-delimited JSON-RPC 2.0 over stdio (no `Content-Length` framin
 | `bus_task_fail` | `id`, `by`, `lease_token`, `reason` | — |
 | `bus_task_list` | — | `state`, `to`, `limit` |
 | `bus_verify` | — | `id` |
+| `bus_task_dispatch` | starts the target agent CLI, then waits | `id`, `cwd`, `wait_s` |
 
 `refs` accepts `["<sha256>", …]` or `[{"sha256": "...", "note": "..."}, …]`.
 

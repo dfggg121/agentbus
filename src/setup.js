@@ -43,7 +43,7 @@ function serverSpec({ root, allowed, bin = 'node' }) {
     return { command: 'npx', args: ['-y', 'agentbus-mcp', 'mcp', '--root', path.resolve(root)], env };
   }
   return {
-    command: process.execPath,
+    command: process.env.AGENTBUS_MCP_COMMAND || process.execPath,
     args: [BUS_BIN, 'mcp', '--root', path.resolve(root)],
     env,
   };
@@ -132,7 +132,8 @@ const CLIENTS = [
   {
     id: 'antigravity',
     label: 'Google Antigravity',
-    file: (home) => path.join(home, '.gemini', 'antigravity', 'mcp_config.json'),
+    // Official docs: global config is ~/.gemini/config/mcp_config.json (App/IDE/CLI share it).
+    file: (home) => path.join(home, '.gemini', 'config', 'mcp_config.json'),
     format: 'json-mcpServers',
   },
   {

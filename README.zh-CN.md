@@ -124,6 +124,21 @@ planner ──put──▶ artifacts(sha256, uri, bytes)        ← 只有元数
 | `bus_task_fail` | 以失败关闭并写明原因 |
 | `bus_task_list` | 列任务（`state`/`to`/`limit`） |
 | `bus_verify` | 全量重算引用与结果哈希，报告漂移 |
+| `bus_task_dispatch` | **默认关闭**：主动唤起目标 agent 的 CLI 并等结果 |
+
+### 主动唤起（dispatch）
+
+任务板需要有人去通知对方"来领活"。dispatch 把这一步去掉：`bus_task_dispatch`（或 `agentbus dispatch <id>`）直接起目标 agent 的 CLI，等它 claim/complete，然后返回结果哈希。
+
+```bash
+AGENTBUS_ENABLE_DISPATCH=1 agentbus dispatch <task-id> --cwd . --wait 600
+```
+
+默认关闭，因为这意味着总线获得了"起进程"的能力。内置 `codex` / `claude` / `gemini` / `antigravity` 四个适配器；其它 agent 用 `AGENTBUS_ADAPTER_<NAME>`（JSON `{command, args}`，`{prompt}` 会被替换）。
+
+dispatch **只信总线，不信子进程**：子进程退出但没调 `bus_task_complete`，结果是 `state=claimed`，不算成功。
+
+Antigravity 适配器需要 `ANTIGRAVITY_LS_ADDRESS` 和 `ANTIGRAVITY_CSRF_TOKEN`，这两个变量只存在于它的集成终端里——要么导到会话文件，要么继续用"建任务等认领"的拉取模式。
 
 ---
 

@@ -484,12 +484,13 @@ async function main() {
       'bus_task_fail',
       'bus_task_list',
       'bus_verify',
+      'bus_task_dispatch',
     ];
     const actualToolNames = toolsResp.map((t) => t.name);
-    const exactNine = toolsResp.length === 9 &&
+    const exactNine = toolsResp.length === 10 &&
       expectedTools.every((n) => actualToolNames.includes(n)) &&
       toolsResp.every((t) => t.inputSchema && t.inputSchema.type === 'object');
-    assertCase(29, 'MCP tools/list 恰好 9 个工具，名字与 §4.1 一致且均有 inputSchema',
+    assertCase(29, 'MCP tools/list 恰好 10 个工具，名字与 §4.1 一致且均有 inputSchema',
       exactNine,
       `count=${toolsResp.length} names=[${actualToolNames.join(',')}]`);
 

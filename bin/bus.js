@@ -18,6 +18,7 @@ import {
 } from '../src/tasks.js';
 import { startMcpStdio, startMcpHttp } from '../src/mcp.js';
 import { setupClients, doctor, listClients, defaultRoot } from '../src/setup.js';
+import { dispatchTask, dispatchEnabled } from '../src/dispatch.js';
 
 const VERSION = '0.1.0';
 
@@ -99,6 +100,7 @@ function printHelp() {
       'fail <id> --by <agent> --lease <token> --reason "..."',
       'verify [--task <id>]',
       'list [--state <state>] [--to <agent>] [--limit <n>]',
+      'dispatch <id> [--cwd <dir>] [--wait <seconds>] [--allow-dispatch]',
       'mcp [--root <dir>] [--http 127.0.0.1:<port>]',
     ],
     exit_codes: { '0': 'success', '1': 'validation/arg/drift error', '2': 'state/lease disallowed' },
@@ -259,6 +261,19 @@ async function main() {
           lease_token: typeof args.lease === 'string' ? args.lease : null,
           reason: typeof args.reason === 'string' ? args.reason : null,
         });
+        break;
+      }
+
+      case 'dispatch': {
+        if (!dispatchEnabled(args['allow-dispatch'] === true)) {
+          throw Object.assign(new Error('dispatch 未启用：加 --allow-dispatch 或设置 AGENTBUS_ENABLE_DISPATCH=1'), { code: 1 });
+        }
+        result = await dispatchTask(bus, {
+          id: args._[1],
+          cwd: typeof args.cwd === 'string' ? args.cwd : null,
+          wait_s: args.wait !== undefined ? Number(args.wait) : 600,
+        });
+        if (result.state !== 'done') exitCode = 1;
         break;
       }
 

@@ -2,12 +2,12 @@
 
 ## What agentbus is
 
-A local, single-user task bus. It stores task metadata and file hashes, and it exposes nine narrowly scoped operations to MCP clients and the CLI. It is not a sandbox, a remote service, or a secrets manager.
+A local, single-user task bus. It stores task metadata and file hashes, and it exposes nine narrowly scoped operations to MCP clients and the CLI. One additional operation (`bus_task_dispatch`) is off unless explicitly enabled. It is not a sandbox, a remote service, or a secrets manager.
 
 ## Default posture
 
 - **No network listener.** MCP is stdio only. HTTP mode exists solely as `--http 127.0.0.1:<port>` and refuses non-loopback binds.
-- **No shell execution.** No tool spawns a process, runs a command, or evaluates code.
+- **No shell execution by default.** No always-on tool spawns a process, runs a command, or evaluates code. `bus_task_dispatch` is the single exception and requires `AGENTBUS_ENABLE_DISPATCH=1` (or `--allow-dispatch`); see *Opt-in process execution* below.
 - **No arbitrary writes.** The bus writes inside its own root: the SQLite database, `events`, and task/result records. Result files are written by the calling agent, not by the bus.
 - **No payload storage.** Referenced file contents are never inserted into SQLite, logs, or envelopes — only `uri`, `bytes`, and `sha256`.
 - **Path allowlist.** Every reference is resolved with `realpath` and must be inside `AGENTBUS_ALLOWED_ROOTS`. Symlinks and Windows junctions pointing outside are rejected.
@@ -29,6 +29,16 @@ A local, single-user task bus. It stores task metadata and file hashes, and it e
 - Prompt injection inside referenced documents. A reference is data; agents should treat it as untrusted input.
 - Local attackers with write access to the database file. File-system permissions are the boundary.
 - Cross-machine transport (not implemented).
+
+## Opt-in process execution (`bus_task_dispatch`)
+
+Dispatch starts another agent's CLI so a caller can hand off work without a human relay. It is disabled unless `AGENTBUS_ENABLE_DISPATCH=1` is set (CLI: `--allow-dispatch`).
+
+- Only the adapter table is executable: `codex`, `claude`, `gemini`, `antigravity`, or a name you provide via `AGENTBUS_ADAPTER_<NAME>`. The task's `to` field selects the adapter; it is not a free-form command line.
+- The child runs with the bus's own user and environment. Treat enabling dispatch as equivalent to letting any MCP client run these agent CLIs.
+- Success is decided by the bus, not the child: the task must reach `state=done` through `bus_task_complete`. A clean child exit without completion is reported as `state=claimed`.
+- On Windows, `.cmd`/`.bat` adapters are launched through `cmd.exe /d /s /c` with explicit quoting; the prompt is passed on stdin, never interpolated into a shell string.
+- Antigravity's adapter needs `ANTIGRAVITY_LS_ADDRESS` and `ANTIGRAVITY_CSRF_TOKEN`. Do not commit these; they are session-scoped.
 
 ## Reporting a vulnerability
 

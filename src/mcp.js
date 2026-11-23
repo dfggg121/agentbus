@@ -1,5 +1,5 @@
 // agentbus: MCP stdio (and optional loopback HTTP) JSON-RPC 2.0 server (§4)
-// Zero third-party dependencies. Exactly 9 tools; stdout strictly JSON-RPC lines only.
+// Zero third-party dependencies. Ten tools (nine bus tools + opt-in dispatch); stdout strictly JSON-RPC lines only.
 
 import http from 'node:http';
 import readline from 'node:readline';
@@ -15,6 +15,7 @@ import {
   listTasks,
   verifyTasks,
 } from './tasks.js';
+import { dispatchTask, dispatchEnabled } from './dispatch.js';
 
 const SUPPORTED_PROTOCOL_VERSIONS = new Set(['2025-06-18', '2025-03-26']);
 const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
@@ -167,6 +168,20 @@ export const MCP_TOOLS = [
       },
     },
   },
+  {
+    name: 'bus_task_dispatch',
+    description: '主动唤起另一个 agent 完成指定任务，并等待其交回结果（需服务端启用 AGENTBUS_ENABLE_DISPATCH=1）。',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        id: { type: 'string', description: '要交办的任务 id' },
+        cwd: { type: 'string', description: '被唤起 agent 的工作目录，默认当前进程 cwd' },
+        wait_s: { type: 'number', description: '最长等待秒数，默认 600' },
+      },
+      required: ['id'],
+    },
+  },
 ];
 
 function toolSuccess(structuredContent) {
@@ -297,6 +312,15 @@ function invokeTool(bus, name, args = {}) {
         };
       }
 
+      case 'bus_task_dispatch': {
+        if (!dispatchEnabled()) {
+          return toolError(new Error('dispatch 未启用：服务端需设置 AGENTBUS_ENABLE_DISPATCH=1'));
+        }
+        return dispatchTask(bus, { id: a.id, cwd: a.cwd, wait_s: a.wait_s })
+          .then((res) => toolSuccess(res))
+          .catch((err) => toolError(err));
+      }
+
       default:
         return toolError(new Error(`未知工具: ${name}`));
     }
@@ -395,9 +419,11 @@ export function startMcpStdio(bus) {
         return;
       }
       const resp = handleJsonRpcMessage(bus, msg);
-      if (resp !== null) {
-        process.stdout.write(JSON.stringify(resp) + '\n');
-      }
+      Promise.resolve(resp).then((r) => {
+        if (r !== null && r !== undefined) process.stdout.write(JSON.stringify(r) + '\n');
+      }).catch((err) => {
+        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id ?? null, error: { code: -32603, message: String(err?.message || err) } }) + '\n');
+      });
     });
 
     rl.on('close', shutdown);
@@ -434,8 +460,13 @@ export function startMcpHttp(bus, bindSpec) {
         return;
       }
       const resp = handleJsonRpcMessage(bus, msg);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(resp ? JSON.stringify(resp) : '');
+      Promise.resolve(resp).then((r) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(r ? JSON.stringify(r) : '');
+      }).catch((err) => {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: msg.id ?? null, error: { code: -32603, message: String(err?.message || err) } }));
+      });
     });
   });
 

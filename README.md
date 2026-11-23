@@ -124,6 +124,21 @@ Protocol details: [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 | `bus_task_fail` | Close a task as failed with a reason |
 | `bus_task_list` | List tasks (`state`, `to`, `limit`) |
 | `bus_verify` | Re-hash every ref and result; report drift |
+| `bus_task_dispatch` | **Opt-in**: start the target agent CLI for a task and wait for its result |
+
+### Active dispatch
+
+A task board needs someone to tell the other agent to pick work up. Dispatch removes that step: `bus_task_dispatch` (or `agentbus dispatch <id>`) starts the target agent's CLI, waits for it to claim/complete, and returns the result hash.
+
+```bash
+AGENTBUS_ENABLE_DISPATCH=1 agentbus dispatch <task-id> --cwd . --wait 600
+```
+
+It is off by default because it gives the bus the ability to start processes. Adapters ship for `codex`, `claude`, `gemini` and `antigravity`; anything else can be wired with `AGENTBUS_ADAPTER_<NAME>` (JSON `{command, args}` where `{prompt}` is substituted).
+
+Dispatch trusts the bus, not the child process: if the spawned agent exits without calling `bus_task_complete`, the result is `state=claimed`, not success.
+
+Antigravity's adapter needs `ANTIGRAVITY_LS_ADDRESS` and `ANTIGRAVITY_CSRF_TOKEN`, which only exist inside its integrated terminal — export them to a session file, or use the pull path (task created, agent claims it).
 
 ---
 
