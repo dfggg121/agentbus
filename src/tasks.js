@@ -609,7 +609,15 @@ function parseFieldExpectedValue(v) {
 
 function runAcceptanceChecks(acceptance, resultPath, resultBytes, extraFields = null) {
   const acc = acceptance && typeof acceptance === 'object' ? acceptance : {};
+  // `--accept k=v` 落成扁平键；`fields` 是嵌套写法。两种都要当字段断言，
+  // 否则用 --accept 建的任务会“零校验”直接 done。
+  const RESERVED = new Set(['min_bytes', 'max_bytes', 'json', 'must_contain', 'must_not_contain', 'fields']);
+  const flatFields = {};
+  for (const [k, v] of Object.entries(acc)) {
+    if (!RESERVED.has(k)) flatFields[k] = v;
+  }
   const mergedFields = {
+    ...flatFields,
     ...(acc.fields && typeof acc.fields === 'object' ? acc.fields : {}),
     ...(extraFields && typeof extraFields === 'object' ? extraFields : {}),
   };

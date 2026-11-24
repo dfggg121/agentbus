@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// agentbus self-acceptance suite: 32 assertions (§7)
+// agentbus self-acceptance suite: 33 assertions (§7)
 // Pure Node built-ins, zero frameworks, zero shell pipes.
 // Output: PASS n: <desc> / FAIL n: <desc> :: <actual>, ending with SUMMARY passed=x failed=y
 
@@ -548,6 +548,21 @@ async function main() {
         compatVerDrift.rc === 1 && (compatVerDrift.json?.bad ?? 0) >= 1,
         `showRc=${compatShow.rc} verOkRc=${compatVerOk.rc}(bad=${compatVerOk.json?.bad}) verDriftRc=${compatVerDrift.rc}(bad=${compatVerDrift.json?.bad})`);
     }
+    // 33. `--accept k=v` 落成扁平键，done 时必须真的逐字段校验（防“零校验直接 done”）
+    const accTask = runCli(['new', '--to', 'codex', '--from', 'hermes', '--goal', 'flat-accept',
+      '--accept', 'verdict=ok', '--accept', 'count=3']);
+    const accId = accTask.json?.id;
+    const accClaim = runCli(['claim', accId, '--by', 'codex']);
+    const accLease = accClaim.json?.lease_token;
+    const flatBad = path.join(WORK_DIR, 'flat_bad.json');
+    fs.writeFileSync(flatBad, JSON.stringify({ verdict: 'ok', count: 4 }), 'utf8');
+    const doneFlatBad = runCli(['done', accId, '--by', 'codex', '--lease', accLease, '--result', flatBad]);
+    const flatGood = path.join(WORK_DIR, 'flat_good.json');
+    fs.writeFileSync(flatGood, JSON.stringify({ verdict: 'ok', count: 3 }), 'utf8');
+    const doneFlatGood = runCli(['done', accId, '--by', 'codex', '--lease', accLease, '--result', flatGood]);
+    assertCase(33, '--accept 扁平字段在 done 时逐字段校验（不匹配拒绝、匹配放行）',
+      doneFlatBad.rc !== 0 && doneFlatGood.rc === 0 && doneFlatGood.json?.state === 'done',
+      `badRc=${doneFlatBad.rc} goodRc=${doneFlatGood.rc} state=${doneFlatGood.json?.state}`);
   } finally {
     try { fs.rmSync(RUN_BASE, { recursive: true, force: true }); } catch {}
   }
