@@ -147,6 +147,13 @@ Transport: newline-delimited JSON-RPC 2.0 over stdio (no `Content-Length` framin
 
 `refs` accepts `["<sha256>", …]` or `[{"sha256": "...", "note": "..."}, …]`.
 
+### Threads
+
+- `task:<id>` is recorded automatically on first dispatch, so retries of the same task continue the same conversation (including after a 503).
+- Explicit `--thread <name>` shares one conversation across tasks; Antigravity uses `send-message`, Codex uses `exec resume`.
+- Limits: `AGENTBUS_THREAD_MAX_AGE_S` (default 7200), `AGENTBUS_THREAD_MAX_STEPS` (40), `AGENTBUS_THREAD_MAX_USES` (40). Antigravity step counts come from its conversation DB; agents without a step source fall back to the reuse count.
+- New conversations are titled `agentbus MM-DD <task-id>`.
+
 ### Roles
 
 `AGENTBUS_ROLE` (set by `agentbus onboard`, or by hand) trims the surface:

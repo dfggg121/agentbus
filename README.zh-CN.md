@@ -189,6 +189,15 @@ agentbus onboard --conductor codex --allow /path/to/workspace
 
 真正占时间的是模型推理，不是总线：实测 Codex 45.5s、Antigravity 30s，通信开销不到 1%。要更快就并发、复用会话、选对模型。
 
+### 会话复用与上限
+
+- **同一任务的重试只占一条会话**：`threads` 表自动记 `task:<id>`，重试时沿用同一会话。503 连试多次不再一个任务开出好几条。
+- **跨任务复用**用显式 `--thread <name>`：Antigravity 用 `send-message` 续进原会话，Codex 用 `exec resume`。
+- **上限**：会话超过 2 小时、累计超过 40 步、或复用超过 40 次，自动换新（`AGENTBUS_THREAD_MAX_AGE_S` / `AGENTBUS_THREAD_MAX_STEPS` / `AGENTBUS_THREAD_MAX_USES` 可调）。Antigravity 的步数直接从会话库读；其它 agent 没有步数来源时用复用次数兜底。
+- **标题带日期**：新会话标题形如 `agentbus 11-24 tmw…`，方便一眼看出哪些该归档。
+
+实测：两个任务共用一个 thread，会话目录从 37 条只增到 38 条（两个任务只新建 1 条会话），第二次 `resumed=true`、session 不变。
+
 ### 模型自动降级
 
 `agents.json` 指定的模型失败时（`model_not_found`、`not supported`、`503 No capacity`），dispatch 会按顺序换下一个候选：配置值 → `AGENTBUS_FALLBACK_MODELS`（逗号分隔）→ 该 agent 的已知模型表 → 不传模型（用 CLI 默认）。每次尝试最多等 120 秒，模型类错误会立即中止等待、直接换下一个。返回里的 `attempts` 会列出每个模型的结果。

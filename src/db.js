@@ -190,6 +190,15 @@ export function openBus(opts = {}) {
     }
   }
 
+  // Migrations for thread affinity limits (created_at / uses / steps).
+  for (const ddl of [
+    'ALTER TABLE threads ADD COLUMN created_at TEXT',
+    'ALTER TABLE threads ADD COLUMN uses INTEGER NOT NULL DEFAULT 0',
+    'ALTER TABLE threads ADD COLUMN steps INTEGER NOT NULL DEFAULT 0',
+  ]) {
+    try { db.exec(ddl); } catch { /* column already exists */ }
+  }
+
   const journalRow = db.prepare('PRAGMA journal_mode').get();
   const journalMode = String(journalRow?.journal_mode || '').toLowerCase();
 

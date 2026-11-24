@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// agentbus self-acceptance suite: 37 assertions (§7)
+// agentbus self-acceptance suite: 39 assertions (§7)
 // Pure Node built-ins, zero frameworks, zero shell pipes.
 // Output: PASS n: <desc> / FAIL n: <desc> :: <actual>, ending with SUMMARY passed=x failed=y
 
@@ -58,6 +58,35 @@ for (const d of [FIXTURES, OUT_DIR, ROOT_MAIN, WORK_DIR, OUTSIDE_DIR, ROOT_PERF,
     '',
   ].join('\n'), 'utf8');
   fs.writeFileSync(POLICY_BIN, randomBytes(4 * 1024 * 1024));
+}
+
+// Fake agent used by the thread-affinity cases: claims/completes quickly and
+// prints a session id, so dispatch can record and then resume it.
+const FAKE_AGENT = path.join(RUN_BASE, 'fake_agent.mjs');
+fs.writeFileSync(FAKE_AGENT, [
+  "import { execFileSync } from 'node:child_process';",
+  "import fs from 'node:fs';",
+  "import path from 'node:path';",
+  "const prompt = process.argv[2] || '';",
+  "const id = (prompt.match(/id=([A-Za-z0-9_-]+)/) || [])[1];",
+  "const env = { ...process.env, AGENTBUS_ALLOWED_ROOTS: process.env.AGENTBUS_FAKE_ALLOWED };",
+  "const run = (a) => execFileSync(process.execPath, [process.env.AGENTBUS_FAKE_BIN, ...a, '--root', process.env.AGENTBUS_FAKE_ROOT], { env, encoding: 'utf8' });",
+  "const claim = JSON.parse(run(['claim', id, '--by', 'fake']));",
+  "const out = path.join(process.env.AGENTBUS_FAKE_WORK, 'fake_' + id + '.json');",
+  "fs.writeFileSync(out, JSON.stringify({ ok: true, agent: 'fake' }), 'utf8');",
+  "run(['done', id, '--by', 'fake', '--lease', claim.lease_token, '--result', out]);",
+  "console.log(JSON.stringify({ thread_id: process.env.AGENTBUS_FAKE_SESSION || 'fake-session-1' }));",
+].join('\n'), 'utf8');
+
+function fakeAdapterEnv(session = 'fake-session-1') {
+  return {
+    AGENTBUS_ADAPTER_FAKE: JSON.stringify({ command: process.execPath, args: [FAKE_AGENT, '{prompt}'] }),
+    AGENTBUS_FAKE_BIN: BUS_BIN,
+    AGENTBUS_FAKE_ROOT: ROOT_MAIN,
+    AGENTBUS_FAKE_WORK: OUT_DIR,
+    AGENTBUS_FAKE_ALLOWED: ALLOWED_MAIN,
+    AGENTBUS_FAKE_SESSION: session,
+  };
 }
 
 const ALLOWED_MAIN = [DEMO_REFS, OUT_DIR, WORK_DIR, ROOT_MAIN].join(path.delimiter);
@@ -628,6 +657,34 @@ async function main() {
       fanOut.json.results.length === 2 &&
       fanOut.json.results.every((r) => r.skipped === true),
       `count=${fanOut?.json?.count} results=${fanOut?.json?.results?.length}`);
+
+    // 38. 会话复用：同一 --thread 的第二个任务resume，不新建会话
+    const thA = runCli(['new', '--to', 'fake', '--from', 'hermes', '--goal', 'thread-a']).json?.id;
+    const thB = runCli(['new', '--to', 'fake', '--from', 'hermes', '--goal', 'thread-b']).json?.id;
+    const dThA = runCli(['dispatch', thA, '--allow-dispatch', '--wait', '15', '--thread', 't-reuse'], { envExtra: fakeAdapterEnv('fake-sess-9') });
+    const dThB = runCli(['dispatch', thB, '--allow-dispatch', '--wait', '15', '--thread', 't-reuse'], { envExtra: fakeAdapterEnv('fake-sess-9') });
+    assertCase(38, '会话复用：同 thread 第二次 dispatch resumed=true、session 不变',
+      dThA.json?.thread?.resumed === false &&
+      dThB.json?.thread?.resumed === true &&
+      dThB.json?.thread?.session === 'fake-sess-9',
+      `first=${dThA.json?.thread?.resumed} second=${dThB.json?.thread?.resumed} session=${dThB.json?.thread?.session}`);
+
+    // 39. 会话过期：超过 2 小时的自动换新会话（task:<id> 自动线程同样受限）
+    const thC = runCli(['new', '--to', 'fake', '--from', 'hermes', '--goal', 'thread-expired']).json?.id;
+    const thDb = new DatabaseSync(path.join(ROOT_MAIN, 'agentbus.db'));
+    try {
+      thDb.prepare("INSERT INTO threads (agent, name, session_id, created_at, uses, steps, updated_at) VALUES ('fake', ?, 'stale-sess', ?, 5, 0, ?) " +
+        'ON CONFLICT(agent, name) DO UPDATE SET session_id = excluded.session_id, created_at = excluded.created_at, uses = 5, steps = 0')
+        .run(`task:${thC}`, new Date(Date.now() - 3 * 3600 * 1000).toISOString(), new Date().toISOString());
+    } finally {
+      try { thDb.close(); } catch {}
+    }
+    const dThC = runCli(['dispatch', thC, '--allow-dispatch', '--wait', '15'], { envExtra: fakeAdapterEnv('fresh-sess') });
+    assertCase(39, '会话过期：>2 小时的旧会话不再 resume，自动换新',
+      dThC.json?.thread?.name === `task:${thC}` &&
+      dThC.json?.thread?.resumed === false &&
+      dThC.json?.thread?.session === 'fresh-sess',
+      `name=${dThC.json?.thread?.name} resumed=${dThC.json?.thread?.resumed} session=${dThC.json?.thread?.session}`);
   } finally {
     try { fs.rmSync(RUN_BASE, { recursive: true, force: true }); } catch {}
   }

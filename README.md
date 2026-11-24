@@ -180,6 +180,15 @@ When an agent fails because of upstream capacity (e.g. `503 No capacity availabl
 
 Model inference dominates, not the bus: Codex 45.5s, Antigravity 30s — communication overhead is under 1%. For speed, fan out, reuse sessions, pick the right model.
 
+### Session reuse and limits
+
+- **A task's retries share one conversation**: the `threads` table records `task:<id>` automatically, so repeated 503 retries no longer create one sidebar entry per attempt.
+- **Cross-task reuse** is explicit: `--thread <name>`. Antigravity continues the conversation with `send-message`; Codex uses `exec resume`.
+- **Limits**: a conversation older than 2 hours, past 40 steps, or reused more than 40 times is replaced (`AGENTBUS_THREAD_MAX_AGE_S` / `_MAX_STEPS` / `_MAX_USES`). Antigravity step counts are read from its conversation DB; other agents fall back to the reuse count.
+- **Dated titles**: new conversations are titled `agentbus 11-24 tmw…`, so stale ones are easy to spot.
+
+Measured: two tasks sharing one thread grew the conversation directory from 37 to 38 entries (one conversation for two tasks); the second run reported `resumed=true` with the same session id.
+
 ### Model fallback
 
 If the configured model fails (`model_not_found`, `not supported`, `503 No capacity`), dispatch walks a candidate list: configured value → `AGENTBUS_FALLBACK_MODELS` (comma-separated) → the agent's known models → no model (CLI default). Each attempt gets at most 120s; model errors abort the wait immediately and move on. The result's `attempts` array records every model tried.

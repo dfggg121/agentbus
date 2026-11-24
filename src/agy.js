@@ -6,6 +6,24 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { spawnSync } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
+
+// How many steps a conversation has accumulated. Used by thread limits: a
+// long-lived conversation re-reads its whole history on every turn, so past
+// ~40 steps a fresh conversation is cheaper than continuity.
+export function conversationStepCount(sessionId, home = os.homedir()) {
+  if (!sessionId) return null;
+  const file = path.join(home, '.gemini', 'antigravity', 'conversations', `${sessionId}.db`);
+  if (!fs.existsSync(file)) return null;
+  try {
+    const db = new DatabaseSync(file, { readOnly: true });
+    const row = db.prepare('SELECT COUNT(*) AS c FROM steps').get();
+    db.close();
+    return Number(row?.c || 0);
+  } catch {
+    return null;
+  }
+}
 
 export function defaultAgySessionPath(busRoot) {
   return process.env.AGENTBUS_AGY_SESSION || path.join(busRoot || process.cwd(), 'antigravity-session.json');

@@ -11,7 +11,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { showTask } from './tasks.js';
-import { defaultAgySessionPath, readAgySession, detectAgentApi, discoverAgySession } from './agy.js';
+import { defaultAgySessionPath, readAgySession, detectAgentApi, discoverAgySession, conversationStepCount } from './agy.js';
 import { modelFor, KNOWN_MODELS } from './agents.js';
 
 export function dispatchEnabled(flag) {
@@ -20,20 +20,59 @@ export function dispatchEnabled(flag) {
 
 // Session affinity, borrowed from magpie's Claude bridge: a conversation's
 // turns must find the same underlying session, not start cold each time.
-function getThread(bus, agent, name) {
-  const row = bus.db.prepare('SELECT session_id FROM threads WHERE agent = ? AND name = ?').get(agent, name);
-  return row ? row.session_id : null;
+const THREAD_MAX_AGE_S = () => Number(process.env.AGENTBUS_THREAD_MAX_AGE_S || 7200);
+const THREAD_MAX_STEPS = () => Number(process.env.AGENTBUS_THREAD_MAX_STEPS || 40);
+const THREAD_MAX_USES = () => Number(process.env.AGENTBUS_THREAD_MAX_USES || 40);
+
+// A conversation re-reads its whole history on every turn, so past these limits
+// a fresh one is cheaper than continuity.
+export function threadUsable(row, now = Date.now()) {
+  if (!row || !row.session_id) return false;
+  const created = row.created_at ? Date.parse(row.created_at) : now;
+  if (Number.isFinite(created) && (now - created) / 1000 > THREAD_MAX_AGE_S()) return false;
+  if (Number(row.steps || 0) > THREAD_MAX_STEPS()) return false;
+  if (Number(row.uses || 0) > THREAD_MAX_USES()) return false;
+  return true;
 }
 
-function setThread(bus, agent, name, sessionId) {
+function getThreadRow(bus, agent, name) {
+  return bus.db.prepare(
+    'SELECT session_id, created_at, uses, steps FROM threads WHERE agent = ? AND name = ?',
+  ).get(agent, name);
+}
+
+function clearThread(bus, agent, name) {
+  bus.db.prepare('DELETE FROM threads WHERE agent = ? AND name = ?').run(agent, name);
+}
+
+function getThread(bus, agent, name) {
+  const row = getThreadRow(bus, agent, name);
+  if (!row) return null;
+  if (!threadUsable(row)) {
+    clearThread(bus, agent, name);
+    return null;
+  }
+  return row.session_id;
+}
+
+function touchThread(bus, agent, name) {
   bus.db.prepare(
-    'INSERT INTO threads (agent, name, session_id, updated_at) VALUES (?, ?, ?, ?) ' +
-    'ON CONFLICT(agent, name) DO UPDATE SET session_id = excluded.session_id, updated_at = excluded.updated_at',
-  ).run(agent, name, sessionId, new Date().toISOString());
+    'UPDATE threads SET uses = uses + 1, updated_at = ? WHERE agent = ? AND name = ?',
+  ).run(new Date().toISOString(), agent, name);
+}
+
+function setThread(bus, agent, name, sessionId, steps = 0) {
+  const now = new Date().toISOString();
+  bus.db.prepare(
+    'INSERT INTO threads (agent, name, session_id, created_at, uses, steps, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?) ' +
+    'ON CONFLICT(agent, name) DO UPDATE SET session_id = excluded.session_id, steps = excluded.steps, updated_at = excluded.updated_at',
+  ).run(agent, name, sessionId, now, steps, now);
 }
 
 function extractSession(stdout) {
-  const m = stdout.match(/"thread_id"\s*:\s*"([^"]+)"/) || stdout.match(/"session_id"\s*:\s*"([^"]+)"/);
+  const m = stdout.match(/"thread_id"\s*:\s*"([^"]+)"/)
+    || stdout.match(/"session_id"\s*:\s*"([^"]+)"/)
+    || stdout.match(/"conversationId"\s*:\s*"([^"]+)"/);
   return m ? m[1] : null;
 }
 
@@ -69,7 +108,7 @@ const BUILTIN = {
     command: 'gemini',
     args: [...(model ? ['-m', model] : []), '-p', prompt, '--yolo'],
   }),
-  antigravity: ({ prompt, busRoot, id, model }) => {
+  antigravity: ({ prompt, busRoot, id, model, session }) => {
     const bin = detectAgentApi();
     if (!bin) {
       throw Object.assign(new Error(
@@ -109,6 +148,17 @@ const BUILTIN = {
         env,
       };
     };
+    // Resuming: send the new task into the SAME conversation. A 503 retry or a
+    // same-task retry then costs one sidebar entry instead of one per attempt.
+    const title = `agentbus ${new Date().toISOString().slice(5, 10)} ${id || ''}`.trim();
+    if (session) {
+      return {
+        command: bin,
+        args: [...base, 'send-message', `--title=${title}`, session, oneLine],
+        env,
+        sessionFile,
+      };
+    }
     return {
       command: bin,
       args: [
@@ -118,7 +168,7 @@ const BUILTIN = {
         // for model gemini-4-hydrogen-tiered-high"); AGENTBUS_AGY_MODEL=flash
         // pins a cheaper tier that answers instead of retrying forever.
         ...(model || process.env.AGENTBUS_AGY_MODEL ? [`--model=${model || process.env.AGENTBUS_AGY_MODEL}`] : []),
-        `--title=agentbus ${id || ''}`.trim(),
+        `--title=${title}`,
         oneLine,
       ],
       env,
@@ -345,7 +395,11 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, 
   }
 
   for (const [k, v] of Object.entries(env)) process.env[k] = v;
-  const session = thread ? getThread(bus, task.to, thread) : null;
+  // Retries of the same task reuse one conversation (`task:<id>`); explicit
+  // --thread shares one across tasks. Both obey the age/step limits below.
+  const threadName = thread || `task:${task.id}`;
+  const session = getThread(bus, task.to, threadName);
+  if (session) touchThread(bus, task.to, threadName);
   const candidates = modelCandidates(bus.config.rootDir, task.to);
   const multi = candidates.length > 1;
   const totalDeadline = Date.now() + Math.max(5, wait_s) * 1000;
@@ -355,6 +409,7 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, 
   let lastRun = null;
   let usedModel = null;
   let sessionId = session;
+  let capturedSession = null;
   const attempts = [];
 
   for (let i = 0; i < candidates.length; i++) {
@@ -371,7 +426,7 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, 
       prompt: buildPrompt(task.id, task.goal, task.to, workdir),
       cwd: workdir,
       busRoot: bus.config.rootDir,
-      session: sessionId,
+      session: i === 0 ? sessionId : null,
       id: task.id,
       model,
     });
@@ -408,12 +463,8 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, 
     lastRun = adapterResult;
     usedModel = model;
 
-    if (thread && !sessionId) {
-      const found = extractSession(adapterResult.stdout || '');
-      if (found) {
-        setThread(bus, task.to, thread, found);
-        sessionId = found;
-      }
+    if (!capturedSession) {
+      capturedSession = extractSession(`${adapterResult.stdout || ''}${adapterResult.stderr || ''}`);
     }
 
     attempts.push({
@@ -432,6 +483,15 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, 
     if (i + 1 >= candidates.length) break;
   }
 
+  // Persist the conversation id even when the task did not finish: a 503 retry
+  // then continues the same conversation instead of creating another sidebar entry.
+  const finalSession = capturedSession || sessionId;
+  if (finalSession) {
+    const steps = task.to === 'antigravity' ? (conversationStepCount(finalSession) || 0) : 0;
+    setThread(bus, task.to, threadName, finalSession, steps);
+    sessionId = finalSession;
+  }
+
   const healthAfter = markAgentHealth(bus, task.to, {
     ok: latest.state === 'done',
     text: `${lastRun?.stdout || ''}${lastRun?.stderr || ''}`,
@@ -447,7 +507,7 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, 
     attempts: attempts.length > 1 ? attempts : undefined,
     elapsed_s: Number(((Date.now() - t0) / 1000).toFixed(1)),
     health: healthAfter || undefined,
-    thread: thread ? { name: thread, session: sessionId, resumed: !!session } : undefined,
+    thread: { name: threadName, session: sessionId, resumed: !!session, auto: !thread },
     adapter: lastSpec
       ? { command: lastSpec.command, exit: lastRun?.exit ?? null, seconds: lastRun?.seconds ?? null }
       : undefined,

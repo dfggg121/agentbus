@@ -22,6 +22,10 @@ All notable changes to this project are documented here. Format follows [Keep a 
 - MCP dispatch default wait lowered to 3s; conductors poll via `bus_task_wait` instead of blocking a single call.
 - Polling tightened to 150ms for the first 8s (backing off to 400ms); dispatches now report `elapsed_s`. Overhead measured ~0.19s per dispatch with a 300ms fake agent.
 - Acceptance now 37 cases (adds fan-out structure).
+- Retries of one task reuse one conversation: dispatch records `task:<id>` in `threads`, so repeated 503 attempts no longer create a new sidebar entry each time. Antigravity resumes via `send-message`, Codex via `exec resume`.
+- Thread limits: `AGENTBUS_THREAD_MAX_AGE_S` (7200), `AGENTBUS_THREAD_MAX_STEPS` (40), `AGENTBUS_THREAD_MAX_USES` (40). Antigravity step counts are read from its conversation DB, others fall back to reuse count.
+- New-conversation titles carry a date prefix (`agentbus 11-24 <id>`).
+- Acceptance now 39 cases (adds thread reuse and expiry).
 
 ## [0.1.0] — 2026-11-23
 
