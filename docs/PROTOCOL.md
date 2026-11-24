@@ -141,9 +141,20 @@ Transport: newline-delimited JSON-RPC 2.0 over stdio (no `Content-Length` framin
 | `bus_task_fail` | `id`, `by`, `lease_token`, `reason` | — |
 | `bus_task_list` | — | `state`, `to`, `limit` |
 | `bus_verify` | — | `id` |
-| `bus_task_dispatch` | starts the target agent CLI, then waits | `id`, `cwd`, `wait_s` |
+| `bus_task_dispatch` | starts the target agent CLI, then waits | `id`, `cwd`, `wait_s`, `thread`, `force` |
 
 `refs` accepts `["<sha256>", …]` or `[{"sha256": "...", "note": "..."}, …]`.
+
+### Roles
+
+`AGENTBUS_ROLE` (set by `agentbus onboard`, or by hand) trims the surface:
+
+- `conductor` / unset: all ten tools.
+- `worker`: `bus_register`, `bus_task_claim`, `bus_task_heartbeat`, `bus_ref_read`, `bus_task_complete`, `bus_task_fail`. Calls to `bus_task_create`, `bus_task_list`, `bus_verify` or `bus_task_dispatch` are rejected with `isError: true`, so a dispatched agent cannot spawn its own fan-out.
+
+Per-agent model choices live in `<bus root>/agents.json` (`{ "conductor": "codex", "models": { "antigravity": "gemini-4-neon" } }`), written by onboarding and read at dispatch time. The file is git-ignored; the protocol never carries preferences.
+
+`agent_health` records cooldowns (`capacity/503` → 900 s, other failures → 120 s). A cooled-down agent is skipped unless `force` is set; a successful `done` clears the row.
 
 Tool failures use `isError: true` inside `result`, with `structuredContent.error`. Protocol-level errors (`-32601`, `-32602`) are reserved for malformed requests.
 

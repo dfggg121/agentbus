@@ -81,6 +81,14 @@ CREATE TABLE IF NOT EXISTS threads (
   PRIMARY KEY (agent, name)
 );
 
+CREATE TABLE IF NOT EXISTS agent_health (
+  agent TEXT PRIMARY KEY,
+  cooldown_until TEXT,
+  reason TEXT,
+  fails INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS events (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   at TEXT NOT NULL,

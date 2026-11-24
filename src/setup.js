@@ -36,9 +36,9 @@ function writeAtomic(file, text) {
 
 // ---------- server spec ----------
 
-function serverSpec({ root, allowed, bin = 'node' }) {
+function serverSpec({ root, allowed, bin = 'node', env: extraEnv }) {
   const roots = (allowed && allowed.length ? allowed : [root]).map((p) => path.resolve(p));
-  const env = { AGENTBUS_ALLOWED_ROOTS: roots.join(path.delimiter) };
+  const env = { AGENTBUS_ALLOWED_ROOTS: roots.join(path.delimiter), ...(extraEnv || {}) };
   if (bin === 'npx') {
     return { command: 'npx', args: ['-y', 'agentbus-mcp', 'mcp', '--root', path.resolve(root)], env };
   }
@@ -193,13 +193,13 @@ function applyClient(client, opts) {
   return { client: client.id, file, backup: bak, changed: true };
 }
 
-export function setupClients({ clients, root, allowed, bin, home, dryRun }) {
+export function setupClients({ clients, root, allowed, bin, home, dryRun, env }) {
   const ids = clients && clients.length ? clients : CLIENTS.map((c) => c.id);
   const unknown = ids.filter((id) => !CLIENTS.some((c) => c.id === id));
   if (unknown.length) {
     throw Object.assign(new Error(`未知客户端: ${unknown.join(', ')}；可选: ${listClients().join(', ')}`), { code: 1 });
   }
-  const opts = { root: root || defaultRoot(), allowed, bin: bin || 'node', home: home || os.homedir(), dryRun: !!dryRun };
+  const opts = { root: root || defaultRoot(), allowed, bin: bin || 'node', home: home || os.homedir(), dryRun: !!dryRun, env };
   const results = [];
   for (const id of ids) {
     const client = CLIENTS.find((c) => c.id === id);

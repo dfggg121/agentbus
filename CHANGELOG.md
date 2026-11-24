@@ -9,6 +9,10 @@ All notable changes to this project are documented here. Format follows [Keep a 
 - Built-in adapters: `codex`, `claude`, `gemini`, `antigravity`; extensible with `AGENTBUS_ADAPTER_<NAME>`.
 - Dispatch result reports `state` from the bus, not the child's exit code.
 - `--thread <name>` / `thread` argument: session affinity via a `threads` table; Codex threads resume the recorded session id. Resumed Codex runs use `--dangerously-bypass-approvals-and-sandbox` because `exec resume` lacks `--approve-for-me`.
+- `agentbus onboard`: detects installed agents, picks a conductor, asks which model each agent should use, stores answers in a git-ignored `agents.json`, and writes `AGENTBUS_ROLE` into every client config.
+- Role enforcement: workers only see register/claim/heartbeat/ref_read/complete/fail; create/dispatch/verify are rejected.
+- `agent_health` cooldown: capacity failures (503) pause an agent for 900s, other failures 120s; `dispatch --force` overrides. One success clears it.
+- Per-agent model is taken from `agents.json` and passed to the adapter (`codex -m`, `claude --model`, `gemini -m`, antigravity `--model`).
 
 ## [0.1.0] — 2026-11-23
 

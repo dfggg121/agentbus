@@ -154,6 +154,29 @@ Antigravity 是异步起会话的，`dispatch` 可能在任务还 `open` 时就�
 agentbus wait <task-id> --timeout 900
 ```
 
+### 导入：探测本机 agent 并分角色（onboard）
+
+在一台新机器上，不用逐个手写配置：
+
+```bash
+agentbus onboard --conductor codex --allow /path/to/workspace
+```
+
+它会：
+
+1. 扫 PATH 与已知安装位置，列出本机装了哪些 agent（Codex / Claude Code / Gemini / Antigravity / OpenCode）
+2. 选一个 **conductor**（主 agent，能建任务、派活、验收），其余写成 **worker**
+3. 交互式询问每个 agent 主要用哪个模型（回车=默认），答案存进总线根目录的 `agents.json`（已在 .gitignore，不进仓库）
+4. 改写各家的 MCP 配置，注入 `AGENTBUS_ROLE`
+
+角色不是摆设：worker 的 `tools/list` 只返回 6 个工具（register / claim / heartbeat / ref_read / complete / fail），调用 `bus_task_create` 或 `bus_task_dispatch` 会被直接拒绝。这样被派的 agent 没法自己再派活，避免回路。
+
+模型只存本机：仓库里没有任何人的偏好值，只有"询问 + 存储 + 生效"这套机制。
+
+### 健康冷却
+
+某个 agent 因上游容量（例如 503 `No capacity available`）失败后，总线会给它记一段冷却（默认 900 秒，其它失败 120 秒）。冷却期内 `dispatch` 直接返回 `skipped: true` 并给出到期时间，不再干等；确认要重试加 `--force`。成功一次即清除。
+
 ---
 
 ## 安全模型

@@ -20,12 +20,16 @@ import { startMcpStdio, startMcpHttp } from '../src/mcp.js';
 import { setupClients, doctor, listClients, defaultRoot } from '../src/setup.js';
 import { dispatchTask, dispatchEnabled, waitForTask } from '../src/dispatch.js';
 import { exportAgySession, defaultAgySessionPath } from '../src/agy.js';
+import { detectAgents, readAgentConfig, writeAgentConfig } from '../src/agents.js';
+import os from 'node:os';
+import path from 'node:path';
+import * as rlPromises from 'node:readline/promises';
 
 const VERSION = '0.1.0';
 
 function parseArgs(argv) {
-  const out = { _: [], ref: [], accept: [], constraint: [], field: [], client: [], allow: [] };
-  const multi = new Set(['ref', 'accept', 'constraint', 'field', 'client', 'allow']);
+  const out = { _: [], ref: [], accept: [], constraint: [], field: [], client: [], allow: [], model: [] };
+  const multi = new Set(['ref', 'accept', 'constraint', 'field', 'client', 'allow', 'model']);
 
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -103,6 +107,7 @@ function printHelp() {
       'list [--state <state>] [--to <agent>] [--limit <n>]',
       'dispatch <id> [--cwd <dir>] [--wait <seconds>] [--thread <name>] [--allow-dispatch]',
       'wait <id> [--timeout <seconds>]   # 等异步 agent 把任务做完',
+      'onboard [--conductor <agent>] [--model <agent>=<id>]... [--yes] [--dry-run]   # 探测本机 agent 并写好通信配置',
       'agy-session [--out <file>]   # 在 Antigravity 集成终端里运行，导出会话地址与令牌',
       'mcp [--root <dir>] [--http 127.0.0.1:<port>]',
     ],
@@ -267,6 +272,78 @@ async function main() {
         break;
       }
 
+      case 'onboard': {
+        const home = typeof args.home === 'string' ? args.home : os.homedir();
+        const detected = detectAgents(home).filter((a) => a.installed);
+        if (!detected.length) {
+          throw Object.assign(new Error('没有探测到任何已安装的 agent'), { code: 1 });
+        }
+
+        const provided = {};
+        for (const spec of [].concat(args.model || [])) {
+          const [agent, id] = String(spec).split('=');
+          if (agent && id) provided[agent] = id;
+        }
+
+        let conductorId = typeof args.conductor === 'string' ? args.conductor : null;
+        if (!conductorId) {
+          conductorId = (detected.find((a) => a.capabilities.includes('conductor')) || detected[0]).id;
+        }
+        if (!detected.some((a) => a.id === conductorId)) {
+          throw Object.assign(new Error(`--conductor ${conductorId} 不在已探测列表里: ${detected.map((a) => a.id).join(', ')}`), { code: 1 });
+        }
+
+        const models = { ...readAgentConfig(bus.config.rootDir).models, ...provided };
+        const notes = [];
+
+        if (process.stdin.isTTY && !args.yes) {
+          const rl = rlPromises.createInterface({ input: process.stdin, output: process.stderr });
+          try {
+            for (const a of detected) {
+              if (provided[a.id]) continue;
+              const options = a.models.length ? `（例: ${a.models.join(' / ')}）` : '';
+              const answer = await rl.question(`${a.id} 主要用哪个模型？${options} [回车=默认] `);
+              if (answer.trim()) models[a.id] = answer.trim();
+            }
+          } finally {
+            rl.close();
+          }
+        } else if (!args.yes) {
+          notes.push('非交互环境：模型用 --model <agent>=<id> 指定，未指定则留空');
+        }
+
+        const knownClients = listClients();
+        const configured = [];
+        for (const a of detected) {
+          if (!knownClients.includes(a.id)) continue;
+          const env = { AGENTBUS_ROLE: a.id === conductorId ? 'conductor' : 'worker' };
+          const r = setupClients({
+            clients: [a.id],
+            root: bus.config.rootDir,
+            allowed: (args.allow && args.allow.length ? args.allow : [process.cwd()]),
+            env,
+            dryRun: args['dry-run'] === true,
+          });
+          configured.push({ agent: a.id, role: env.AGENTBUS_ROLE, ok: r.ok, files: r.results.map((x) => x.file || x.client) });
+        }
+
+        const cfg = args['dry-run'] === true
+          ? { conductor: conductorId, models, dry_run: true }
+          : writeAgentConfig(bus.config.rootDir, { conductor: conductorId, models });
+
+        result = {
+          conductor: conductorId,
+          detected: detected.map((a) => ({ id: a.id, bin: a.bin, config: a.config })),
+          models,
+          configured,
+          config_file: path.join(bus.config.rootDir, 'agents.json'),
+          notes,
+          dry_run: args['dry-run'] === true || undefined,
+          next: `重启 ${conductorId} 后它就有派活权限；worker 只有 claim/read/complete`,
+        };
+        break;
+      }
+
       case 'wait': {
         result = await waitForTask(bus, args._[1], args.timeout !== undefined ? Number(args.timeout) : 900);
         if (result.state !== 'done') exitCode = 1;
@@ -288,6 +365,7 @@ async function main() {
           cwd: typeof args.cwd === 'string' ? args.cwd : null,
           wait_s: args.wait !== undefined ? Number(args.wait) : 600,
           thread: typeof args.thread === 'string' ? args.thread : null,
+          force: args.force === true,
         });
         if (result.state !== 'done') exitCode = 1;
         break;

@@ -12,6 +12,7 @@ import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { showTask } from './tasks.js';
 import { defaultAgySessionPath, readAgySession, detectAgentApi, discoverAgySession } from './agy.js';
+import { modelFor } from './agents.js';
 
 export function dispatchEnabled(flag) {
   return !!flag || process.env.AGENTBUS_ENABLE_DISPATCH === '1';
@@ -37,8 +38,9 @@ function extractSession(stdout) {
 }
 
 const BUILTIN = {
-  codex: ({ prompt, cwd, session }) => {
+  codex: ({ prompt, cwd, session, model }) => {
     const bin = process.env.AGENTBUS_CODEX_BIN || (process.platform === 'win32' ? 'codex.cmd' : 'codex');
+    const modelArgs = model ? ['-m', model] : [];
     const base = ['exec'];
     if (session) {
       // Session affinity (the magpie idea): a thread's next task resumes the
@@ -47,7 +49,7 @@ const BUILTIN = {
         command: bin,
         // `resume` has no --approve-for-me; MCP calls need approvals bypassed.
         // Documented in SECURITY.md: resume runs unsandboxed by Codex's own rules.
-        args: [...base, 'resume', session, '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', '-'],
+        args: [...base, 'resume', session, ...modelArgs, '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', '-'],
         stdinPrompt: prompt,
         keepsSession: true,
       };
@@ -55,19 +57,19 @@ const BUILTIN = {
     return {
       // The prompt goes over stdin ("-"): no quoting problems on any platform.
       command: bin,
-      args: [...base, '--json', '--approve-for-me', '--skip-git-repo-check', '-C', cwd, '-'],
+      args: [...base, ...modelArgs, '--json', '--approve-for-me', '--skip-git-repo-check', '-C', cwd, '-'],
       stdinPrompt: prompt,
     };
   },
-  claude: ({ prompt }) => ({
+  claude: ({ prompt, model }) => ({
     command: 'claude',
-    args: ['-p', prompt, '--permission-mode', 'acceptEdits'],
+    args: [...(model ? ['--model', model] : []), '-p', prompt, '--permission-mode', 'acceptEdits'],
   }),
-  gemini: ({ prompt }) => ({
+  gemini: ({ prompt, model }) => ({
     command: 'gemini',
-    args: ['-p', prompt, '--yolo'],
+    args: [...(model ? ['-m', model] : []), '-p', prompt, '--yolo'],
   }),
-  antigravity: ({ prompt, busRoot, id }) => {
+  antigravity: ({ prompt, busRoot, id, model }) => {
     const bin = detectAgentApi();
     if (!bin) {
       throw Object.assign(new Error(
@@ -115,7 +117,7 @@ const BUILTIN = {
         // The default tier can be out of capacity (503 "No capacity available
         // for model gemini-4-hydrogen-tiered-high"); AGENTBUS_AGY_MODEL=flash
         // pins a cheaper tier that answers instead of retrying forever.
-        ...(process.env.AGENTBUS_AGY_MODEL ? [`--model=${process.env.AGENTBUS_AGY_MODEL}`] : []),
+        ...(model || process.env.AGENTBUS_AGY_MODEL ? [`--model=${model || process.env.AGENTBUS_AGY_MODEL}`] : []),
         `--title=agentbus ${id || ''}`.trim(),
         oneLine,
       ],
@@ -160,6 +162,7 @@ function buildPrompt(id, goal, to, cwd) {
     '2) bus_ref_read 逐个读 refs，返回 resource_link 的按 uri 自己读文件；',
     '3) 按需求产出结果文件；',
     '4) bus_task_complete 交回，fields 用你实际算出的值。',
+    '注意：如果产出不是 JSON，就不要传 fields——传了会强制按 JSON 校验结果文件。',
     '不要跳过 complete；完不成用 bus_task_fail 说明原因。',
   ].filter(Boolean).join('\n');
 }
@@ -267,7 +270,32 @@ export async function waitForTask(bus, id, timeout_s = 900, poll_ms = 1000) {
   };
 }
 
-export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 700, env = {}, thread = null }) {
+function agentHealth(bus, agent) {
+  const row = bus.db.prepare('SELECT cooldown_until, reason FROM agent_health WHERE agent = ?').get(agent);
+  if (!row || !row.cooldown_until) return null;
+  return new Date(row.cooldown_until).getTime() > Date.now() ? row : null;
+}
+
+function markAgentHealth(bus, agent, { ok, text = '' }) {
+  const at = new Date().toISOString();
+  if (ok) {
+    bus.db.prepare(
+      'INSERT INTO agent_health (agent, cooldown_until, reason, fails, updated_at) VALUES (?, NULL, NULL, 0, ?) ' +
+      'ON CONFLICT(agent) DO UPDATE SET cooldown_until = NULL, reason = NULL, fails = 0, updated_at = excluded.updated_at',
+    ).run(agent, at);
+    return null;
+  }
+  const capacity = /503|No capacity|UNAVAILABLE|overloaded|capacity/i.test(text);
+  const cooldownS = Number(process.env.AGENTBUS_COOLDOWN_S || (capacity ? 900 : 120));
+  const until = new Date(Date.now() + cooldownS * 1000).toISOString();
+  bus.db.prepare(
+    'INSERT INTO agent_health (agent, cooldown_until, reason, fails, updated_at) VALUES (?, ?, ?, 1, ?) ' +
+    'ON CONFLICT(agent) DO UPDATE SET cooldown_until = excluded.cooldown_until, reason = excluded.reason, fails = fails + 1, updated_at = excluded.updated_at',
+  ).run(agent, until, capacity ? 'capacity/503' : 'adapter failure', at);
+  return { cooldown_until: until, reason: capacity ? 'capacity/503' : 'adapter failure' };
+}
+
+export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 700, env = {}, thread = null, force = false }) {
   const task = showTask(bus, id);
   if (!task) throw Object.assign(new Error(`找不到任务: ${id}`), { code: 1 });
   if (task.state === 'done' || task.state === 'failed') {
@@ -276,14 +304,32 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 700, 
   const workdir = cwd || process.cwd();
   if (!existsSync(workdir)) throw Object.assign(new Error(`cwd 不存在: ${workdir}`), { code: 1 });
 
+  const health = force ? null : agentHealth(bus, task.to);
+  if (health) {
+    return {
+      id: task.id,
+      to: task.to,
+      state: task.state,
+      ok: false,
+      dispatched: false,
+      skipped: true,
+      reason: 'cooldown',
+      cooldown_until: health.cooldown_until,
+      detail: health.reason,
+      hint: `该 agent 冷却中（${health.reason}，到 ${health.cooldown_until}）；确认要重试就加 --force`,
+    };
+  }
+
   for (const [k, v] of Object.entries(env)) process.env[k] = v;
   const session = thread ? getThread(bus, task.to, thread) : null;
+  const model = modelFor(bus.config.rootDir, task.to);
   const spec = resolveAdapter(task.to, {
     prompt: buildPrompt(task.id, task.goal, task.to, workdir),
     cwd: workdir,
     busRoot: bus.config.rootDir,
     session,
     id: task.id,
+    model,
   });
 
   const run = runAdapter(spec, { cwd: workdir, timeout_s: Math.max(5, wait_s) });
@@ -314,12 +360,19 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 700, 
     }
   }
 
+  const healthAfter = markAgentHealth(bus, task.to, {
+    ok: latest.state === 'done',
+    text: `${adapterResult.stdout || ''}${adapterResult.stderr || ''}`,
+  });
+
   return {
     id: task.id,
     to: task.to,
     state: latest.state,
     ok: latest.state === 'done',
     dispatched: true,
+    model: model || undefined,
+    health: healthAfter || undefined,
     thread: thread ? { name: thread, session: sessionId, resumed: !!session } : undefined,
     adapter: { command: spec.command, exit: adapterResult.exit ?? null, seconds: adapterResult.seconds ?? null },
     result: latest.result || null,

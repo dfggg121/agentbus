@@ -20,6 +20,24 @@ import { dispatchTask, dispatchEnabled } from './dispatch.js';
 const SUPPORTED_PROTOCOL_VERSIONS = new Set(['2025-06-18', '2025-03-26']);
 const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
 
+const WORKER_TOOLS = new Set([
+  'bus_register',
+  'bus_task_claim',
+  'bus_task_heartbeat',
+  'bus_ref_read',
+  'bus_task_complete',
+  'bus_task_fail',
+]);
+
+function currentRole() {
+  return String(process.env.AGENTBUS_ROLE || 'all').toLowerCase();
+}
+
+function visibleTools() {
+  if (currentRole() !== 'worker') return MCP_TOOLS;
+  return MCP_TOOLS.filter((t) => WORKER_TOOLS.has(t.name));
+}
+
 export const MCP_TOOLS = [
   {
     name: 'bus_register',
@@ -179,6 +197,7 @@ export const MCP_TOOLS = [
         cwd: { type: 'string', description: '被唤起 agent 的工作目录，默认当前进程 cwd' },
         wait_s: { type: 'number', description: '最长等待秒数，默认 600' },
         thread: { type: 'string', description: '会话名：同名线程复用同一 agent 会话（会话亲和）' },
+        force: { type: 'boolean', description: '忽略该 agent 的健康冷却，强制重试' },
       },
       required: ['id'],
     },
@@ -317,7 +336,7 @@ function invokeTool(bus, name, args = {}) {
         if (!dispatchEnabled()) {
           return toolError(new Error('dispatch 未启用：服务端需设置 AGENTBUS_ENABLE_DISPATCH=1'));
         }
-        return dispatchTask(bus, { id: a.id, cwd: a.cwd, wait_s: a.wait_s })
+        return dispatchTask(bus, { id: a.id, cwd: a.cwd, wait_s: a.wait_s, thread: a.thread || null, force: a.force === true })
           .then((res) => toolSuccess(res))
           .catch((err) => toolError(err));
       }
@@ -367,7 +386,7 @@ export function handleJsonRpcMessage(bus, msg) {
       return {
         jsonrpc: '2.0',
         id: msg.id,
-        result: { tools: MCP_TOOLS },
+        result: { tools: visibleTools() },
       };
 
     case 'tools/call': {
@@ -378,6 +397,13 @@ export function handleJsonRpcMessage(bus, msg) {
           jsonrpc: '2.0',
           id: msg.id,
           result: toolError(new Error(`未知工具: ${toolName || ''}`)),
+        };
+      }
+      if (currentRole() === 'worker' && !WORKER_TOOLS.has(toolName)) {
+        return {
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: toolError(new Error(`角色 worker 不允许调用 ${toolName}（只有 conductor 能建任务/派活/验收）`)),
         };
       }
       return {

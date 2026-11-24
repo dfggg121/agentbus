@@ -154,6 +154,22 @@ Antigravity starts conversations asynchronously, so `dispatch` can return while 
 agentbus wait <task-id> --timeout 900
 ```
 
+### Onboarding: detect agents, split roles
+
+```bash
+agentbus onboard --conductor codex --allow /path/to/workspace
+```
+
+It scans PATH and known install locations for Codex, Claude Code, Gemini CLI, Antigravity and OpenCode, picks one **conductor** (can create/dispatch/verify) and writes the rest as **worker**. It then asks which model each agent should default to and stores the answers in `agents.json` in the bus root (git-ignored), and rewrites each client's MCP config with `AGENTBUS_ROLE`.
+
+Roles are enforced, not cosmetic: a worker's `tools/list` returns only six tools (register / claim / heartbeat / ref_read / complete / fail), and calling `bus_task_create` or `bus_task_dispatch` is rejected — a dispatched agent cannot dispatch further.
+
+Model choices stay local: the repo ships the ask/store/apply mechanism, never anybody's preferences.
+
+### Health cooldown
+
+When an agent fails because of upstream capacity (e.g. `503 No capacity available`), the bus records a cooldown (900s for capacity, 120s otherwise). `dispatch` then returns `skipped: true` with the expiry instead of waiting; pass `--force` to retry anyway. One success clears it.
+
 ---
 
 ## Security model
