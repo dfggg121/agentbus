@@ -19,7 +19,8 @@ import {
 import { startMcpStdio, startMcpHttp } from '../src/mcp.js';
 import { setupClients, doctor, listClients, defaultRoot } from '../src/setup.js';
 import { dispatchTask, dispatchEnabled, waitForTask } from '../src/dispatch.js';
-import { exportAgySession, defaultAgySessionPath } from '../src/agy.js';
+import { exportAgySession, defaultAgySessionPath, archiveConversation } from '../src/agy.js';
+import { loadContextLedger, confirmDecision } from '../src/context.js';
 import { detectAgents, readAgentConfig, writeAgentConfig } from '../src/agents.js';
 import os from 'node:os';
 import path from 'node:path';
@@ -96,17 +97,19 @@ function printHelp() {
       'version',
       'init [--root <dir>]',
       'put <path> [--as <name>] [--by <agent>] [--root <dir>]',
-      'new --to <agent> --goal "..." --ref <sha>[:note]... [--accept k=v]... [--constraint "..."] [--from <agent>] [--key <idempotency_key>]',
+      'new --to <agent> --goal "..." --ref <sha>[:note]... [--accept k=v]... [--constraint "..."] [--from <agent>] [--key <idempotency_key>] [--thread <name>]',
       'show <id|prefix>',
       'claim <id> --by <agent> [--ttl <seconds>]',
       'heartbeat <id> --by <agent> --lease <token> [--ttl <seconds>]',
-      'ref <id> --name <name> [--max <bytes>] [--encoding utf8|base64]',
+      'ref <id> --name <name> [--max <bytes>] [--encoding utf8|base64] [--by <agent>]',
       'done <id> --by <agent> --lease <token> --result <path> [--field k=v]...',
       'fail <id> --by <agent> --lease <token> --reason "..."',
       'verify [--task <id>]',
       'list [--state <state>] [--to <agent>] [--limit <n>]',
       'dispatch <id> [--cwd <dir>] [--wait <seconds>] [--thread <name>] [--allow-dispatch]',
       'wait <id> [--timeout <seconds>]   # 等异步 agent 把任务做完',
+      'context <thread> | context confirm <thread> <decision-id> --by <agent> [--evidence <sha256>]',
+      'archive <conversation-id> [--port <port>] [--title-prefix <prefix>] [--dry-run]',
       'onboard [--conductor <agent>] [--model <agent>=<id>]... [--yes] [--dry-run]   # 探测本机 agent 并写好通信配置',
       'agy-session [--out <file>]   # 在 Antigravity 集成终端里运行，导出会话地址与令牌',
       'mcp [--root <dir>] [--http 127.0.0.1:<port>]',
@@ -162,6 +165,23 @@ async function main() {
     }
   }
 
+  if (cmd === 'archive') {
+    try {
+      const res = await archiveConversation({
+        conversationId: args._[1] || null,
+        port: args.port !== undefined && args.port !== true ? args.port : null,
+        titlePrefix: typeof args['title-prefix'] === 'string' ? args['title-prefix'] : null,
+        dryRun: args['dry-run'] === true,
+      });
+      process.stdout.write(JSON.stringify(res, null, 2) + '\n');
+      process.exit(res.ok ? 0 : 1);
+    } catch (e) {
+      const code = e?.code === 2 ? 2 : 1;
+      process.stderr.write(JSON.stringify({ error: String(e?.message || e), code }) + '\n');
+      process.exit(code);
+    }
+  }
+
   if (cmd === 'mcp') {
     const bus = openBus({ rootOverride });
     if (typeof args.http === 'string') {
@@ -212,6 +232,7 @@ async function main() {
           acceptance,
           from: typeof args.from === 'string' ? args.from : (process.env.AGENTBUS_AGENT || 'unknown'),
           idempotency_key: typeof args.key === 'string' ? args.key : null,
+          thread: typeof args.thread === 'string' ? args.thread : null,
         });
         break;
       }
@@ -246,7 +267,30 @@ async function main() {
           name: typeof args.name === 'string' ? args.name : null,
           max_bytes: args.max !== undefined ? Number(args.max) : null,
           encoding: typeof args.encoding === 'string' ? args.encoding : null,
+          by: typeof args.by === 'string' ? args.by : (process.env.AGENTBUS_AGENT || null),
         });
+        break;
+      }
+
+      case 'context': {
+        const sub = args._[1];
+        if (sub === 'confirm') {
+          const threadName = args._[2];
+          const decisionId = args._[3];
+          if (!threadName || !decisionId) {
+            throw Object.assign(new Error('用法: agentbus context confirm <thread> <decision-id> --by <agent>'), { code: 1 });
+          }
+          result = confirmDecision(bus, threadName, decisionId, {
+            confirmedBy: typeof args.by === 'string' ? args.by : process.env.AGENTBUS_AGENT,
+            evidenceSha256: typeof args.evidence === 'string' ? args.evidence : null,
+          });
+        } else {
+          const threadName = sub === 'show' ? args._[2] : sub;
+          if (!threadName) {
+            throw Object.assign(new Error('用法: agentbus context <thread>'), { code: 1 });
+          }
+          result = loadContextLedger(bus, threadName) || { exists: false, thread: threadName };
+        }
         break;
       }
 

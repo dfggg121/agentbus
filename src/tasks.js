@@ -8,6 +8,8 @@ import { pathToFileURL } from 'node:url';
 
 import { withImmediateTx, appendEvent } from './db.js';
 import { getArtifact, resolveAndValidatePath, sha256File, verifyRefIntegrity, guessMime } from './store.js';
+import { clearTaskThreadByName } from './threads.js';
+import { contextLedgerDisabled, getExistingContextRef, recordContextOutcome, CONTEXT_REF_NAME } from './context.js';
 
 function nowIso() {
   return new Date().toISOString();
@@ -143,7 +145,8 @@ export function reapExpiredLeases(bus) {
   ).all(now);
   if (expiredRows.length === 0) return 0;
 
-  return withImmediateTx(bus.db, () => {
+  const failedWithThreads = [];
+  const count = withImmediateTx(bus.db, () => {
     const freshExpired = bus.db.prepare(
       `SELECT * FROM tasks WHERE state = 'claimed' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?`
     ).all(now);
@@ -174,11 +177,34 @@ export function reapExpiredLeases(bus) {
         next_state: nextState,
       });
 
+      if (exceeded) {
+        clearTaskThreadByName(bus.db, `task:${row.id}`);
+      }
+
       const updated = bus.db.prepare('SELECT * FROM tasks WHERE id = ?').get(row.id);
-      if (updated) writeEnvelopeMirror(bus, updated);
+      if (updated) {
+        writeEnvelopeMirror(bus, updated);
+        if (exceeded && updated.thread_name) {
+          failedWithThreads.push({ threadName: updated.thread_name, envelope: rowToEnvelope(updated) });
+        }
+      }
     }
     return freshExpired.length;
   });
+
+  if (!contextLedgerDisabled()) {
+    for (const item of failedWithThreads) {
+      try {
+        recordContextOutcome(bus, item.threadName, {
+          task: item.envelope,
+          status: 'failed',
+          reason: 'lease_expired',
+          actor: 'system',
+        });
+      } catch {}
+    }
+  }
+  return count;
 }
 
 function findTaskRowByIdOrPrefix(bus, idOrPrefix) {
@@ -254,6 +280,7 @@ export function createTask(bus, {
   acceptance = {},
   from = 'unknown',
   idempotency_key = null,
+  thread = null,
 }) {
   if (!to || typeof to !== 'string' || !to.trim()) {
     throw Object.assign(new Error('缺少必填参数 --to <agent>'), { code: 1 });
@@ -265,9 +292,23 @@ export function createTask(bus, {
   const fromAgent = String(from || 'unknown').trim();
   const toAgent = to.trim();
   const idemKey = idempotency_key ? String(idempotency_key).trim() : null;
+  const threadName = thread && String(thread).trim() ? String(thread).trim() : null;
   const resolvedRefs = normalizeRefInputs(bus, refs);
   const cleanConstraints = Array.isArray(constraints) ? constraints.map(String) : constraints ? [String(constraints)] : [];
   const cleanAcceptance = acceptance && typeof acceptance === 'object' ? acceptance : {};
+
+  if (threadName && !contextLedgerDisabled() && !resolvedRefs.some((r) => r.name === CONTEXT_REF_NAME)) {
+    const ctxRef = getExistingContextRef(bus, threadName);
+    if (ctxRef) {
+      resolvedRefs.push({
+        name: CONTEXT_REF_NAME,
+        uri: ctxRef.uri,
+        sha256: ctxRef.sha256,
+        bytes: ctxRef.bytes,
+        note: `context@1 rev=${ctxRef.rev}`,
+      });
+    }
+  }
 
   return withImmediateTx(bus.db, () => {
     if (idemKey) {
@@ -295,8 +336,8 @@ export function createTask(bus, {
         id, schema, from_agent, to_agent, state, goal,
         constraints_json, refs_json, acceptance_json,
         claimed_by, lease_token, lease_expires_at, attempt,
-        idempotency_key, created_at, finished_at, result_json, history_json
-      ) VALUES (?, 'agentbus/task@1', ?, ?, 'open', ?, ?, ?, ?, NULL, NULL, NULL, 0, ?, ?, NULL, NULL, ?)`
+        idempotency_key, created_at, finished_at, result_json, history_json, thread_name
+      ) VALUES (?, 'agentbus/task@1', ?, ?, 'open', ?, ?, ?, ?, NULL, NULL, NULL, 0, ?, ?, NULL, NULL, ?, ?)`
     ).run(
       id,
       fromAgent,
@@ -307,7 +348,8 @@ export function createTask(bus, {
       JSON.stringify(cleanAcceptance),
       idemKey,
       createdAt,
-      JSON.stringify(history)
+      JSON.stringify(history),
+      threadName
     );
 
     appendEvent(bus.db, id, 'task_create', { from: fromAgent, to: toAgent, refs_count: resolvedRefs.length, idempotency_key: idemKey });
@@ -494,7 +536,7 @@ export function heartbeatTask(bus, { id, by, lease_token, ttl_s = null }) {
 /**
  * Read a task reference with strict SHA-256 verification and 64KB pointer/resource_link semantics (§4.2).
  */
-export function readTaskRef(bus, { id, name, max_bytes = null, encoding = null }) {
+export function readTaskRef(bus, { id, name, max_bytes = null, encoding = null, by = null }) {
   if (!name || typeof name !== 'string') {
     throw Object.assign(new Error('缺少 --name <名>'), { code: 1 });
   }
@@ -522,6 +564,17 @@ export function readTaskRef(bus, { id, name, max_bytes = null, encoding = null }
   }
 
   const mimeType = guessMime(fsPath);
+  const auditMode = stat.size > maxBytes ? 'resource_link' : 'inline_text';
+  withImmediateTx(bus.db, () => {
+    appendEvent(bus.db, row.id, 'ref_read', {
+      name: ref.name,
+      sha256: ref.sha256,
+      bytes: stat.size,
+      mode: auditMode,
+      attempt: Number(row.attempt || 0),
+      by: by || null,
+    });
+  });
 
   // Over inline threshold -> return ONLY resource_link, ZERO content bytes (§4.2)
   if (stat.size > maxBytes) {
@@ -611,7 +664,7 @@ function runAcceptanceChecks(acceptance, resultPath, resultBytes, extraFields = 
   const acc = acceptance && typeof acceptance === 'object' ? acceptance : {};
   // `--accept k=v` 落成扁平键；`fields` 是嵌套写法。两种都要当字段断言，
   // 否则用 --accept 建的任务会“零校验”直接 done。
-  const RESERVED = new Set(['min_bytes', 'max_bytes', 'json', 'must_contain', 'must_not_contain', 'fields']);
+  const RESERVED = new Set(['min_bytes', 'max_bytes', 'json', 'must_contain', 'must_not_contain', 'fields', 'require_ref_read']);
   const flatFields = {};
   for (const [k, v] of Object.entries(acc)) {
     if (!RESERVED.has(k)) flatFields[k] = v;
@@ -688,6 +741,65 @@ function runAcceptanceChecks(acceptance, resultPath, resultBytes, extraFields = 
   }
 }
 
+function isTaskResumed(bus, taskId) {
+  if (!bus || !taskId) return false;
+  const rows = bus.db.prepare(
+    "SELECT payload_json FROM events WHERE task_id = ? AND event = 'dispatch'"
+  ).all(taskId);
+  return rows.some((r) => {
+    try {
+      return JSON.parse(r.payload_json || '{}').resumed === true;
+    } catch {
+      return false;
+    }
+  });
+}
+
+export function resolveAuditMode(acceptance, config, taskRow, bus = null) {
+  const acc = acceptance && typeof acceptance === 'object' ? acceptance : {};
+  if (acc.require_ref_read === true || acc.require_ref_read === 'true') return 'strict';
+  if (acc.require_ref_read === false || acc.require_ref_read === 'false') return 'off';
+
+  const envRaw = process.env.AGENTBUS_STRICT_REF_AUDIT;
+  if (envRaw !== undefined && String(envRaw).trim() !== '') {
+    const envVal = String(envRaw).trim().toLowerCase();
+    if (envVal === 'strict' || envVal === '1') return 'strict';
+    if (envVal === 'warn') return 'warn';
+    if (envVal === 'off' || envVal === '0') return 'off';
+    if (envVal === 'resumed') {
+      return bus && taskRow && isTaskResumed(bus, taskRow.id) ? 'strict' : 'warn';
+    }
+  }
+
+  const cfgMode = String(config?.refAuditMode || 'warn').trim().toLowerCase();
+  if (cfgMode === 'off' || cfgMode === 'warn' || cfgMode === 'strict') return cfgMode;
+  return 'warn';
+}
+
+export function evaluateRefReadAudit(bus, row, by) {
+  const refs = JSON.parse(row.refs_json || '[]');
+  if (refs.length === 0) return { ok: true, missing: [], mode: 'off', resumed: false };
+  const acc = JSON.parse(row.acceptance_json || '{}');
+  const mode = resolveAuditMode(acc, bus.config, row, bus);
+  const resumed = isTaskResumed(bus, row.id);
+  if (mode === 'off') return { ok: true, missing: [], mode, resumed };
+
+  const reads = bus.db.prepare(
+    "SELECT payload_json FROM events WHERE task_id = ? AND event = 'ref_read'"
+  ).all(row.id);
+  const readSet = new Set(reads.map((r) => {
+    try {
+      const p = JSON.parse(r.payload_json || '{}');
+      return `${p.name}:${p.sha256}`;
+    } catch {
+      return '';
+    }
+  }));
+  const missing = refs.filter((r) => !readSet.has(`${r.name}:${r.sha256}`)).map((r) => r.name);
+  if (missing.length === 0) return { ok: true, missing: [], mode, resumed };
+  return { ok: false, missing, mode, resumed, by };
+}
+
 export function completeTask(bus, { id, by, lease_token, result_path, fields = null }) {
   if (!by || !lease_token) {
     throw Object.assign(new Error('done/complete 需要 --by 与 --lease'), { code: 1 });
@@ -699,7 +811,7 @@ export function completeTask(bus, { id, by, lease_token, result_path, fields = n
   syncLegacyTaskFiles(bus);
   reapExpiredLeases(bus);
 
-  return withImmediateTx(bus.db, () => {
+  const txOut = withImmediateTx(bus.db, () => {
     const row = findTaskRowByIdOrPrefix(bus, id);
     const now = nowIso();
 
@@ -732,6 +844,19 @@ export function completeTask(bus, { id, by, lease_token, result_path, fields = n
     const acceptance = JSON.parse(row.acceptance_json || '{}');
     runAcceptanceChecks(acceptance, resPath, resStat.size, fields);
 
+    // 4.5 ref_read audit gate (warn vs strict)
+    const audit = evaluateRefReadAudit(bus, row, by);
+    if (!audit.ok && audit.mode === 'strict') {
+      return {
+        __auditRejected: {
+          taskId: row.id,
+          attempt: Number(row.attempt || 0),
+          missing: audit.missing,
+          resumed: audit.resumed,
+        },
+      };
+    }
+
     // 5. Hash result file, commit state=done, record events & mirror envelope
     const resultSha = sha256File(resPath);
     const resultObj = {
@@ -750,13 +875,24 @@ export function completeTask(bus, { id, by, lease_token, result_path, fields = n
        WHERE id = ?`
     ).run(now, JSON.stringify(resultObj), JSON.stringify(history), row.id);
 
+    if (!audit.ok && audit.mode === 'warn') {
+      appendEvent(bus.db, row.id, 'complete_audit_warning', {
+        by,
+        attempt: Number(row.attempt || 0),
+        missing_refs: audit.missing,
+        resumed: audit.resumed,
+        mode: 'warn',
+      });
+    }
+
     appendEvent(bus.db, row.id, 'complete', { by, result_sha256: resultSha, result_bytes: resStat.size });
+    clearTaskThreadByName(bus.db, `task:${row.id}`);
 
     const updated = bus.db.prepare('SELECT * FROM tasks WHERE id = ?').get(row.id);
     writeEnvelopeMirror(bus, updated);
 
     // 6. Exact return shape (§6.3)
-    return {
+    const doneResult = {
       ok: true,
       id: row.id,
       state: 'done',
@@ -764,7 +900,50 @@ export function completeTask(bus, { id, by, lease_token, result_path, fields = n
       result_bytes: resStat.size,
       result: resultObj,
     };
+    if (!audit.ok && audit.mode === 'warn') {
+      doneResult.warnings = ['completed_without_bus_ref_read'];
+      doneResult.missing_refs = audit.missing;
+    }
+
+    return {
+      doneResult,
+      threadName: updated?.thread_name || null,
+      updatedEnvelope: rowToEnvelope(updated),
+      resPath,
+      resultObj,
+    };
   });
+
+  if (txOut && txOut.__auditRejected) {
+    const rej = txOut.__auditRejected;
+    withImmediateTx(bus.db, () => {
+      appendEvent(bus.db, rej.taskId, 'complete_audit_rejected', {
+        by,
+        attempt: rej.attempt,
+        missing_refs: rej.missing,
+        resumed: rej.resumed,
+        mode: 'strict',
+      });
+    });
+    throw Object.assign(
+      new Error(`ref_read 审计拦截：交工前必须通过 bus_ref_read 读取全部引用 (${rej.missing.join(', ')})`),
+      { code: 1 }
+    );
+  }
+
+  if (txOut.threadName && !contextLedgerDisabled()) {
+    try {
+      recordContextOutcome(bus, txOut.threadName, {
+        task: txOut.updatedEnvelope,
+        status: 'done',
+        result: txOut.resultObj,
+        resultPath: txOut.resPath,
+        actor: by,
+      });
+    } catch {}
+  }
+
+  return txOut.doneResult;
 }
 
 export function failTask(bus, { id, by, lease_token, reason }) {
@@ -778,7 +957,7 @@ export function failTask(bus, { id, by, lease_token, reason }) {
   syncLegacyTaskFiles(bus);
   reapExpiredLeases(bus);
 
-  return withImmediateTx(bus.db, () => {
+  const txOut = withImmediateTx(bus.db, () => {
     const row = findTaskRowByIdOrPrefix(bus, id);
     const now = nowIso();
     if (row.state !== 'claimed' || !row.lease_expires_at || row.lease_expires_at <= now) {
@@ -788,8 +967,9 @@ export function failTask(bus, { id, by, lease_token, reason }) {
       throw Object.assign(new Error('租约 token 或领取者不匹配'), { code: 2 });
     }
 
+    const reasonText = String(reason).trim();
     const history = JSON.parse(row.history_json || '[]');
-    history.push({ at: now, state: 'failed', by, reason: String(reason).trim() });
+    history.push({ at: now, state: 'failed', by, reason: reasonText });
 
     bus.db.prepare(
       `UPDATE tasks
@@ -797,18 +977,36 @@ export function failTask(bus, { id, by, lease_token, reason }) {
        WHERE id = ?`
     ).run(now, JSON.stringify(history), row.id);
 
-    appendEvent(bus.db, row.id, 'fail', { by, reason: String(reason).trim() });
+    appendEvent(bus.db, row.id, 'fail', { by, reason: reasonText });
+    clearTaskThreadByName(bus.db, `task:${row.id}`);
 
     const updated = bus.db.prepare('SELECT * FROM tasks WHERE id = ?').get(row.id);
     writeEnvelopeMirror(bus, updated);
 
     return {
-      ok: true,
-      id: row.id,
-      state: 'failed',
-      reason: String(reason).trim(),
+      result: {
+        ok: true,
+        id: row.id,
+        state: 'failed',
+        reason: reasonText,
+      },
+      threadName: updated?.thread_name || null,
+      updatedEnvelope: rowToEnvelope(updated),
     };
   });
+
+  if (txOut.threadName && !contextLedgerDisabled()) {
+    try {
+      recordContextOutcome(bus, txOut.threadName, {
+        task: txOut.updatedEnvelope,
+        status: 'failed',
+        reason: txOut.result.reason,
+        actor: by,
+      });
+    } catch {}
+  }
+
+  return txOut.result;
 }
 
 export function verifyTasks(bus, { id = null } = {}) {

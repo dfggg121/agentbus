@@ -5,6 +5,19 @@ All notable changes to this project are documented here. Format follows [Keep a 
 ## [Unreleased]
 
 ### Added
+- `agentbus archive <conversation-id> [--port] [--title-prefix] [--dry-run]`: archives a sidebar conversation over CDP; `AGENTBUS_ARCHIVE_ON_DONE=1` archives the conversation once a task reaches `done`. Fails loudly when the app was not started with `--remote-debugging-port`.
+- `agentbus/context@1` thread ledger (≤8KB) at `<busRoot>/contexts/<thread>.json`, with `proposed`/`confirmed` decisions, supersede rules, and `avoid[]` for failures.
+- `ref_read` audit events and `warn`/`strict` gate on completion (`acceptance.require_ref_read`, `AGENTBUS_STRICT_REF_AUDIT`).
+- Per-client thread policies and `threads` scope columns (`cwd`, `model`, `last_ok`, `step_source`, `rotated_from`); `task:<id>` rows are removed on terminal states.
+- `agentbus context [<thread> | confirm <thread> <decision-id> --by <agent>]` and `new --thread`.
+- Acceptance suite extended to 59 assertions (threads scope, per-client limits, ledger, audit, archive dry-run/mock CDP).
+
+### Changed
+- `--thread` on Antigravity no longer reuses the conversation by default: it opens a fresh conversation and hands over via the ledger.
+- `steps` is derived from Antigravity's conversation DB, Codex JSONL/stdout, or an 8-step-per-use fallback — no longer `0` for non-Antigravity agents.
+- Failed, fast-failing, and empty conversations are no longer written to `threads`; a fallback model never inherits the failed session id.
+
+### Added — dispatch & onboarding
 - `bus_task_dispatch` tool and `agentbus dispatch <id>`: start the target agent's CLI and wait until the task reaches `done`. Off by default (`AGENTBUS_ENABLE_DISPATCH=1` / `--allow-dispatch`).
 - Built-in adapters: `codex`, `claude`, `gemini`, `antigravity`; extensible with `AGENTBUS_ADAPTER_<NAME>`.
 - Dispatch result reports `state` from the bus, not the child's exit code.

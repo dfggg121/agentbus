@@ -28,6 +28,8 @@ export const DEFAULT_CONFIG = {
   max_attempts: 3,
   max_ref_bytes: 2147483648,
   ref_read_inline_max: 65536,
+  ref_audit_mode: 'warn',
+  thread_limits: {},
 };
 
 const SCHEMA_SQL = `
@@ -99,6 +101,9 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_events_task
   ON events(task_id, seq);
+
+CREATE INDEX IF NOT EXISTS idx_events_task_event
+  ON events(task_id, event, seq);
 `;
 
 export function loadConfig({ rootOverride = null, configPath = null } = {}) {
@@ -147,11 +152,14 @@ export function loadConfig({ rootOverride = null, configPath = null } = {}) {
     rootDir,
     dbPath: path.join(rootDir, 'agentbus.db'),
     tasksDir: path.join(rootDir, 'tasks'),
+    contextsDir: path.join(rootDir, 'contexts'),
     allowedRoots,
     leaseTtlS: Number(cfg.lease_ttl_s || 900),
     maxAttempts: Number(cfg.max_attempts || 3),
     maxRefBytes: Number(cfg.max_ref_bytes || 2147483648),
     refReadInlineMax: Number(cfg.ref_read_inline_max || 65536),
+    refAuditMode: String(cfg.ref_audit_mode || 'warn'),
+    threadLimits: cfg.thread_limits && typeof cfg.thread_limits === 'object' ? cfg.thread_limits : {},
   };
 }
 
@@ -164,6 +172,31 @@ function sleepSync(ms) {
   const sab = new SharedArrayBuffer(4);
   const view = new Int32Array(sab);
   Atomics.wait(view, 0, 0, ms);
+}
+
+export function migrateThreadsTable(db) {
+  const cols = new Set(db.prepare('PRAGMA table_info(threads)').all().map((r) => r.name));
+  const alters = [
+    ['created_at', 'ALTER TABLE threads ADD COLUMN created_at TEXT'],
+    ['uses', 'ALTER TABLE threads ADD COLUMN uses INTEGER NOT NULL DEFAULT 0'],
+    ['steps', 'ALTER TABLE threads ADD COLUMN steps INTEGER NOT NULL DEFAULT 0'],
+    ['cwd', 'ALTER TABLE threads ADD COLUMN cwd TEXT DEFAULT NULL'],
+    ['model', 'ALTER TABLE threads ADD COLUMN model TEXT DEFAULT NULL'],
+    ['last_ok', 'ALTER TABLE threads ADD COLUMN last_ok INTEGER NOT NULL DEFAULT 1'],
+    ['step_source', "ALTER TABLE threads ADD COLUMN step_source TEXT NOT NULL DEFAULT 'unknown'"],
+    ['rotated_from', 'ALTER TABLE threads ADD COLUMN rotated_from TEXT DEFAULT NULL'],
+  ];
+  for (const [col, ddl] of alters) {
+    if (!cols.has(col)) db.exec(ddl);
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_threads_updated ON threads(updated_at)');
+}
+
+export function migrateTasksTable(db) {
+  const cols = new Set(db.prepare('PRAGMA table_info(tasks)').all().map((r) => r.name));
+  if (!cols.has('thread_name')) {
+    db.exec('ALTER TABLE tasks ADD COLUMN thread_name TEXT DEFAULT NULL');
+  }
 }
 
 export function openBus(opts = {}) {
@@ -179,6 +212,8 @@ export function openBus(opts = {}) {
       db.exec('PRAGMA journal_mode = WAL;');
       db.exec('PRAGMA synchronous = NORMAL;');
       db.exec(SCHEMA_SQL);
+      migrateThreadsTable(db);
+      migrateTasksTable(db);
       break;
     } catch (err) {
       if (isBusyError(err) && i < 19) {
@@ -188,15 +223,6 @@ export function openBus(opts = {}) {
       db.close();
       throw err;
     }
-  }
-
-  // Migrations for thread affinity limits (created_at / uses / steps).
-  for (const ddl of [
-    'ALTER TABLE threads ADD COLUMN created_at TEXT',
-    'ALTER TABLE threads ADD COLUMN uses INTEGER NOT NULL DEFAULT 0',
-    'ALTER TABLE threads ADD COLUMN steps INTEGER NOT NULL DEFAULT 0',
-  ]) {
-    try { db.exec(ddl); } catch { /* column already exists */ }
   }
 
   const journalRow = db.prepare('PRAGMA journal_mode').get();

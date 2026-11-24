@@ -191,12 +191,26 @@ agentbus onboard --conductor codex --allow /path/to/workspace
 
 ### 会话复用与上限
 
-- **同一任务的重试只占一条会话**：`threads` 表自动记 `task:<id>`，重试时沿用同一会话。503 连试多次不再一个任务开出好几条。
-- **跨任务复用**用显式 `--thread <name>`：Antigravity 用 `send-message` 续进原会话，Codex 用 `exec resume`。
-- **上限**：会话超过 2 小时、累计超过 40 步、或复用超过 40 次，自动换新（`AGENTBUS_THREAD_MAX_AGE_S` / `AGENTBUS_THREAD_MAX_STEPS` / `AGENTBUS_THREAD_MAX_USES` 可调）。Antigravity 的步数直接从会话库读；其它 agent 没有步数来源时用复用次数兜底。
-- **标题带日期**：新会话标题形如 `agentbus 11-24 tmw…`，方便一眼看出哪些该归档。
+- **同一任务的重试只占一条会话**：`threads` 表自动记 `task:<id>`，重试时沿用同一会话；任务进入 `done`/`failed` 后该行自动清理。
+- **跨任务复用按客户端分策略**：`antigravity` 默认**禁止**（每轮重放全量历史，实测 36.6s→78.8s）；传 `--thread` 不会报错，而是"新开干净会话 + 用 `context@1` 账本接力"。`codex` 允许 `exec resume`（实测 63.9s→49.5s）。
+- **上限表**：antigravity 20 步 / 1h / 空闲 30m / 3 次；codex 60 步 / 2h / 30m / 6 次。可用 `AGENTBUS_AGY_MAX_STEPS` 或 `AGENTBUS_THREAD_LIMITS_JSON` 覆盖。
+- **作用域校验**：`cwd`、`model`、`last_ok` 任一不匹配就换新；秒败/模型失败/空对话不写表；降级模型切换不继承失败会话。
+- **步数不再写死 0**：antigravity 读会话库、codex 读 JSONL/stdout、都没有则按每次 8 步估算（`step_source` 会写明来源）。
+- **标题带日期**：新会话标题形如 `agentbus 11-24 tmw…`。
 
-实测：两个任务共用一个 thread，会话目录从 37 条只增到 38 条（两个任务只新建 1 条会话），第二次 `resumed=true`、session 不变。
+### 线程账本 `context@1`
+
+`--thread <name>` 会在 `<busRoot>/contexts/<name>.json` 维护一份 ≤8KB 的账本：`contract_refs`、`decisions`、`latest_artifacts`、`avoid`。任务 `done` 才写产物与提议，失败只进 `avoid`；决策分 `proposed`/`confirmed`，必须由**另一个 agent** 确认才生效，未确认的提议不会顶掉已确认决策。新会话 prompt 只挂一行指针，正文仍不进任务信封。
+
+### 归档会话
+
+```
+agentbus archive <conversation-id> --dry-run       # 只匹配，不点击
+agentbus archive <conversation-id> --port 9222
+AGENTBUS_ARCHIVE_ON_DONE=1                          # 任务 done 后自动归档本次会话
+```
+
+走 CDP 点击侧边栏的 `归档对话` 按钮；应用需以 `--remote-debugging-port=<n>` 启动，否则明确报错而不是假装成功。自动归档只在最终 `done` 时执行一次，失败只记事件，不影响任务状态。
 
 ### 模型自动降级
 

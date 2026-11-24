@@ -97,21 +97,29 @@ export function agentConfigPath(root) {
 
 export function readAgentConfig(root) {
   const file = agentConfigPath(root);
-  if (!fs.existsSync(file)) return { conductor: null, models: {}, updated_at: null };
+  if (!fs.existsSync(file)) return { conductor: null, models: {}, thread_limits: {}, updated_at: null };
   try {
     const data = JSON.parse(fs.readFileSync(file, 'utf8'));
-    return { conductor: data.conductor || null, models: data.models || {}, updated_at: data.updated_at || null };
+    return {
+      conductor: data.conductor || null,
+      models: data.models || {},
+      thread_limits: data.thread_limits && typeof data.thread_limits === 'object' ? data.thread_limits : {},
+      updated_at: data.updated_at || null,
+    };
   } catch {
-    return { conductor: null, models: {}, updated_at: null, broken: true };
+    return { conductor: null, models: {}, thread_limits: {}, updated_at: null, broken: true };
   }
 }
 
 export function writeAgentConfig(root, cfg) {
   const file = agentConfigPath(root);
   fs.mkdirSync(path.dirname(file), { recursive: true });
+  const existing = readAgentConfig(root);
+  const threadLimits = cfg.thread_limits !== undefined ? cfg.thread_limits : existing.thread_limits;
   const payload = {
     conductor: cfg.conductor || null,
     models: cfg.models || {},
+    ...(threadLimits && Object.keys(threadLimits).length > 0 ? { thread_limits: threadLimits } : {}),
     updated_at: new Date().toISOString(),
   };
   fs.writeFileSync(file, JSON.stringify(payload, null, 2) + '\n', 'utf8');

@@ -11,62 +11,31 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { showTask } from './tasks.js';
-import { defaultAgySessionPath, readAgySession, detectAgentApi, discoverAgySession, conversationStepCount } from './agy.js';
+import { defaultAgySessionPath, readAgySession, detectAgentApi, discoverAgySession, archiveConversation } from './agy.js';
 import { modelFor, KNOWN_MODELS } from './agents.js';
+import { appendEvent, withImmediateTx } from './db.js';
+import {
+  threadUsable,
+  getThread,
+  setThread,
+  touchThread,
+  clearThread,
+  invalidateThread,
+  resolveClientPolicy,
+  resolveThreadSteps,
+  rotateThreadWithSnapshot,
+} from './threads.js';
+import {
+  contextLedgerDisabled,
+  getExistingContextRef,
+  attachContextRefIfOpen,
+  recordContextOutcome,
+} from './context.js';
+
+export { threadUsable };
 
 export function dispatchEnabled(flag) {
   return !!flag || process.env.AGENTBUS_ENABLE_DISPATCH === '1';
-}
-
-// Session affinity, borrowed from magpie's Claude bridge: a conversation's
-// turns must find the same underlying session, not start cold each time.
-const THREAD_MAX_AGE_S = () => Number(process.env.AGENTBUS_THREAD_MAX_AGE_S || 7200);
-const THREAD_MAX_STEPS = () => Number(process.env.AGENTBUS_THREAD_MAX_STEPS || 40);
-const THREAD_MAX_USES = () => Number(process.env.AGENTBUS_THREAD_MAX_USES || 40);
-
-// A conversation re-reads its whole history on every turn, so past these limits
-// a fresh one is cheaper than continuity.
-export function threadUsable(row, now = Date.now()) {
-  if (!row || !row.session_id) return false;
-  const created = row.created_at ? Date.parse(row.created_at) : now;
-  if (Number.isFinite(created) && (now - created) / 1000 > THREAD_MAX_AGE_S()) return false;
-  if (Number(row.steps || 0) > THREAD_MAX_STEPS()) return false;
-  if (Number(row.uses || 0) > THREAD_MAX_USES()) return false;
-  return true;
-}
-
-function getThreadRow(bus, agent, name) {
-  return bus.db.prepare(
-    'SELECT session_id, created_at, uses, steps FROM threads WHERE agent = ? AND name = ?',
-  ).get(agent, name);
-}
-
-function clearThread(bus, agent, name) {
-  bus.db.prepare('DELETE FROM threads WHERE agent = ? AND name = ?').run(agent, name);
-}
-
-function getThread(bus, agent, name) {
-  const row = getThreadRow(bus, agent, name);
-  if (!row) return null;
-  if (!threadUsable(row)) {
-    clearThread(bus, agent, name);
-    return null;
-  }
-  return row.session_id;
-}
-
-function touchThread(bus, agent, name) {
-  bus.db.prepare(
-    'UPDATE threads SET uses = uses + 1, updated_at = ? WHERE agent = ? AND name = ?',
-  ).run(new Date().toISOString(), agent, name);
-}
-
-function setThread(bus, agent, name, sessionId, steps = 0) {
-  const now = new Date().toISOString();
-  bus.db.prepare(
-    'INSERT INTO threads (agent, name, session_id, created_at, uses, steps, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?) ' +
-    'ON CONFLICT(agent, name) DO UPDATE SET session_id = excluded.session_id, steps = excluded.steps, updated_at = excluded.updated_at',
-  ).run(agent, name, sessionId, now, steps, now);
 }
 
 function extractSession(stdout) {
@@ -157,6 +126,7 @@ const BUILTIN = {
         args: [...base, 'send-message', `--title=${title}`, session, oneLine],
         env,
         sessionFile,
+        conversationTitle: title,
       };
     }
     return {
@@ -174,6 +144,7 @@ const BUILTIN = {
       env,
       sessionFile,
       followUp,
+      conversationTitle: title,
     };
   },
 };
@@ -203,11 +174,15 @@ function resolveAdapter(to, ctx) {
   return build(ctx);
 }
 
-function buildPrompt(id, goal, to, cwd) {
+function buildPrompt(id, goal, to, cwd, ctxRef = null) {
+  const ctxLine = ctxRef
+    ? `线程账本指针：先通过 bus_ref_read 读取 ref "${ctxRef.name}"（rev=${ctxRef.rev}, sha256=${ctxRef.sha256.slice(0, 12)}），仅遵守 confirmed 决策与最新 refs。`
+    : null;
   return [
     `你是被主动调用的执行方。任务 id=${id}。`,
     `目标：${goal}`,
     cwd ? `工作目录：${cwd}（所有产出必须写在这个目录下，不要到别的盘或用户目录里探索）` : null,
+    ctxLine,
     `步骤：1) bus_task_claim 领取，by 必须写 "${to}"；`,
     '2) bus_ref_read 逐个读 refs，返回 resource_link 的按 uri 自己读文件；',
     '3) 按需求产出结果文件；',
@@ -367,6 +342,20 @@ function looksLikeModelFailure(text) {
   return /model_not_found|not supported|invalid model|unknown model|No capacity|UNAVAILABLE|503|capacity/i.test(text || '');
 }
 
+function shouldPersistThread({ latest, adapterResult, effectiveSession, steps, resumed }) {
+  if (!effectiveSession) return { action: 'skip', reason: 'no_session' };
+  if (latest.state === 'failed') return { action: 'invalidate', reason: 'task_failed' };
+  const text = `${adapterResult?.stdout || ''}${adapterResult?.stderr || ''}`;
+  const modelErr = looksLikeModelFailure(text);
+  const fastFail = adapterResult?.ok === false && (adapterResult?.seconds ?? 0) < 10;
+  if (latest.state !== 'done' && (modelErr || fastFail)) {
+    return { action: resumed ? 'invalidate' : 'skip', reason: modelErr ? 'model_failure' : 'fast_fail' };
+  }
+  const emptyNew = !resumed && latest.state === 'open' && adapterResult?.ok === false && (steps ?? 0) === 0;
+  if (emptyNew) return { action: 'skip', reason: 'empty_conversation' };
+  return { action: 'save', lastOk: 1 };
+}
+
 export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, env = {}, thread = null, force = false }) {
   const t0 = Date.now();
   const task = showTask(bus, id);
@@ -395,12 +384,56 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, 
   }
 
   for (const [k, v] of Object.entries(env)) process.env[k] = v;
-  // Retries of the same task reuse one conversation (`task:<id>`); explicit
-  // --thread shares one across tasks. Both obey the age/step limits below.
-  const threadName = thread || `task:${task.id}`;
-  const session = getThread(bus, task.to, threadName);
-  if (session) touchThread(bus, task.to, threadName);
   const candidates = modelCandidates(bus.config.rootDir, task.to);
+  const initialModel = candidates[0] ?? null;
+
+  // Retries of the same task reuse one conversation (`task:<id>`); explicit
+  // --thread shares context across tasks (and reuses sessions only when allowed by client policy).
+  const threadName = thread || `task:${task.id}`;
+  if (thread) {
+    withImmediateTx(bus.db, () => {
+      bus.db.prepare("UPDATE tasks SET thread_name = ? WHERE id = ? AND (thread_name IS NULL OR thread_name = '')")
+        .run(threadName, task.id);
+    });
+  }
+
+  const policy = resolveClientPolicy(task.to, bus.config.rootDir, process.env, bus.config.threadLimits);
+  const th = getThread(bus, task.to, threadName, {
+    cwd: workdir,
+    model: initialModel,
+    constraints: task.constraints,
+    explicitThreadOverride: policy.allow_cross_task === true,
+  });
+
+  let rotatedFrom = null;
+  let ctxRef = null;
+  if (th.rotatedReason && thread) {
+    rotatedFrom = th.prevRow?.session_id || null;
+    ctxRef = rotateThreadWithSnapshot(bus, {
+      threadName,
+      taskId: task.id,
+      agent: task.to,
+      cwd: workdir,
+      model: initialModel,
+      reason: th.rotatedReason,
+      prevRow: th.prevRow,
+    });
+  } else if (thread && !contextLedgerDisabled()) {
+    ctxRef = getExistingContextRef(bus, threadName);
+  }
+  if (ctxRef && task.state === 'open') {
+    attachContextRefIfOpen(bus, task.id, ctxRef);
+  }
+
+  withImmediateTx(bus.db, () => {
+    appendEvent(bus.db, task.id, 'dispatch', {
+      agent: task.to,
+      thread: threadName,
+      resumed: Boolean(th.sessionId),
+      rotated_reason: th.rotatedReason || null,
+    });
+  });
+
   const multi = candidates.length > 1;
   const totalDeadline = Date.now() + Math.max(5, wait_s) * 1000;
 
@@ -408,8 +441,8 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, 
   let lastSpec = null;
   let lastRun = null;
   let usedModel = null;
-  let sessionId = session;
-  let capturedSession = null;
+  let finalAttemptIndex = 0;
+  let finalAttemptCaptured = null;
   const attempts = [];
 
   for (let i = 0; i < candidates.length; i++) {
@@ -423,10 +456,10 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, 
       : Math.max(15, Math.min(120, Math.floor(remainingMs / 1000)));
 
     const spec = resolveAdapter(task.to, {
-      prompt: buildPrompt(task.id, task.goal, task.to, workdir),
+      prompt: buildPrompt(task.id, task.goal, task.to, workdir, ctxRef),
       cwd: workdir,
       busRoot: bus.config.rootDir,
-      session: i === 0 ? sessionId : null,
+      session: i === 0 ? th.sessionId : null,
       id: task.id,
       model,
     });
@@ -462,10 +495,8 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, 
     lastSpec = spec;
     lastRun = adapterResult;
     usedModel = model;
-
-    if (!capturedSession) {
-      capturedSession = extractSession(`${adapterResult.stdout || ''}${adapterResult.stderr || ''}`);
-    }
+    finalAttemptIndex = i;
+    finalAttemptCaptured = extractSession(`${adapterResult.stdout || ''}${adapterResult.stderr || ''}`);
 
     attempts.push({
       model: model || '(default)',
@@ -483,13 +514,93 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, 
     if (i + 1 >= candidates.length) break;
   }
 
-  // Persist the conversation id even when the task did not finish: a 503 retry
-  // then continues the same conversation instead of creating another sidebar entry.
-  const finalSession = capturedSession || sessionId;
-  if (finalSession) {
-    const steps = task.to === 'antigravity' ? (conversationStepCount(finalSession) || 0) : 0;
-    setThread(bus, task.to, threadName, finalSession, steps);
-    sessionId = finalSession;
+  // Fallback loop isolation: if i > 0 ran fresh, NEVER inherit i=0's failed sessionId.
+  const effectiveResumed = Boolean(finalAttemptIndex === 0 && th.sessionId);
+  const effectiveSession = finalAttemptIndex === 0
+    ? (finalAttemptCaptured || th.sessionId || null)
+    : (finalAttemptCaptured || null);
+
+  const stepInfo = effectiveSession
+    ? resolveThreadSteps({
+        agent: task.to,
+        sessionId: effectiveSession,
+        stdout: lastRun?.stdout || '',
+        prevRow: effectiveResumed ? th.prevRow : null,
+      })
+    : { steps: 0, stepSource: 'unknown' };
+
+  const persist = shouldPersistThread({
+    latest,
+    adapterResult: lastRun,
+    effectiveSession,
+    steps: stepInfo.steps,
+    resumed: effectiveResumed,
+  });
+
+  if (!thread && (latest.state === 'done' || latest.state === 'failed')) {
+    clearThread(bus, task.to, threadName);
+  } else if (persist.action === 'save') {
+    if (effectiveResumed) touchThread(bus, task.to, threadName);
+    setThread(bus, task.to, threadName, effectiveSession, {
+      cwd: workdir,
+      model: usedModel ?? null,
+      steps: stepInfo.steps,
+      stepSource: stepInfo.stepSource,
+      lastOk: persist.lastOk,
+      resumed: effectiveResumed,
+      rotatedFrom,
+    });
+  } else if (persist.action === 'invalidate') {
+    if (!thread) clearThread(bus, task.to, threadName);
+    else if (effectiveResumed) invalidateThread(bus, task.to, threadName);
+  }
+
+  if (thread && !contextLedgerDisabled()) {
+    try {
+      if (latest.state === 'done') {
+        recordContextOutcome(bus, threadName, {
+          task: latest,
+          status: 'done',
+          result: latest.result,
+          actor: 'conductor',
+          cwd: workdir,
+          model: usedModel ?? null,
+        });
+      } else if (latest.state === 'failed' || persist.action === 'invalidate' || persist.reason === 'model_failure') {
+        recordContextOutcome(bus, threadName, {
+          task: latest,
+          status: 'failed',
+          reason: persist.reason || 'task_failed',
+          actor: 'system',
+          cwd: workdir,
+          model: usedModel ?? null,
+        });
+      }
+    } catch {}
+  }
+
+  if (process.env.AGENTBUS_ARCHIVE_ON_DONE === '1' && task.to === 'antigravity' && latest.state === 'done' && effectiveSession) {
+    try {
+      const archRes = await archiveConversation({
+        conversationId: effectiveSession,
+        titlePrefix: lastSpec?.conversationTitle || null,
+      });
+      withImmediateTx(bus.db, () => {
+        appendEvent(bus.db, task.id, 'archive_on_done', {
+          conversation_id: effectiveSession,
+          ok: Boolean(archRes?.ok),
+          reason: archRes?.reason || null,
+        });
+      });
+    } catch (archErr) {
+      withImmediateTx(bus.db, () => {
+        appendEvent(bus.db, task.id, 'archive_on_done', {
+          conversation_id: effectiveSession,
+          ok: false,
+          error: String(archErr?.message || archErr),
+        });
+      });
+    }
   }
 
   const healthAfter = markAgentHealth(bus, task.to, {
@@ -507,7 +618,15 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, 
     attempts: attempts.length > 1 ? attempts : undefined,
     elapsed_s: Number(((Date.now() - t0) / 1000).toFixed(1)),
     health: healthAfter || undefined,
-    thread: { name: threadName, session: sessionId, resumed: !!session, auto: !thread },
+    thread: {
+      name: threadName,
+      session: effectiveSession,
+      resumed: effectiveResumed,
+      auto: !thread,
+      ...(th.rotatedReason ? { rotated_reason: th.rotatedReason } : {}),
+      steps: stepInfo.steps,
+      step_source: stepInfo.stepSource,
+    },
     adapter: lastSpec
       ? { command: lastSpec.command, exit: lastRun?.exit ?? null, seconds: lastRun?.seconds ?? null }
       : undefined,

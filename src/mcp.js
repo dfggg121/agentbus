@@ -81,9 +81,10 @@ export const MCP_TOOLS = [
           },
         },
         constraints: { type: 'array', items: { type: 'string' }, description: '约束列表' },
-        acceptance: { type: 'object', description: '验收条款：json / must_contain / must_not_contain / min_bytes / max_bytes / fields' },
+        acceptance: { type: 'object', description: '验收条款：json / must_contain / must_not_contain / min_bytes / max_bytes / fields / require_ref_read' },
         from: { type: 'string', description: '发起方 agent 名' },
         idempotency_key: { type: 'string', description: '幂等键，同 from 重复提交返回同一任务 id' },
+        thread: { type: 'string', description: '关联跨任务线程名（若已有 context@1 账本则自动挂载指针）' },
       },
     },
   },
@@ -128,6 +129,7 @@ export const MCP_TOOLS = [
         name: { type: 'string', description: '引用展示名' },
         max_bytes: { type: 'number', description: '内联上限字节数，默认 65536' },
         encoding: { type: 'string', enum: ['utf8', 'base64'], description: '期望返回编码' },
+        by: { type: 'string', description: '读取方 agent 名（用于 ref_read 审计记录）' },
       },
     },
   },
@@ -281,6 +283,7 @@ function invokeTool(bus, name, args = {}) {
           acceptance: a.acceptance || {},
           from: a.from || 'mcp',
           idempotency_key: a.idempotency_key || null,
+          thread: a.thread || null,
         });
         return toolSuccess(res);
       }
@@ -316,6 +319,7 @@ function invokeTool(bus, name, args = {}) {
           name: a.name,
           max_bytes: a.max_bytes !== undefined ? Number(a.max_bytes) : null,
           encoding: a.encoding || null,
+          by: a.by || process.env.AGENTBUS_AGENT || null,
         });
         return {
           content: res.content,
@@ -401,6 +405,7 @@ function invokeTool(bus, name, args = {}) {
           acceptance: a.acceptance || {},
           from: a.from || 'mcp',
           idempotency_key: a.idempotency_key || null,
+          thread: a.thread || null,
         });
         return dispatchTask(bus, { id: created.id, cwd: a.cwd, wait_s: Math.min(Number(a.wait_s) || 3, 20), thread: a.thread || null })
           .then((res) => toolSuccess({ task: created.id, ...res, hint: res.state === 'done' ? undefined : `任务已建并派出；用 bus_task_wait {id:"${created.id}", timeout_s:300} 等结果` }))

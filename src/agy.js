@@ -3,6 +3,7 @@
 // never exported into a world-readable environment or a command line.
 
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import os from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -143,4 +144,198 @@ export function discoverAgySession() {
     }
   }
   return best;
+}
+
+export function resolveCdpPort(portOpt = null, env = process.env) {
+  if (portOpt !== null && portOpt !== undefined && portOpt !== '') {
+    const p = Number(portOpt);
+    if (!Number.isInteger(p) || p <= 0 || p > 65535) {
+      throw Object.assign(new Error(`非法 CDP 端口: ${portOpt}`), { code: 1 });
+    }
+    return p;
+  }
+  if (env.AGENTBUS_AGY_CDP_PORT) {
+    const p = Number(env.AGENTBUS_AGY_CDP_PORT);
+    if (!Number.isInteger(p) || p <= 0 || p > 65535) {
+      throw Object.assign(new Error(`非法 AGENTBUS_AGY_CDP_PORT: ${env.AGENTBUS_AGY_CDP_PORT}`), { code: 1 });
+    }
+    return p;
+  }
+  return 9222;
+}
+
+function httpGetJson(url, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const req = http.get(url, (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (c) => { body += c; });
+      res.on('end', () => {
+        if ((res.statusCode || 500) >= 400) {
+          reject(new Error(`HTTP ${res.statusCode}`));
+          return;
+        }
+        try {
+          resolve(JSON.parse(body));
+        } catch (err) {
+          reject(new Error(`invalid JSON from ${url}: ${err.message}`));
+        }
+      });
+    });
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`timeout after ${timeoutMs}ms`));
+    });
+    req.on('error', reject);
+  });
+}
+
+function cdpEvaluate(wsUrl, expression, timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    if (typeof globalThis.WebSocket !== 'function') {
+      reject(new Error('当前 Node 版本缺少内置 WebSocket 客户端'));
+      return;
+    }
+    const ws = new globalThis.WebSocket(wsUrl);
+    let settled = false;
+    const done = (err, val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { ws.close(); } catch {}
+      if (err) reject(err);
+      else resolve(val);
+    };
+    const timer = setTimeout(() => {
+      done(new Error(`CDP evaluate timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    ws.addEventListener('open', () => {
+      ws.send(JSON.stringify({
+        id: 1,
+        method: 'Runtime.evaluate',
+        params: { expression, returnByValue: true, awaitPromise: true },
+      }));
+    });
+    ws.addEventListener('message', (ev) => {
+      let msg;
+      try {
+        msg = JSON.parse(String(ev.data || ''));
+      } catch {
+        return;
+      }
+      if (msg.id !== 1) return;
+      const res = msg.result || {};
+      if (res.exceptionDetails) {
+        done(new Error(`CDP script error: ${JSON.stringify(res.exceptionDetails)}`));
+        return;
+      }
+      done(null, res.result?.value);
+    });
+    ws.addEventListener('error', (ev) => {
+      done(new Error(ev?.message || 'CDP WebSocket error'));
+    });
+    ws.addEventListener('close', () => {
+      done(new Error('CDP WebSocket closed before response'));
+    });
+  });
+}
+
+function buildArchiveEvalJs({ conversationId, titlePrefix, dryRun }) {
+  return `(() => {
+    const convId = ${JSON.stringify(conversationId || '')};
+    const titlePrefix = ${JSON.stringify(titlePrefix || '')};
+    const dryRun = ${dryRun ? 'true' : 'false'};
+    const aria = '归档对话';
+    const selector = 'button[aria-label="' + aria + '"]';
+
+    let hit = null;
+    if (convId) {
+      const attrNodes = Array.from(document.querySelectorAll('[data-conversation-id], [data-id], [href]'));
+      hit = attrNodes.find((n) => {
+        const vals = [
+          n.getAttribute('data-conversation-id') || '',
+          n.getAttribute('data-id') || '',
+          n.getAttribute('href') || '',
+        ];
+        return vals.some((v) => v === convId || v.includes(convId));
+      }) || null;
+      if (!hit) {
+        const leaves = Array.from(document.querySelectorAll('*'))
+          .filter((n) => n.children.length === 0 && (n.textContent || '').trim().includes(convId));
+        if (leaves.length) hit = leaves[0];
+      }
+    }
+    if (!hit && titlePrefix) {
+      const leaves = Array.from(document.querySelectorAll('*'))
+        .filter((n) => n.children.length === 0 && (n.textContent || '').trim().startsWith(titlePrefix));
+      if (leaves.length) hit = leaves[0];
+    }
+    if (!hit) {
+      return { ok: false, archived: false, conversation_id: convId || null, reason: 'row_not_found' };
+    }
+
+    let btn = hit.matches && hit.matches(selector) ? hit : hit.querySelector(selector);
+    let rowEl = hit;
+    let cur = hit;
+    for (let i = 0; i < 9 && cur && !btn; i++) {
+      cur = cur.parentElement;
+      if (!cur || cur.tagName === 'BODY' || cur.tagName === 'HTML') break;
+      const found = cur.querySelector(selector);
+      if (found) {
+        btn = found;
+        rowEl = cur;
+        break;
+      }
+    }
+    const rowText = (rowEl.innerText || rowEl.textContent || '').trim().slice(0, 120);
+    if (!btn) {
+      return { ok: false, archived: false, conversation_id: convId || null, reason: 'row_not_found', row_text: rowText };
+    }
+    if (dryRun) {
+      return { ok: true, archived: false, dry_run: true, conversation_id: convId || null, row_text: rowText };
+    }
+    if (typeof btn.scrollIntoView === 'function') btn.scrollIntoView({ block: 'center' });
+    btn.click();
+    return { ok: true, archived: true, conversation_id: convId || null, row_text: rowText };
+  })()`;
+}
+
+export async function archiveConversation({ conversationId = null, port = null, titlePrefix = null, dryRun = false } = {}) {
+  if (!conversationId && !titlePrefix) {
+    throw Object.assign(new Error('archive 需要 <conversation-id> 或 --title-prefix'), { code: 1 });
+  }
+  const cdpPort = resolveCdpPort(port);
+  let targetList;
+  try {
+    targetList = await httpGetJson(`http://127.0.0.1:${cdpPort}/json`, 5000);
+  } catch (err) {
+    throw Object.assign(
+      new Error(`CDP 端口 ${cdpPort} 不可用（${err.message}）。目标应用需以 --remote-debugging-port=${cdpPort} 启动。`),
+      { code: 1 }
+    );
+  }
+
+  const pages = (Array.isArray(targetList) ? targetList : [])
+    .filter((t) => t && t.type === 'page' && String(t.title || '').includes('Antigravity'));
+  const page = pages[0];
+  if (!page || !page.webSocketDebuggerUrl) {
+    throw Object.assign(
+      new Error(`CDP 端口 ${cdpPort} 上未找到标题包含 Antigravity 的 page target`),
+      { code: 1 }
+    );
+  }
+
+  const expr = buildArchiveEvalJs({ conversationId, titlePrefix, dryRun });
+  try {
+    const result = await cdpEvaluate(page.webSocketDebuggerUrl, expr, 10000);
+    if (!result || typeof result !== 'object') {
+      return { ok: false, archived: false, conversation_id: conversationId || null, reason: 'unexpected_cdp_result' };
+    }
+    return result;
+  } catch (err) {
+    throw Object.assign(
+      new Error(`CDP 执行归档失败 (port=${cdpPort}): ${err.message}`),
+      { code: 1 }
+    );
+  }
 }

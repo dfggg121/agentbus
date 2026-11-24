@@ -1,8 +1,20 @@
 # Security
 
+## Opt-in process execution
+
+`bus_task_dispatch` starts a local CLI. It is off unless `AGENTBUS_ENABLE_DISPATCH=1` or `--allow-dispatch` is passed. It never sends task content over the network; the child process runs with the caller's OS permissions and the configured `cwd`.
+
+## Archiving uses CDP (loopback only)
+
+`agentbus archive` connects to `http://127.0.0.1:<port>/json` and a local WebSocket to click the sidebar archive button. It requires the target app to run with `--remote-debugging-port=<n>`; the port is not opened by agentbus, and no data leaves the machine. `--dry-run` matches the row without clicking. Agentbus refuses to claim success when the port is closed.
+
+## Thread ledger and audit are advisory by default
+
+`context@1` holds decisions and artifact pointers, not payloads, and is capped at 8KB. Only a `confirmed` decision (confirmed by an agent other than the proposer) can supersede an existing one. `ref_read` auditing defaults to `warn`: completion still succeeds with a warning. Set `acceptance.require_ref_read=true` or `AGENTBUS_STRICT_REF_AUDIT=strict` to reject completions that did not read their refs.
+
 ## What agentbus is
 
-A local, single-user task bus. It stores task metadata and file hashes, and it exposes nine narrowly scoped operations to MCP clients and the CLI. One additional operation (`bus_task_dispatch`) is off unless explicitly enabled. It is not a sandbox, a remote service, or a secrets manager.
+A local, single-user task bus. It stores task metadata and file hashes, and it exposes twelve narrowly scoped operations to MCP clients and the CLI. `bus_task_dispatch` / `bus_task_run` are off unless explicitly enabled. It is not a sandbox, a remote service, or a secrets manager.
 
 ## Default posture
 

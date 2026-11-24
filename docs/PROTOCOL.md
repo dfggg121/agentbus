@@ -149,10 +149,44 @@ Transport: newline-delimited JSON-RPC 2.0 over stdio (no `Content-Length` framin
 
 ### Threads
 
-- `task:<id>` is recorded automatically on first dispatch, so retries of the same task continue the same conversation (including after a 503).
-- Explicit `--thread <name>` shares one conversation across tasks; Antigravity uses `send-message`, Codex uses `exec resume`.
-- Limits: `AGENTBUS_THREAD_MAX_AGE_S` (default 7200), `AGENTBUS_THREAD_MAX_STEPS` (40), `AGENTBUS_THREAD_MAX_USES` (40). Antigravity step counts come from its conversation DB; agents without a step source fall back to the reuse count.
+- `task:<id>` is recorded automatically on first dispatch, so retries of the same task continue the same conversation (including after a 503). The row is deleted when the task reaches `done` or `failed`.
+- Explicit `--thread <name>` is scope-checked: `cwd`, `model` and `last_ok` must match, or a fresh conversation is started and the ledger is snapshotted (`thread_rotated` event).
+- Per-client limits (`CLIENT_THREAD_POLICIES`, overridable via `AGENTBUS_THREAD_LIMITS_JSON` or `AGENTBUS_<CLIENT>_MAX_*`):
+
+  | client | max_steps | max_age_s | max_idle_s | max_uses | allow_cross_task |
+  |---|---|---|---|---|---|
+  | antigravity | 20 | 3600 | 1800 | 3 | false |
+  | codex | 60 | 7200 | 1800 | 6 | true |
+  | default | 40 | 7200 | 1800 | 10 | true |
+
+- When `allow_cross_task` is false, `--thread` does not error: it starts a fresh conversation and attaches the `context@1` ledger pointer instead.
+- `steps` comes from the conversation DB (Antigravity), Codex JSONL/stdout, or 8 steps per use (`fallback_uses`); it is never hard-coded to 0.
 - New conversations are titled `agentbus MM-DD <task-id>`.
+
+### Context ledger `agentbus/context@1`
+
+Stored at `<busRoot>/contexts/<thread>.json`, capped at 8192 bytes, registered as the `thread_context.json` ref:
+
+| field | meaning |
+|---|---|
+| `contract_refs[]` | `{name, uri, sha256}` of inputs that must not drift |
+| `decisions[]` | `{id, statement, supersedes, status: proposed\|confirmed, proposed_by, confirmed_by, evidence_sha256}` |
+| `latest_artifacts[]` | `{role, uri, sha256, task_id, summary}` |
+| `avoid[]` | `{task_id, reason}` — failures only, never pollutes decisions |
+
+Write points: `done` (artifacts + proposals), `failed` (avoid only), and rotation (snapshot before a new conversation). A supersede removes the old decision **only after the replacement is confirmed**; `confirmed_by` must differ from `proposed_by`.
+
+### ref_read audit
+
+`bus_ref_read` appends a `ref_read` event (`{name, sha256, bytes, mode}`). On `complete`, refs without a matching read are reported:
+
+- `off` — skip;
+- `warn` (default) — task still completes, `warnings: ["completed_without_bus_ref_read"]` + `complete_audit_warning` event;
+- `strict` — rejected with exit 1, task stays `claimed`, `complete_audit_rejected` event; enable per task with `acceptance.require_ref_read=true` or globally with `AGENTBUS_STRICT_REF_AUDIT=strict`.
+
+### Archiving conversations
+
+`agentbus archive <conversation-id> [--port N] [--title-prefix P] [--dry-run]` finds the sidebar row over CDP and clicks `button[aria-label="归档对话"]`. The app must run with `--remote-debugging-port=<n>`; an unreachable port is an explicit error. `AGENTBUS_ARCHIVE_ON_DONE=1` archives the conversation once the task is `done`; failures only append an `archive_on_done` event.
 
 ### Roles
 

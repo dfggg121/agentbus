@@ -182,12 +182,25 @@ Model inference dominates, not the bus: Codex 45.5s, Antigravity 30s — communi
 
 ### Session reuse and limits
 
-- **A task's retries share one conversation**: the `threads` table records `task:<id>` automatically, so repeated 503 retries no longer create one sidebar entry per attempt.
-- **Cross-task reuse** is explicit: `--thread <name>`. Antigravity continues the conversation with `send-message`; Codex uses `exec resume`.
-- **Limits**: a conversation older than 2 hours, past 40 steps, or reused more than 40 times is replaced (`AGENTBUS_THREAD_MAX_AGE_S` / `_MAX_STEPS` / `_MAX_USES`). Antigravity step counts are read from its conversation DB; other agents fall back to the reuse count.
-- **Dated titles**: new conversations are titled `agentbus 11-24 tmw…`, so stale ones are easy to spot.
+- **A task's retries share one conversation**: the `threads` table records `task:<id>` automatically, and the row is cleared once the task reaches `done`/`failed`.
+- **Cross-task reuse is per-client**: `antigravity` is disabled by default (it replays the whole history; measured 36.6s → 78.8s). Passing `--thread` does not error — it means "fresh conversation + `context@1` ledger handoff". `codex` may `exec resume` (measured 63.9s → 49.5s).
+- **Limits**: antigravity 20 steps / 1h / 30m idle / 3 uses; codex 60 / 2h / 30m / 6. Override with `AGENTBUS_AGY_MAX_STEPS` or `AGENTBUS_THREAD_LIMITS_JSON`.
+- **Scope checks**: a mismatch in `cwd`, `model`, or `last_ok` forces a fresh conversation; fast failures, model failures, and empty conversations are never persisted; a fallback model never inherits the failed session.
+- **Steps are never hard-coded to 0**: antigravity reads its conversation DB, codex reads JSONL/stdout, otherwise 8 steps per use (`step_source` records which).
 
-Measured: two tasks sharing one thread grew the conversation directory from 37 to 38 entries (one conversation for two tasks); the second run reported `resumed=true` with the same session id.
+### Thread ledger `context@1`
+
+`--thread <name>` maintains a ≤8KB ledger at `<busRoot>/contexts/<name>.json`: `contract_refs`, `decisions`, `latest_artifacts`, `avoid`. Only `done` writes artifacts and proposals; failures only append to `avoid`. Decisions are `proposed`/`confirmed`, and a decision takes effect only after a **different** agent confirms it. Fresh conversations receive one pointer line — payload never enters the task envelope.
+
+### Archiving conversations
+
+```
+agentbus archive <conversation-id> --dry-run
+agentbus archive <conversation-id> --port 9222
+AGENTBUS_ARCHIVE_ON_DONE=1
+```
+
+Drives the sidebar `归档对话` button over CDP. The app must be started with `--remote-debugging-port=<n>`; otherwise the command fails loudly instead of pretending. Auto-archive runs once on final `done` and never changes task state on failure.
 
 ### Model fallback
 

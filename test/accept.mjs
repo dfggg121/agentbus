@@ -69,23 +69,33 @@ fs.writeFileSync(FAKE_AGENT, [
   "import path from 'node:path';",
   "const prompt = process.argv[2] || '';",
   "const id = (prompt.match(/id=([A-Za-z0-9_-]+)/) || [])[1];",
+  "const by = process.env.AGENTBUS_FAKE_BY || 'fake';",
   "const env = { ...process.env, AGENTBUS_ALLOWED_ROOTS: process.env.AGENTBUS_FAKE_ALLOWED };",
   "const run = (a) => execFileSync(process.execPath, [process.env.AGENTBUS_FAKE_BIN, ...a, '--root', process.env.AGENTBUS_FAKE_ROOT], { env, encoding: 'utf8' });",
-  "const claim = JSON.parse(run(['claim', id, '--by', 'fake']));",
+  "const claim = JSON.parse(run(['claim', id, '--by', by]));",
   "const out = path.join(process.env.AGENTBUS_FAKE_WORK, 'fake_' + id + '.json');",
-  "fs.writeFileSync(out, JSON.stringify({ ok: true, agent: 'fake' }), 'utf8');",
-  "run(['done', id, '--by', 'fake', '--lease', claim.lease_token, '--result', out]);",
+  "fs.writeFileSync(out, JSON.stringify({ ok: true, agent: by }), 'utf8');",
+  "run(['done', id, '--by', by, '--lease', claim.lease_token, '--result', out]);",
   "console.log(JSON.stringify({ thread_id: process.env.AGENTBUS_FAKE_SESSION || 'fake-session-1' }));",
 ].join('\n'), 'utf8');
 
-function fakeAdapterEnv(session = 'fake-session-1') {
+const FAIL_FAST_AGENT = path.join(RUN_BASE, 'fail_fast_agent.mjs');
+fs.writeFileSync(FAIL_FAST_AGENT, [
+  "console.log(JSON.stringify({ thread_id: process.env.AGENTBUS_FAKE_SESSION || 'bad-503-sess' }));",
+  "console.error('503 No capacity available');",
+  "process.exit(1);",
+].join('\n'), 'utf8');
+
+function fakeAdapterEnv(session = 'fake-session-1', { by = 'fake', adapterKey = 'AGENTBUS_ADAPTER_FAKE', script = FAKE_AGENT, extra = {} } = {}) {
   return {
-    AGENTBUS_ADAPTER_FAKE: JSON.stringify({ command: process.execPath, args: [FAKE_AGENT, '{prompt}'] }),
+    [adapterKey]: JSON.stringify({ command: process.execPath, args: [script, '{prompt}'] }),
     AGENTBUS_FAKE_BIN: BUS_BIN,
     AGENTBUS_FAKE_ROOT: ROOT_MAIN,
     AGENTBUS_FAKE_WORK: OUT_DIR,
     AGENTBUS_FAKE_ALLOWED: ALLOWED_MAIN,
     AGENTBUS_FAKE_SESSION: session,
+    AGENTBUS_FAKE_BY: by,
+    ...extra,
   };
 }
 
@@ -212,6 +222,11 @@ async function main() {
       path.join(PKG_ROOT, 'src', 'tasks.js'),
       path.join(PKG_ROOT, 'src', 'mcp.js'),
       path.join(PKG_ROOT, 'src', 'setup.js'),
+      path.join(PKG_ROOT, 'src', 'threads.js'),
+      path.join(PKG_ROOT, 'src', 'context.js'),
+      path.join(PKG_ROOT, 'src', 'agy.js'),
+      path.join(PKG_ROOT, 'src', 'agents.js'),
+      path.join(PKG_ROOT, 'src', 'dispatch.js'),
       path.join(PKG_ROOT, 'test', 'accept.mjs'),
     ];
     const syntaxFailures = [];
@@ -685,6 +700,448 @@ async function main() {
       dThC.json?.thread?.resumed === false &&
       dThC.json?.thread?.session === 'fresh-sess',
       `name=${dThC.json?.thread?.name} resumed=${dThC.json?.thread?.resumed} session=${dThC.json?.thread?.session}`);
+
+    // 40. cwd 变更不复用
+    const cwdT1 = runCli(['new', '--to', 'fake', '--from', 'hermes', '--goal', 'cwd-1']).json?.id;
+    const cwdT2 = runCli(['new', '--to', 'fake', '--from', 'hermes', '--goal', 'cwd-2']).json?.id;
+    const dCwd1 = runCli(['dispatch', cwdT1, '--allow-dispatch', '--wait', '15', '--thread', 't-cwd', '--cwd', WORK_DIR], { envExtra: fakeAdapterEnv('sess-cwd-1') });
+    const dCwd2 = runCli(['dispatch', cwdT2, '--allow-dispatch', '--wait', '15', '--thread', 't-cwd', '--cwd', OUT_DIR], { envExtra: fakeAdapterEnv('sess-cwd-2') });
+    assertCase(40, 'cwd 变更不复用（同一 --thread 切换目录后生成新会话）',
+      dCwd1.json?.thread?.resumed === false &&
+      dCwd2.json?.thread?.resumed === false &&
+      dCwd2.json?.thread?.session === 'sess-cwd-2',
+      `r1=${dCwd1.json?.thread?.resumed} r2=${dCwd2.json?.thread?.resumed} s2=${dCwd2.json?.thread?.session}`);
+
+    // 41. model 变更或 last_ok = 0 不复用
+    const modT1 = runCli(['new', '--to', 'fake', '--from', 'hermes', '--goal', 'mod-1']).json?.id;
+    const modT2 = runCli(['new', '--to', 'fake', '--from', 'hermes', '--goal', 'mod-2']).json?.id;
+    const modT3 = runCli(['new', '--to', 'fake', '--from', 'hermes', '--goal', 'mod-3']).json?.id;
+    runCli(['dispatch', modT1, '--allow-dispatch', '--wait', '15', '--thread', 't-mod', '--cwd', WORK_DIR], { envExtra: fakeAdapterEnv('sess-mod-1') });
+    const modDb = new DatabaseSync(path.join(ROOT_MAIN, 'agentbus.db'));
+    try {
+      modDb.prepare("UPDATE threads SET last_ok = 0 WHERE agent = 'fake' AND name = 't-mod'").run();
+    } finally { modDb.close(); }
+    const dMod2 = runCli(['dispatch', modT2, '--allow-dispatch', '--wait', '15', '--thread', 't-mod', '--cwd', WORK_DIR], { envExtra: fakeAdapterEnv('sess-mod-2') });
+    const modDb2 = new DatabaseSync(path.join(ROOT_MAIN, 'agentbus.db'));
+    try {
+      modDb2.prepare("UPDATE threads SET model = 'other-model', last_ok = 1 WHERE agent = 'fake' AND name = 't-mod'").run();
+    } finally { modDb2.close(); }
+    const dMod3 = runCli(['dispatch', modT3, '--allow-dispatch', '--wait', '15', '--thread', 't-mod', '--cwd', WORK_DIR], { envExtra: fakeAdapterEnv('sess-mod-3') });
+    assertCase(41, 'model 变更或 last_ok=0 不复用',
+      dMod2.json?.thread?.resumed === false && dMod2.json?.thread?.session === 'sess-mod-2' &&
+      dMod3.json?.thread?.resumed === false && dMod3.json?.thread?.session === 'sess-mod-3',
+      `r2=${dMod2.json?.thread?.resumed} r3=${dMod3.json?.thread?.resumed}`);
+
+    // 42. 首轮秒败不写入 threads 表
+    const ffTask = runCli(['new', '--to', 'fake', '--from', 'hermes', '--goal', 'fast-fail']).json?.id;
+    const dFf = runCli(['dispatch', ffTask, '--allow-dispatch', '--wait', '15', '--thread', 't-fast-fail', '--cwd', WORK_DIR], {
+      envExtra: fakeAdapterEnv('bad-503-sess', { script: FAIL_FAST_AGENT }),
+    });
+    const ffDb = new DatabaseSync(path.join(ROOT_MAIN, 'agentbus.db'));
+    let ffCount = -1;
+    try {
+      ffCount = Number(ffDb.prepare("SELECT COUNT(*) AS c FROM threads WHERE agent = 'fake' AND name = 't-fast-fail'").get().c);
+      ffDb.prepare("UPDATE agent_health SET cooldown_until = NULL, reason = NULL WHERE agent = 'fake'").run();
+    } finally { ffDb.close(); }
+    assertCase(42, '首轮秒败（<10s 且含 503）不写入 threads 表',
+      dFf.json?.state === 'open' && ffCount === 0,
+      `state=${dFf.json?.state} threadRows=${ffCount}`);
+
+    // 43. task:<id> 任务终态（done / failed）后 threads 表对应行自动清理
+    const failThTask = runCli(['new', '--to', 'fake', '--from', 'hermes', '--goal', 'fail-cleanup']).json?.id;
+    const failThClaim = runCli(['claim', failThTask, '--by', 'fake']);
+    const cleanDb1 = new DatabaseSync(path.join(ROOT_MAIN, 'agentbus.db'));
+    try {
+      cleanDb1.prepare(
+        "INSERT INTO threads (agent, name, session_id, created_at, uses, steps, updated_at, cwd) VALUES ('fake', ?, 'temp-fail-sess', ?, 1, 8, ?, ?)"
+      ).run(`task:${failThTask}`, new Date().toISOString(), new Date().toISOString(), WORK_DIR);
+    } finally { cleanDb1.close(); }
+    runCli(['fail', failThTask, '--by', 'fake', '--lease', failThClaim.json?.lease_token, '--reason', 'cleanup-check']);
+    const cleanDb2 = new DatabaseSync(path.join(ROOT_MAIN, 'agentbus.db'));
+    let doneRowCnt = -1;
+    let failRowCnt = -1;
+    try {
+      doneRowCnt = Number(cleanDb2.prepare('SELECT COUNT(*) AS c FROM threads WHERE name = ?').get(`task:${thC}`).c);
+      failRowCnt = Number(cleanDb2.prepare('SELECT COUNT(*) AS c FROM threads WHERE name = ?').get(`task:${failThTask}`).c);
+    } finally { cleanDb2.close(); }
+    assertCase(43, 'task:<id> 任务 done / failed 后对应 threads 行自动清理',
+      doneRowCnt === 0 && failRowCnt === 0,
+      `doneRows=${doneRowCnt} failRows=${failRowCnt}`);
+
+    // 44. steps 非零降级：fake 无会话库连续复用 2 次后 steps === 16 且 step_source === 'fallback_uses'
+    const st1 = runCli(['new', '--to', 'fake', '--from', 'hermes', '--goal', 'steps-1']).json?.id;
+    const st2 = runCli(['new', '--to', 'fake', '--from', 'hermes', '--goal', 'steps-2']).json?.id;
+    runCli(['dispatch', st1, '--allow-dispatch', '--wait', '15', '--thread', 't-steps', '--cwd', WORK_DIR], { envExtra: fakeAdapterEnv('sess-st-1') });
+    runCli(['dispatch', st2, '--allow-dispatch', '--wait', '15', '--thread', 't-steps', '--cwd', WORK_DIR], { envExtra: fakeAdapterEnv('sess-st-1') });
+    const stDb = new DatabaseSync(path.join(ROOT_MAIN, 'agentbus.db'));
+    let stRow;
+    try {
+      stRow = stDb.prepare("SELECT steps, step_source, uses FROM threads WHERE agent = 'fake' AND name = 't-steps'").get();
+    } finally { stDb.close(); }
+    assertCase(44, 'steps 非零降级：连续复用 2 次后 steps=16 且 step_source=fallback_uses',
+      Number(stRow?.steps) === 16 && stRow?.step_source === 'fallback_uses' && Number(stRow?.uses) === 2,
+      JSON.stringify(stRow));
+
+    // 45. 分端超限换新 + 快照接力：max_uses=2 时第 3 次 dispatch 换新并记 thread_rotated + context@1 ref
+    const st3 = runCli(['new', '--to', 'fake', '--from', 'hermes', '--goal', 'steps-3']).json?.id;
+    const dSt3 = runCli(['dispatch', st3, '--allow-dispatch', '--wait', '15', '--thread', 't-steps', '--cwd', WORK_DIR], {
+      envExtra: fakeAdapterEnv('sess-st-2', {
+        extra: { AGENTBUS_THREAD_LIMITS_JSON: JSON.stringify({ fake: { max_uses: 2 } }) },
+      }),
+    });
+    const stShow3 = runCli(['show', st3]);
+    const rotDb = new DatabaseSync(path.join(ROOT_MAIN, 'agentbus.db'));
+    let rotEvents = 0;
+    try {
+      rotEvents = Number(rotDb.prepare("SELECT COUNT(*) AS c FROM events WHERE task_id = ? AND event = 'thread_rotated'").get(st3).c);
+    } finally { rotDb.close(); }
+    const ledgerStepsPath = path.join(ROOT_MAIN, 'contexts', 't-steps.json');
+    assertCase(45, '分端超限换新 + 快照接力：max_uses=2 第 3 次换新、events 含 thread_rotated 且生成 context@1',
+      dSt3.json?.thread?.resumed === false &&
+      dSt3.json?.thread?.session === 'sess-st-2' &&
+      rotEvents >= 1 &&
+      fs.existsSync(ledgerStepsPath) &&
+      (stShow3.json?.refs || []).some((r) => r.name === 'thread_context.json'),
+      `resumed=${dSt3.json?.thread?.resumed} rotEvents=${rotEvents} ledger=${fs.existsSync(ledgerStepsPath)}`);
+
+    // 46. Codex 沙盒约束门控：constraints 含 sandbox:strict 时不走 resume
+    const sbx1 = runCli(['new', '--to', 'codex', '--from', 'hermes', '--goal', 'sbx-1']).json?.id;
+    const sbx2 = runCli(['new', '--to', 'codex', '--from', 'hermes', '--goal', 'sbx-2', '--constraint', 'sandbox:strict']).json?.id;
+    const dSbx1 = runCli(['dispatch', sbx1, '--allow-dispatch', '--wait', '15', '--thread', 't-sbx', '--cwd', WORK_DIR], {
+      envExtra: fakeAdapterEnv('codex-sess-1', { by: 'codex', adapterKey: 'AGENTBUS_ADAPTER_CODEX' }),
+    });
+    const dSbx2 = runCli(['dispatch', sbx2, '--allow-dispatch', '--wait', '15', '--thread', 't-sbx', '--cwd', WORK_DIR], {
+      envExtra: fakeAdapterEnv('codex-sess-2', { by: 'codex', adapterKey: 'AGENTBUS_ADAPTER_CODEX' }),
+    });
+    assertCase(46, 'Codex 沙盒约束门控：constraints 含 sandbox:strict 时拒绝 resume',
+      dSbx1.json?.state === 'done' && dSbx2.json?.thread?.resumed === false && dSbx2.json?.thread?.session === 'codex-sess-2',
+      `r2=${dSbx2.json?.thread?.resumed} s2=${dSbx2.json?.thread?.session}`);
+
+    // 47. context@1 写入与 8KB 裁剪（含 supersedes 清理）
+    const { openBus } = await import('../src/db.js');
+    const { initContextLedger, saveAndRegisterContext, contextLedgerPath, loadContextLedger, proposeDecision } = await import('../src/context.js');
+    const { resolveClientPolicy } = await import('../src/threads.js');
+    const ctxBus = openBus({ rootOverride: ROOT_MAIN });
+    let ledger47Path;
+    let ledger47Doc;
+    try {
+      const doc47 = initContextLedger('t-compact-test', { cwd: WORK_DIR });
+      for (let idx = 0; idx < 25; idx++) {
+        doc47.decisions.push({
+          id: `dec-${idx}`,
+          statement: `Decision ${idx}: ` + 'x'.repeat(210),
+          supersedes: idx > 0 && idx % 5 === 0 ? `dec-${idx - 1}` : null,
+          status: 'confirmed',
+          proposed_by: 'hermes',
+          confirmed_by: 'codex',
+          confirmed_at: new Date().toISOString(),
+          evidence_sha256: null,
+          task_id: `t-${idx}`,
+          pinned: false,
+          at: new Date().toISOString(),
+        });
+      }
+      saveAndRegisterContext(ctxBus, 't-compact-test', doc47);
+      ledger47Path = contextLedgerPath(ROOT_MAIN, 't-compact-test');
+      ledger47Doc = loadContextLedger(ctxBus, 't-compact-test');
+    } finally {
+      ctxBus.close();
+    }
+    const ledger47Size = fs.statSync(ledger47Path).size;
+    const hasSuperseded = (ledger47Doc?.decisions || []).some((d) => ['dec-4', 'dec-9', 'dec-14', 'dec-19'].includes(d.id));
+    assertCase(47, 'context@1 写入与 <=8KB 确定性裁剪（且已清理被 supersedes 覆盖条目）',
+      ledger47Size <= 8192 && !hasSuperseded && (ledger47Doc?.decisions || []).length <= 12,
+      `size=${ledger47Size} count=${ledger47Doc?.decisions?.length} hasSuperseded=${hasSuperseded}`);
+
+    // 48. 失败隔离：任务 fail 后，错误原因仅进入 avoid[]，decisions 与 latest_artifacts 原样未变
+    const isoSeed = runCli(['new', '--to', 'fake', '--from', 'hermes', '--goal', 'iso-seed', '--thread', 't-iso']).json?.id;
+    const isoSeedClaim = runCli(['claim', isoSeed, '--by', 'fake']);
+    const isoSeedOut = path.join(OUT_DIR, 'iso_seed.json');
+    fs.writeFileSync(isoSeedOut, JSON.stringify({ ok: true }), 'utf8');
+    runCli(['done', isoSeed, '--by', 'fake', '--lease', isoSeedClaim.json?.lease_token, '--result', isoSeedOut]);
+    const isoBus = openBus({ rootOverride: ROOT_MAIN });
+    let propInfo;
+    try {
+      propInfo = proposeDecision(isoBus, 't-iso', { statement: 'Keep API v1', proposedBy: 'fake', taskId: isoSeed, cwd: WORK_DIR });
+    } finally { isoBus.close(); }
+    const beforeFail = runCli(['context', 't-iso']).json;
+    const isoFailTask = runCli(['new', '--to', 'fake', '--from', 'hermes', '--goal', 'iso-fail', '--thread', 't-iso']).json?.id;
+    const isoFailClaim = runCli(['claim', isoFailTask, '--by', 'fake']);
+    runCli(['fail', isoFailTask, '--by', 'fake', '--lease', isoFailClaim.json?.lease_token, '--reason', 'broken approach xyz']);
+    const afterFail = runCli(['context', 't-iso']).json;
+    assertCase(48, '失败隔离：fail 后原因仅入 avoid[]，decisions 与 latest_artifacts 未变',
+      (afterFail?.avoid || []).some((a) => a.task_id === isoFailTask && a.reason.includes('broken approach xyz')) &&
+      JSON.stringify(afterFail?.decisions) === JSON.stringify(beforeFail?.decisions) &&
+      JSON.stringify(afterFail?.latest_artifacts) === JSON.stringify(beforeFail?.latest_artifacts),
+      `avoidLen=${afterFail?.avoid?.length}`);
+
+    // 49. 双人确认门控：同 agent 被拒（exit 1），异 agent 确认后 status === 'confirmed'
+    const sameConfirm = runCli(['context', 'confirm', 't-iso', propInfo.decision_id, '--by', 'fake']);
+    const diffConfirm = runCli(['context', 'confirm', 't-iso', propInfo.decision_id, '--by', 'hermes']);
+    const afterConfirm = runCli(['context', 't-iso']).json;
+    const confirmedDec = (afterConfirm?.decisions || []).find((d) => d.id === propInfo.decision_id);
+    assertCase(49, '双人确认门控：同 agent 被拒(rc=1)、异 agent 确认后 status=confirmed',
+      sameConfirm.rc === 1 && diffConfirm.rc === 0 && confirmedDec?.status === 'confirmed' && confirmedDec?.confirmed_by === 'hermes',
+      `sameRc=${sameConfirm.rc} diffRc=${diffConfirm.rc} status=${confirmedDec?.status}`);
+
+    // 50. 挂载 context@1 不破坏信封不变量（单行 <=300、无 40B 决策/避坑正文泄漏、show 无 content）
+    const uniqueMarker50 = 'UNIQUE_LEDGER_DECISION_PAYLOAD_' + 'Z'.repeat(30);
+    const isoBus50 = openBus({ rootOverride: ROOT_MAIN });
+    try {
+      proposeDecision(isoBus50, 't-iso', { statement: uniqueMarker50, proposedBy: 'fake', taskId: isoSeed, cwd: WORK_DIR });
+    } finally { isoBus50.close(); }
+    const envCheckTask = runCli(['new', '--to', 'fake', '--from', 'hermes', '--goal', 'env-invariant', '--thread', 't-iso']).json?.id;
+    const envRaw50 = fs.readFileSync(path.join(ROOT_MAIN, 'tasks', `${envCheckTask}.json`), 'utf8');
+    const ledgerDoc50 = JSON.parse(fs.readFileSync(path.join(ROOT_MAIN, 'contexts', 't-iso.json'), 'utf8'));
+    const maxEnvLine = Math.max(...envRaw50.split(/\r?\n/).map((l) => l.length));
+    const secretPayloadText50 = JSON.stringify({ decisions: ledgerDoc50.decisions, avoid: ledgerDoc50.avoid });
+    let leaked50 = envRaw50.includes(uniqueMarker50);
+    if (!leaked50) {
+      for (let i = 0; i <= uniqueMarker50.length - 40; i += 10) {
+        if (envRaw50.includes(uniqueMarker50.slice(i, i + 40))) { leaked50 = true; break; }
+      }
+    }
+    const envShow50 = runCli(['show', envCheckTask]);
+    const hasCtxRef50 = (envShow50.json?.refs || []).some((r) => r.name === 'thread_context.json');
+    const noContent50 = envShow50.json && !('content' in envShow50.json);
+    assertCase(50, '挂载 context@1 不破坏信封不变量（行<=300、零正文泄漏、show 无 content）',
+      hasCtxRef50 && maxEnvLine <= 300 && !leaked50 && noContent50 && secretPayloadText50.includes(uniqueMarker50),
+      `hasCtx=${hasCtxRef50} maxLine=${maxEnvLine} leaked=${leaked50}`);
+
+    // 51. bus_ref_read 审计落库：读 telemetry.csv (inline_text) 与 policy.bin (resource_link)
+    const auditDb = new DatabaseSync(path.join(ROOT_MAIN, 'agentbus.db'));
+    let refReadRows = [];
+    try {
+      refReadRows = auditDb.prepare("SELECT payload_json FROM events WHERE task_id = ? AND event = 'ref_read' ORDER BY seq ASC")
+        .all(mainTaskId)
+        .map((r) => JSON.parse(r.payload_json));
+    } finally { auditDb.close(); }
+    assertCase(51, 'bus_ref_read 审计落库：events 记有 inline_text 与 resource_link 的 ref_read 事件',
+      refReadRows.some((p) => p.name === 'telemetry.csv' && p.mode === 'inline_text' && p.sha256) &&
+      refReadRows.some((p) => p.name === 'policy.bin' && p.mode === 'resource_link' && p.sha256),
+      JSON.stringify(refReadRows));
+
+    // 52. 默认 warn 模式放行：#21 mainTaskId 未读 SPEC.md 直接 done，记 complete_audit_warning 且 warnings 含 completed_without_bus_ref_read
+    const warnDb = new DatabaseSync(path.join(ROOT_MAIN, 'agentbus.db'));
+    let warnEvent = null;
+    try {
+      const r = warnDb.prepare("SELECT payload_json FROM events WHERE task_id = ? AND event = 'complete_audit_warning'").get(mainTaskId);
+      if (r) warnEvent = JSON.parse(r.payload_json);
+    } finally { warnDb.close(); }
+    assertCase(52, '默认 warn 模式放行：未读全部 ref 仍 done，返回 warning 并写 complete_audit_warning',
+      (doneOk.json?.warnings || []).includes('completed_without_bus_ref_read') &&
+      (warnEvent?.missing_refs || []).includes('SPEC.md'),
+      `warnings=${JSON.stringify(doneOk.json?.warnings)} event=${JSON.stringify(warnEvent)}`);
+
+    // 53. strict 模式强拦截：--accept require_ref_read=true 未读 ref 拒收(rc=1, claimed, complete_audit_rejected)，补读后放行(rc=0)
+    const putCsv53 = runCli(['put', TELEMETRY_CSV, '--by', 'hermes']);
+    const strictTask = runCli([
+      'new', '--to', 'codex', '--from', 'hermes', '--goal', 'strict-audit',
+      '--ref', putCsv53.json?.sha256, '--accept', 'require_ref_read=true',
+    ]).json?.id;
+    const strictClaim = runCli(['claim', strictTask, '--by', 'codex']);
+    const strictOut = path.join(WORK_DIR, 'strict_plain.txt');
+    fs.writeFileSync(strictOut, 'plain text output without json', 'utf8');
+    const strictReject = runCli(['done', strictTask, '--by', 'codex', '--lease', strictClaim.json?.lease_token, '--result', strictOut]);
+    const strictAfterRej = runCli(['show', strictTask]);
+    const strictDb = new DatabaseSync(path.join(ROOT_MAIN, 'agentbus.db'));
+    let rejEventCount = 0;
+    try {
+      rejEventCount = Number(strictDb.prepare("SELECT COUNT(*) AS c FROM events WHERE task_id = ? AND event = 'complete_audit_rejected'").get(strictTask).c);
+    } finally { strictDb.close(); }
+    const strictRead = runCli(['ref', strictTask, '--name', 'telemetry.csv', '--by', 'codex']);
+    const strictAccept = runCli(['done', strictTask, '--by', 'codex', '--lease', strictClaim.json?.lease_token, '--result', strictOut]);
+    assertCase(53, 'strict 模式强拦截 + RESERVED 放行非 JSON 产物：未读拒收(rc=1, claimed)、补读后 done(rc=0)',
+      strictReject.rc === 1 &&
+      strictAfterRej.json?.state === 'claimed' &&
+      rejEventCount === 1 &&
+      strictRead.rc === 0 &&
+      strictAccept.rc === 0 &&
+      strictAccept.json?.state === 'done',
+      `rejRc=${strictReject.rc} stateAfterRej=${strictAfterRej.json?.state} rejEvents=${rejEventCount} accRc=${strictAccept.rc}`);
+
+    // 54. archive 端口不通明确报错（含 "需以 --remote-debugging-port"）且不得假装成功
+    const deadPort = 59871;
+    const archDead = runCli(['archive', 'conv-dead', '--port', String(deadPort)]);
+    assertCase(54, 'archive 端口不通明确报错（含 --remote-debugging-port 提示）且退出码 1',
+      archDead.rc === 1 && archDead.stderr.includes('需以 --remote-debugging-port'),
+      `rc=${archDead.rc} stderr=${archDead.stderr.slice(0, 160)}`);
+
+    // 55 & 56. archive --dry-run 与命中/未命中（仅连接测试内本地 mock CDP 服务，绝不触碰真实 Antigravity）
+    const httpMod = await import('node:http');
+    let mockMode = 'match';
+    const mockCdpServer = httpMod.default.createServer((req, res) => {
+      if (req.url === '/json') {
+        const port = mockCdpServer.address().port;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify([
+          { type: 'page', title: 'data:text/html,noise', webSocketDebuggerUrl: `ws://127.0.0.1:${port}/noise` },
+          { type: 'page', title: 'Antigravity - Mock', webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/1` },
+        ]));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    mockCdpServer.on('upgrade', (req, socket) => {
+      socket.on('error', () => {});
+      const key = req.headers['sec-websocket-key'];
+      const accept = createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64');
+      socket.write(
+        'HTTP/1.1 101 Switching Protocols\r\n'
+        + 'Upgrade: websocket\r\n'
+        + 'Connection: Upgrade\r\n'
+        + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+      );
+      let acc = Buffer.alloc(0);
+      socket.on('data', (chunk) => {
+        acc = Buffer.concat([acc, chunk]);
+        while (acc.length >= 2) {
+          const opcode = acc[0] & 0x0f;
+          const len = acc[1] & 0x7f;
+          let offset = 2;
+          let payloadLen = len;
+          if (len === 126) {
+            if (acc.length < 4) return;
+            payloadLen = acc.readUInt16BE(2);
+            offset = 4;
+          } else if (len === 127) {
+            if (acc.length < 10) return;
+            payloadLen = Number(acc.readBigUInt64BE(2));
+            offset = 10;
+          }
+          const masked = (acc[1] & 0x80) !== 0;
+          const totalLen = offset + (masked ? 4 : 0) + payloadLen;
+          if (acc.length < totalLen) return;
+          const mask = masked ? acc.subarray(offset, offset + 4) : null;
+          const dataStart = masked ? offset + 4 : offset;
+          const data = Buffer.from(acc.subarray(dataStart, dataStart + payloadLen));
+          acc = acc.subarray(totalLen);
+          if (mask) {
+            for (let i = 0; i < data.length; i++) data[i] ^= mask[i % 4];
+          }
+          if (opcode === 0x8) {
+            try { socket.end(); } catch {}
+            return;
+          }
+          let reqMsg;
+          try { reqMsg = JSON.parse(data.toString('utf8')); } catch { continue; }
+          const expr = reqMsg?.params?.expression || '';
+          const isDry = expr.includes('const dryRun = true');
+          let value;
+          if (mockMode === 'miss') {
+            value = { ok: false, archived: false, conversation_id: 'conv-missing', reason: 'row_not_found' };
+          } else if (isDry) {
+            value = { ok: true, archived: false, dry_run: true, conversation_id: 'conv-mock-1', row_text: 'agentbus 11-24 t123' };
+          } else {
+            value = { ok: true, archived: true, conversation_id: 'conv-mock-1', row_text: 'agentbus 11-24 t123' };
+          }
+          const respBuf = Buffer.from(JSON.stringify({ id: reqMsg.id, result: { result: { value } } }), 'utf8');
+          const header = respBuf.length < 126
+            ? Buffer.from([0x81, respBuf.length])
+            : Buffer.from([0x81, 126, (respBuf.length >> 8) & 0xff, respBuf.length & 0xff]);
+          socket.write(Buffer.concat([header, respBuf]));
+        }
+      });
+    });
+    await new Promise((r) => mockCdpServer.listen(0, '127.0.0.1', r));
+    const mockPort = mockCdpServer.address().port;
+    const runCliAsync = (args) => new Promise((resolve) => {
+      const p = spawn(process.execPath, [BUS_BIN, ...args, '--root', ROOT_MAIN], {
+        cwd: PKG_ROOT,
+        env: { ...process.env, AGENTBUS_ALLOWED_ROOTS: ALLOWED_MAIN },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      p.stdout.on('data', (d) => { stdout += d.toString('utf8'); });
+      p.stderr.on('data', (d) => { stderr += d.toString('utf8'); });
+      p.on('exit', (code) => {
+        let json = null;
+        try { if (stdout.trim()) json = JSON.parse(stdout); } catch {}
+        resolve({ rc: code ?? -1, stdout, stderr, json });
+      });
+    });
+    try {
+      const dryRes = await runCliAsync(['archive', 'conv-mock-1', '--port', String(mockPort), '--title-prefix', 'agentbus 11-24', '--dry-run']);
+      assertCase(55, 'archive --dry-run 只做匹配不点击，返回 archived=false, dry_run=true',
+        dryRes.rc === 0 && dryRes.json?.ok === true && dryRes.json?.archived === false && dryRes.json?.dry_run === true,
+        `rc=${dryRes.rc} json=${JSON.stringify(dryRes.json)} err=${dryRes.stderr}`);
+
+      mockMode = 'miss';
+      const missRes = await runCliAsync(['archive', 'conv-missing', '--port', String(mockPort)]);
+      mockMode = 'match';
+      const hitRes = await runCliAsync(['archive', 'conv-mock-1', '--port', String(mockPort)]);
+      assertCase(56, 'archive 未命中返回 row_not_found(rc=1)，命中返回 archived=true(rc=0)',
+        missRes.rc === 1 && missRes.json?.ok === false && missRes.json?.reason === 'row_not_found' &&
+        hitRes.rc === 0 && hitRes.json?.ok === true && hitRes.json?.archived === true,
+        `miss=${JSON.stringify(missRes.json)} hit=${JSON.stringify(hitRes.json)}`);
+    } finally {
+      mockCdpServer.close();
+    }
+
+    // 57. 分客户端默认策略核验：antigravity (20/3600/1800/3/false) 与 codex (60/7200/1800/6/true)
+    const agyPol = resolveClientPolicy('antigravity', ROOT_MAIN, {});
+    const cdxPol = resolveClientPolicy('codex', ROOT_MAIN, {});
+    assertCase(57, '分客户端默认策略：antigravity(20/1h/30m/3/禁跨任务) 与 codex(60/2h/30m/6/允跨任务)',
+      agyPol.max_steps === 20 && agyPol.max_age_s === 3600 && agyPol.max_idle_s === 1800 && agyPol.max_uses === 3 && agyPol.allow_cross_task === false &&
+      cdxPol.max_steps === 60 && cdxPol.max_age_s === 7200 && cdxPol.max_idle_s === 1800 && cdxPol.max_uses === 6 && cdxPol.allow_cross_task === true,
+      `agy=${JSON.stringify(agyPol)} codex=${JSON.stringify(cdxPol)}`);
+
+    // 58. antigravity --thread 语义：禁止跨任务复用旧会话，改走新会话 + context@1 账本接力
+    const agyT1 = runCli(['new', '--to', 'antigravity', '--from', 'hermes', '--goal', 'agy-relay-1']).json?.id;
+    const agyT2 = runCli(['new', '--to', 'antigravity', '--from', 'hermes', '--goal', 'agy-relay-2']).json?.id;
+    const dAgy1 = runCli(['dispatch', agyT1, '--allow-dispatch', '--wait', '15', '--thread', 't-agy-relay', '--cwd', WORK_DIR], {
+      envExtra: fakeAdapterEnv('agy-sess-1', { by: 'antigravity', adapterKey: 'AGENTBUS_ADAPTER_ANTIGRAVITY' }),
+    });
+    const dAgy2 = runCli(['dispatch', agyT2, '--allow-dispatch', '--wait', '15', '--thread', 't-agy-relay', '--cwd', WORK_DIR], {
+      envExtra: fakeAdapterEnv('agy-sess-2', { by: 'antigravity', adapterKey: 'AGENTBUS_ADAPTER_ANTIGRAVITY' }),
+    });
+    const agyShow2 = runCli(['show', agyT2]);
+    assertCase(58, 'antigravity --thread 禁跨任务复用：第 2 轮开新会话(resumed=false)且挂载 context@1 账本指针',
+      dAgy1.json?.state === 'done' &&
+      dAgy2.json?.state === 'done' &&
+      dAgy2.json?.thread?.resumed === false &&
+      dAgy2.json?.thread?.session === 'agy-sess-2' &&
+      (agyShow2.json?.refs || []).some((r) => r.name === 'thread_context.json'),
+      `r2=${dAgy2.json?.thread?.resumed} s2=${dAgy2.json?.thread?.session} refs=${JSON.stringify((agyShow2.json?.refs || []).map((r) => r.name))}`);
+
+    // 59. 降级循环 i > 0 不串号：i=0 模型失败产出旧 session 后，i=1 无 session 输出时不得沿用 i=0 的旧 sessionId
+    const FALLBACK_TEST_AGENT = path.join(RUN_BASE, 'fallback_iso_agent.mjs');
+    fs.writeFileSync(FALLBACK_TEST_AGENT, [
+      "import { execFileSync } from 'node:child_process';",
+      "import fs from 'node:fs';",
+      "import path from 'node:path';",
+      "const countFile = process.env.AGENTBUS_FB_COUNT_FILE;",
+      "const n = fs.existsSync(countFile) ? Number(fs.readFileSync(countFile, 'utf8')) + 1 : 1;",
+      "fs.writeFileSync(countFile, String(n), 'utf8');",
+      "if (n === 1) {",
+      "  console.log(JSON.stringify({ thread_id: 'poisoned-i0-sess' }));",
+      "  console.error('503 No capacity available');",
+      "  process.exit(1);",
+      "}",
+      "const prompt = process.argv[2] || '';",
+      "const id = (prompt.match(/id=([A-Za-z0-9_-]+)/) || [])[1];",
+      "const env = { ...process.env, AGENTBUS_ALLOWED_ROOTS: process.env.AGENTBUS_FAKE_ALLOWED };",
+      "const run = (a) => execFileSync(process.execPath, [process.env.AGENTBUS_FAKE_BIN, ...a, '--root', process.env.AGENTBUS_FAKE_ROOT], { env, encoding: 'utf8' });",
+      "const claim = JSON.parse(run(['claim', id, '--by', 'antigravity']));",
+      "const out = path.join(process.env.AGENTBUS_FAKE_WORK, 'fb_' + id + '.json');",
+      "fs.writeFileSync(out, JSON.stringify({ ok: true }), 'utf8');",
+      "run(['done', id, '--by', 'antigravity', '--lease', claim.lease_token, '--result', out]);",
+    ].join('\n'), 'utf8');
+    const fbCountFile = path.join(RUN_BASE, 'fb_count.txt');
+    const fbTask = runCli(['new', '--to', 'antigravity', '--from', 'hermes', '--goal', 'fallback-no-leak']).json?.id;
+    const dFb = runCli(['dispatch', fbTask, '--allow-dispatch', '--wait', '20', '--thread', 't-fb-iso', '--cwd', WORK_DIR], {
+      envExtra: fakeAdapterEnv('unused', {
+        by: 'antigravity',
+        adapterKey: 'AGENTBUS_ADAPTER_ANTIGRAVITY',
+        script: FALLBACK_TEST_AGENT,
+        extra: { AGENTBUS_FB_COUNT_FILE: fbCountFile },
+      }),
+    });
+    assertCase(59, '降级循环 i>0 不串号：i=1 未输出新 session 时不继承 i=0 失败会话 ID',
+      dFb.json?.state === 'done' && dFb.json?.thread?.resumed === false && dFb.json?.thread?.session === null,
+      `state=${dFb.json?.state} session=${dFb.json?.thread?.session} attempts=${JSON.stringify(dFb.json?.attempts)}`);
   } finally {
     try { fs.rmSync(RUN_BASE, { recursive: true, force: true }); } catch {}
   }
