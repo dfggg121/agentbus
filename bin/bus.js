@@ -361,13 +361,25 @@ async function main() {
         if (!dispatchEnabled(args['allow-dispatch'] === true)) {
           throw Object.assign(new Error('dispatch 未启用：加 --allow-dispatch 或设置 AGENTBUS_ENABLE_DISPATCH=1'), { code: 1 });
         }
-        result = await dispatchTask(bus, {
-          id: args._[1],
+        const ids = args._.slice(1);
+        const opts = {
           cwd: typeof args.cwd === 'string' ? args.cwd : null,
           wait_s: args.wait !== undefined ? Number(args.wait) : 600,
           thread: typeof args.thread === 'string' ? args.thread : null,
           force: args.force === true,
-        });
+        };
+        if (ids.length > 1) {
+          // Fan-out: wall time is the slowest agent, not the sum.
+          const results = await Promise.all(ids.map((id) => dispatchTask(bus, { id, ...opts })));
+          result = {
+            count: results.length,
+            done: results.filter((r) => r.state === 'done').length,
+            results,
+          };
+          if (result.done !== results.length) exitCode = 1;
+          break;
+        }
+        result = await dispatchTask(bus, { id: ids[0], ...opts });
         if (result.state !== 'done') exitCode = 1;
         break;
       }

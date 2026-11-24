@@ -141,8 +141,9 @@ Transport: newline-delimited JSON-RPC 2.0 over stdio (no `Content-Length` framin
 | `bus_task_fail` | `id`, `by`, `lease_token`, `reason` | — |
 | `bus_task_list` | — | `state`, `to`, `limit` |
 | `bus_verify` | — | `id` |
-| `bus_task_dispatch` | starts the target agent CLI, then waits | `id`, `cwd`, `wait_s`, `thread`, `force` |
+| `bus_task_dispatch` | starts the target agent CLI, then waits | `id`, `ids`, `cwd`, `wait_s` (default 3 over MCP), `thread`, `force` |
 | `bus_task_wait` | waits on bus state only (no process start) | `id`, `timeout_s` |
+| `bus_task_run` | create + dispatch in one call | `to`, `goal`, `refs`, `acceptance`, `cwd`, `wait_s`, `thread` |
 
 `refs` accepts `["<sha256>", …]` or `[{"sha256": "...", "note": "..."}, …]`.
 

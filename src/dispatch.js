@@ -317,7 +317,8 @@ function looksLikeModelFailure(text) {
   return /model_not_found|not supported|invalid model|unknown model|No capacity|UNAVAILABLE|503|capacity/i.test(text || '');
 }
 
-export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 700, env = {}, thread = null, force = false }) {
+export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, env = {}, thread = null, force = false }) {
+  const t0 = Date.now();
   const task = showTask(bus, id);
   if (!task) throw Object.assign(new Error(`找不到任务: ${id}`), { code: 1 });
   if (task.state === 'done' || task.state === 'failed') {
@@ -336,6 +337,7 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 700, 
       dispatched: false,
       skipped: true,
       reason: 'cooldown',
+      elapsed_s: Number(((Date.now() - t0) / 1000).toFixed(1)),
       cooldown_until: health.cooldown_until,
       detail: health.reason,
       hint: `该 agent 冷却中（${health.reason}，到 ${health.cooldown_until}）；确认要重试就加 --force`,
@@ -379,9 +381,13 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 700, 
     // Poll the bus while the adapter runs; the adapter's own exit is not proof of work.
     const deadline = Date.now() + budgetS * 1000;
     let abortWait = false;
+    const watchStart = Date.now();
     const watcher = (async () => {
       while (Date.now() < deadline && !abortWait) {
-        await sleep(poll_ms);
+        // Tight polling for the first seconds (most agents claim/complain fast),
+        // then back off so long waits stay cheap.
+        const interval = Date.now() - watchStart < 8000 ? Math.min(poll_ms, 150) : Math.max(poll_ms, 400);
+        await sleep(interval);
         const t = showTask(bus, id);
         if (!t) break;
         latest = t;
@@ -439,6 +445,7 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 700, 
     dispatched: true,
     model: usedModel || undefined,
     attempts: attempts.length > 1 ? attempts : undefined,
+    elapsed_s: Number(((Date.now() - t0) / 1000).toFixed(1)),
     health: healthAfter || undefined,
     thread: thread ? { name: thread, session: sessionId, resumed: !!session } : undefined,
     adapter: lastSpec

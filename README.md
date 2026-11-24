@@ -170,6 +170,16 @@ Model choices stay local: the repo ships the ask/store/apply mechanism, never an
 
 When an agent fails because of upstream capacity (e.g. `503 No capacity available`), the bus records a cooldown (900s for capacity, 120s otherwise). `dispatch` then returns `skipped: true` with the expiry instead of waiting; pass `--force` to retry anyway. One success clears it.
 
+### Concurrency and latency
+
+- **Fan-out in one call**: `agentbus dispatch <id1> <id2> ...` or MCP `bus_task_dispatch {ids:[...]}`. Wall time is the slowest task. Measured with three tasks: 2,899ms one-by-one vs 910ms fan-out (3.2×).
+- **`bus_task_run`** creates and dispatches in one round-trip.
+- **MCP dispatch returns within 3s** instead of blocking 20s; follow with `bus_task_wait`, and the conductor is free to start other work meanwhile.
+- **Session affinity**: a second task on the same `--thread` resumes the recorded session instead of re-reading context (measured 63.9s → 49.5s).
+- **Polling**: 150ms for the first 8 seconds, backing off to 400ms. Pure protocol overhead is ~0.19s per dispatch (825ms end-to-end with a 300ms fake agent, minus the agent's own two CLI calls).
+
+Model inference dominates, not the bus: Codex 45.5s, Antigravity 30s — communication overhead is under 1%. For speed, fan out, reuse sessions, pick the right model.
+
 ### Model fallback
 
 If the configured model fails (`model_not_found`, `not supported`, `503 No capacity`), dispatch walks a candidate list: configured value → `AGENTBUS_FALLBACK_MODELS` (comma-separated) → the agent's known models → no model (CLI default). Each attempt gets at most 120s; model errors abort the wait immediately and move on. The result's `attempts` array records every model tried.

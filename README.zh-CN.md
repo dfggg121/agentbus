@@ -179,6 +179,16 @@ agentbus onboard --conductor codex --allow /path/to/workspace
 
 某个 agent 因上游容量（例如 503 `No capacity available`）失败后，总线会给它记一段冷却（默认 900 秒，其它失败 120 秒）。冷却期内 `dispatch` 直接返回 `skipped: true` 并给出到期时间，不再干等；确认要重试加 `--force`。成功一次即清除。
 
+### 并发与延迟
+
+- **一条命令并发派发**：`agentbus dispatch <id1> <id2> ...` 或 MCP `bus_task_dispatch {ids:[...]}`。墙钟时间取最慢的那个。实测三个任务：逐个派 2,899ms，一次并发 910ms（3.2×）。
+- **`bus_task_run`**：建任务并立刻派发，省掉 create→dispatch 一次往返。
+- **MCP 的 dispatch 3 秒内返回**（不再阻塞 20 秒），随后用 `bus_task_wait` 等总线；等待期间主 agent 可以继续派别的活。
+- **会话亲和**：同一 `--thread` 的第二轮走 `resume`，省掉重新读上下文的时间（实测 63.9s → 49.5s）。
+- **轮询**：前 8 秒 150ms 一次，之后退避到 400ms；协议本身的开销约 0.19 秒/次（用 300ms 的假 agent 实测 825ms，扣掉 agent 自身两次 CLI 调用）。
+
+真正占时间的是模型推理，不是总线：实测 Codex 45.5s、Antigravity 30s，通信开销不到 1%。要更快就并发、复用会话、选对模型。
+
 ### 模型自动降级
 
 `agents.json` 指定的模型失败时（`model_not_found`、`not supported`、`503 No capacity`），dispatch 会按顺序换下一个候选：配置值 → `AGENTBUS_FALLBACK_MODELS`（逗号分隔）→ 该 agent 的已知模型表 → 不传模型（用 CLI 默认）。每次尝试最多等 120 秒，模型类错误会立即中止等待、直接换下一个。返回里的 `attempts` 会列出每个模型的结果。

@@ -193,13 +193,33 @@ export const MCP_TOOLS = [
       type: 'object',
       additionalProperties: false,
       properties: {
-        id: { type: 'string', description: '要交办的任务 id' },
+        id: { type: 'string', description: '要交办的任务 id（单个）' },
+        ids: { type: 'array', items: { type: 'string' }, description: '多个任务 id：一次并发派发，墙钟时间取最慢的那个' },
         cwd: { type: 'string', description: '被唤起 agent 的工作目录，默认当前进程 cwd' },
-        wait_s: { type: 'number', description: '最长等待秒数，默认 600' },
+        wait_s: { type: 'number', description: '最长等待秒数，MCP 默认 3（其余用 bus_task_wait 等）' },
         thread: { type: 'string', description: '会话名：同名线程复用同一 agent 会话（会话亲和）' },
         force: { type: 'boolean', description: '忽略该 agent 的健康冷却，强制重试' },
       },
-      required: ['id'],
+    },
+  },
+  {
+    name: 'bus_task_run',
+    description: '一步到位：建任务并立刻派给目标 agent（省掉 create→dispatch 两次往返）。',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        to: { type: 'string', description: '目标 agent' },
+        goal: { type: 'string', description: '任务目标' },
+        refs: { type: 'array', items: {}, description: '引用（sha256 或 {sha256,note}）' },
+        constraints: { type: 'array', items: { type: 'string' } },
+        acceptance: { type: 'object', description: '验收键，如 {"json":"true"}' },
+        cwd: { type: 'string', description: '工作目录' },
+        wait_s: { type: 'number', description: '最多等待秒数，默认 3' },
+        thread: { type: 'string', description: '会话名（会话亲和）' },
+        idempotency_key: { type: 'string' },
+      },
+      required: ['to', 'goal'],
     },
   },
   {
@@ -349,8 +369,41 @@ function invokeTool(bus, name, args = {}) {
         if (!dispatchEnabled()) {
           return toolError(new Error('dispatch 未启用：服务端需设置 AGENTBUS_ENABLE_DISPATCH=1'));
         }
-        return dispatchTask(bus, { id: a.id, cwd: a.cwd, wait_s: Math.min(Number(a.wait_s) || 20, 20), thread: a.thread || null, force: a.force === true })
-          .then((res) => toolSuccess(res.state === 'done' ? res : { ...res, hint: `任务在总线上等 ${res.to} 完成；接着调 bus_task_wait {id:"${res.id}", timeout_s:300}，不要在这一步阻塞` }))
+        const ids = Array.isArray(a.ids) && a.ids.length ? a.ids.map(String) : (a.id ? [String(a.id)] : []);
+        if (!ids.length) return toolError(new Error('需要 id 或 ids'));
+        const wait_s = Math.min(Number(a.wait_s) || 3, 20);
+        const runOne = (id) => dispatchTask(bus, { id, cwd: a.cwd, wait_s, thread: a.thread || null, force: a.force === true });
+        if (ids.length === 1) {
+          return runOne(ids[0])
+            .then((res) => toolSuccess(res.state === 'done' ? res : { ...res, hint: `任务在总线上等 ${res.to} 完成；接着调 bus_task_wait {id:"${res.id}", timeout_s:300}，不要在这一步阻塞` }))
+            .catch((err) => toolError(err));
+        }
+        // Fan-out: one call starts several agents in parallel; wall time is the slowest, not the sum.
+        return Promise.all(ids.map(runOne))
+          .then((results) => toolSuccess({
+            count: results.length,
+            done: results.filter((r) => r.state === 'done').length,
+            results,
+            hint: '并发派发；未 done 的用 bus_task_wait 逐个等',
+          }))
+          .catch((err) => toolError(err));
+      }
+
+      case 'bus_task_run': {
+        if (!dispatchEnabled()) {
+          return toolError(new Error('dispatch 未启用：服务端需设置 AGENTBUS_ENABLE_DISPATCH=1'));
+        }
+        const created = createTask(bus, {
+          to: a.to,
+          goal: a.goal,
+          refs: a.refs || [],
+          constraints: a.constraints || [],
+          acceptance: a.acceptance || {},
+          from: a.from || 'mcp',
+          idempotency_key: a.idempotency_key || null,
+        });
+        return dispatchTask(bus, { id: created.id, cwd: a.cwd, wait_s: Math.min(Number(a.wait_s) || 3, 20), thread: a.thread || null })
+          .then((res) => toolSuccess({ task: created.id, ...res, hint: res.state === 'done' ? undefined : `任务已建并派出；用 bus_task_wait {id:"${created.id}", timeout_s:300} 等结果` }))
           .catch((err) => toolError(err));
       }
 

@@ -17,6 +17,11 @@ All notable changes to this project are documented here. Format follows [Keep a 
 - Fix: `tools/call` now awaits async handlers. Previously `bus_task_dispatch` returned `{}` over MCP (a Promise serialized as an empty object), which clients reported as `Unexpected response type`.
 - Model fallback: when a model fails with `model_not_found` / `not supported` / `503`, dispatch tries the configured value → `AGENTBUS_FALLBACK_MODELS` → known models → CLI default; each attempt is capped at 120s and model errors abort the wait immediately. `attempts` lists every try.
 - Acceptance suite grew to 36 assertions: worker role gating (6 tools + rejected create), `bus_task_wait` returning real content (guards the async-await regression), and cooldown short-circuit without spawning a process.
+- Fan-out dispatch: `agentbus dispatch <id1> <id2> ...` / MCP `ids:[...]` runs tasks concurrently (3 tasks: 2,899ms sequential → 910ms, 3.2×). Each result is returned in order.
+- `bus_task_run` combines create + dispatch into one round-trip.
+- MCP dispatch default wait lowered to 3s; conductors poll via `bus_task_wait` instead of blocking a single call.
+- Polling tightened to 150ms for the first 8s (backing off to 400ms); dispatches now report `elapsed_s`. Overhead measured ~0.19s per dispatch with a 300ms fake agent.
+- Acceptance now 37 cases (adds fan-out structure).
 
 ## [0.1.0] — 2026-11-23
 

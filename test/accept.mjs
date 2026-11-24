@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// agentbus self-acceptance suite: 36 assertions (§7)
+// agentbus self-acceptance suite: 37 assertions (§7)
 // Pure Node built-ins, zero frameworks, zero shell pipes.
 // Output: PASS n: <desc> / FAIL n: <desc> :: <actual>, ending with SUMMARY passed=x failed=y
 
@@ -486,12 +486,13 @@ async function main() {
       'bus_verify',
       'bus_task_dispatch',
       'bus_task_wait',
+      'bus_task_run',
     ];
     const actualToolNames = toolsResp.map((t) => t.name);
-    const exactNine = toolsResp.length === 11 &&
+    const exactNine = toolsResp.length === 12 &&
       expectedTools.every((n) => actualToolNames.includes(n)) &&
       toolsResp.every((t) => t.inputSchema && t.inputSchema.type === 'object');
-    assertCase(29, 'MCP tools/list 恰好 11 个工具，名字与 §4.1 一致且均有 inputSchema',
+    assertCase(29, 'MCP tools/list 恰好 12 个工具，名字与 §4.1 一致且均有 inputSchema',
       exactNine,
       `count=${toolsResp.length} names=[${actualToolNames.join(',')}]`);
 
@@ -606,6 +607,27 @@ async function main() {
     assertCase(36, '健康冷却：503 冷却期内 dispatch 直接 skipped、不起进程',
       cdDispatch?.json?.skipped === true && cdDispatch?.json?.reason === 'cooldown',
       `skipped=${cdDispatch?.json?.skipped} reason=${cdDispatch?.json?.reason} rc=${cdDispatch?.rc}`);
+
+    // 37. 并发派发：一条命令派多个任务，冷却期内两个都被跳过（不启进程也能验证 fan-out 结构）
+    const fanA = runCli(['new', '--to', 'codex', '--from', 'hermes', '--goal', 'fan-a']).json?.id;
+    const fanB = runCli(['new', '--to', 'codex', '--from', 'hermes', '--goal', 'fan-b']).json?.id;
+    const fanDb = new DatabaseSync(path.join(ROOT_MAIN, 'agentbus.db'));
+    let fanOut;
+    try {
+      fanDb.prepare("INSERT INTO agent_health (agent, cooldown_until, reason, fails, updated_at) VALUES ('codex', ?, 'capacity/503', 1, ?) " +
+        'ON CONFLICT(agent) DO UPDATE SET cooldown_until = excluded.cooldown_until, reason = excluded.reason')
+        .run(new Date(Date.now() + 600000).toISOString(), new Date().toISOString());
+      fanOut = runCli(['dispatch', fanA, fanB, '--allow-dispatch', '--wait', '5']);
+    } finally {
+      try { fanDb.prepare("UPDATE agent_health SET cooldown_until = NULL, reason = NULL WHERE agent = 'codex'").run(); } catch {}
+      try { fanDb.close(); } catch {}
+    }
+    assertCase(37, '并发派发：dispatch id1 id2 返回 count=2，逐个结果都在',
+      fanOut?.json?.count === 2 &&
+      Array.isArray(fanOut?.json?.results) &&
+      fanOut.json.results.length === 2 &&
+      fanOut.json.results.every((r) => r.skipped === true),
+      `count=${fanOut?.json?.count} results=${fanOut?.json?.results?.length}`);
   } finally {
     try { fs.rmSync(RUN_BASE, { recursive: true, force: true }); } catch {}
   }
