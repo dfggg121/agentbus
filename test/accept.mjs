@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// agentbus self-acceptance suite: 33 assertions (§7)
+// agentbus self-acceptance suite: 36 assertions (§7)
 // Pure Node built-ins, zero frameworks, zero shell pipes.
 // Output: PASS n: <desc> / FAIL n: <desc> :: <actual>, ending with SUMMARY passed=x failed=y
 
@@ -121,11 +121,11 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function runMcpSession(root, allowed, requests) {
+async function runMcpSession(root, allowed, requests, envExtra = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [BUS_BIN, 'mcp', '--root', root], {
       cwd: PKG_ROOT,
-      env: { ...process.env, AGENTBUS_ALLOWED_ROOTS: allowed },
+      env: { ...process.env, AGENTBUS_ALLOWED_ROOTS: allowed, ...envExtra },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let outBuf = '';
@@ -564,6 +564,48 @@ async function main() {
     assertCase(33, '--accept 扁平字段在 done 时逐字段校验（不匹配拒绝、匹配放行）',
       doneFlatBad.rc !== 0 && doneFlatGood.rc === 0 && doneFlatGood.json?.state === 'done',
       `badRc=${doneFlatBad.rc} goodRc=${doneFlatGood.rc} state=${doneFlatGood.json?.state}`);
+
+    // 34. worker 角色：只看到 6 个工具，create/dispatch 被拒
+    const workerSession = await runMcpSession(ROOT_MAIN, ALLOWED_MAIN, [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'accept-worker', version: '1.0' } } },
+      { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
+      { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'bus_task_create', arguments: { to: 'codex', goal: 'blocked for workers' } } },
+    ], { AGENTBUS_ROLE: 'worker' });
+    const workerTools = workerSession.responses.find((r) => r.id === 2)?.result?.tools || [];
+    const blockedCall = workerSession.responses.find((r) => r.id === 3)?.result;
+    assertCase(34, 'worker 角色只看到 6 个工具，且 bus_task_create 被拒',
+      workerTools.length === 6 &&
+      !workerTools.some((t) => t.name === 'bus_task_create') &&
+      blockedCall?.isError === true,
+      `count=${workerTools.length} names=[${workerTools.map((t) => t.name).join(',')}] isError=${blockedCall?.isError}`);
+
+    // 35. bus_task_wait 必须返回真实结果（异步处理器没 await 时这里会是空对象）
+    const waitSession = await runMcpSession(ROOT_MAIN, ALLOWED_MAIN, [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'accept-wait', version: '1.0' } } },
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'bus_task_wait', arguments: { id: accId, timeout_s: 5 } } },
+    ]);
+    const waitRes = waitSession.responses.find((r) => r.id === 2)?.result;
+    assertCase(35, 'MCP bus_task_wait 返回真实内容（异步处理器已 await，不再是空 {}）',
+      waitRes?.structuredContent?.state === 'done' && Array.isArray(waitRes?.content) && waitRes.content.length > 0,
+      `state=${waitRes?.structuredContent?.state} hasContent=${Array.isArray(waitRes?.content)}`);
+
+    // 36. 健康冷却：503 冷却期内 dispatch 直接 skipped，不启动进程
+    const cdTask = runCli(['new', '--to', 'codex', '--from', 'hermes', '--goal', 'cooldown probe']);
+    const cdId = cdTask.json?.id;
+    const cdDb = new DatabaseSync(path.join(ROOT_MAIN, 'agentbus.db'));
+    let cdDispatch;
+    try {
+      cdDb.prepare("INSERT INTO agent_health (agent, cooldown_until, reason, fails, updated_at) VALUES ('codex', ?, 'capacity/503', 1, ?) " +
+        'ON CONFLICT(agent) DO UPDATE SET cooldown_until = excluded.cooldown_until, reason = excluded.reason')
+        .run(new Date(Date.now() + 600000).toISOString(), new Date().toISOString());
+      cdDispatch = runCli(['dispatch', cdId, '--allow-dispatch', '--wait', '5']);
+    } finally {
+      try { cdDb.prepare("UPDATE agent_health SET cooldown_until = NULL, reason = NULL WHERE agent = 'codex'").run(); } catch {}
+      try { cdDb.close(); } catch {}
+    }
+    assertCase(36, '健康冷却：503 冷却期内 dispatch 直接 skipped、不起进程',
+      cdDispatch?.json?.skipped === true && cdDispatch?.json?.reason === 'cooldown',
+      `skipped=${cdDispatch?.json?.skipped} reason=${cdDispatch?.json?.reason} rc=${cdDispatch?.rc}`);
   } finally {
     try { fs.rmSync(RUN_BASE, { recursive: true, force: true }); } catch {}
   }

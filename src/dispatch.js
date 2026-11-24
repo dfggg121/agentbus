@@ -12,7 +12,7 @@ import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { showTask } from './tasks.js';
 import { defaultAgySessionPath, readAgySession, detectAgentApi, discoverAgySession } from './agy.js';
-import { modelFor } from './agents.js';
+import { modelFor, KNOWN_MODELS } from './agents.js';
 
 export function dispatchEnabled(flag) {
   return !!flag || process.env.AGENTBUS_ENABLE_DISPATCH === '1';
@@ -295,6 +295,28 @@ function markAgentHealth(bus, agent, { ok, text = '' }) {
   return { cooldown_until: until, reason: capacity ? 'capacity/503' : 'adapter failure' };
 }
 
+function modelCandidates(root, agent) {
+  const first = modelFor(root, agent);
+  const extra = String(process.env.AGENTBUS_FALLBACK_MODELS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const list = [first, ...extra, ...(KNOWN_MODELS[agent] || []), null];
+  const seen = new Set();
+  const out = [];
+  for (const m of list) {
+    const key = m || '(default)';
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(m);
+  }
+  return out;
+}
+
+function looksLikeModelFailure(text) {
+  return /model_not_found|not supported|invalid model|unknown model|No capacity|UNAVAILABLE|503|capacity/i.test(text || '');
+}
+
 export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 700, env = {}, thread = null, force = false }) {
   const task = showTask(bus, id);
   if (!task) throw Object.assign(new Error(`找不到任务: ${id}`), { code: 1 });
@@ -322,47 +344,91 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 700, 
 
   for (const [k, v] of Object.entries(env)) process.env[k] = v;
   const session = thread ? getThread(bus, task.to, thread) : null;
-  const model = modelFor(bus.config.rootDir, task.to);
-  const spec = resolveAdapter(task.to, {
-    prompt: buildPrompt(task.id, task.goal, task.to, workdir),
-    cwd: workdir,
-    busRoot: bus.config.rootDir,
-    session,
-    id: task.id,
-    model,
-  });
+  const candidates = modelCandidates(bus.config.rootDir, task.to);
+  const multi = candidates.length > 1;
+  const totalDeadline = Date.now() + Math.max(5, wait_s) * 1000;
 
-  const run = runAdapter(spec, { cwd: workdir, timeout_s: Math.max(5, wait_s) });
-
-  // Poll the bus while the adapter runs; the adapter's own exit is not proof of work.
-  const deadline = Date.now() + Math.max(5, wait_s) * 1000;
   let latest = task;
-  let finished = false;
-  const watcher = (async () => {
-    while (Date.now() < deadline) {
-      await sleep(poll_ms);
-      const t = showTask(bus, id);
-      if (!t) break;
-      latest = t;
-      if (t.state === 'done' || t.state === 'failed') { finished = true; break; }
-    }
-  })();
-
-  const adapterResult = await run;
-  await watcher;
-
+  let lastSpec = null;
+  let lastRun = null;
+  let usedModel = null;
   let sessionId = session;
-  if (thread && !sessionId) {
-    const found = extractSession(adapterResult.stdout || '');
-    if (found) {
-      setThread(bus, task.to, thread, found);
-      sessionId = found;
+  const attempts = [];
+
+  for (let i = 0; i < candidates.length; i++) {
+    const model = candidates[i];
+    const remainingMs = totalDeadline - Date.now();
+    if (i > 0 && remainingMs < 15000) break;
+
+    // With fallbacks available, do not burn the whole budget on the first model.
+    const budgetS = i === 0
+      ? Math.max(5, Math.min(wait_s, multi ? 120 : wait_s))
+      : Math.max(15, Math.min(120, Math.floor(remainingMs / 1000)));
+
+    const spec = resolveAdapter(task.to, {
+      prompt: buildPrompt(task.id, task.goal, task.to, workdir),
+      cwd: workdir,
+      busRoot: bus.config.rootDir,
+      session: sessionId,
+      id: task.id,
+      model,
+    });
+
+    const run = runAdapter(spec, { cwd: workdir, timeout_s: budgetS });
+
+    // Poll the bus while the adapter runs; the adapter's own exit is not proof of work.
+    const deadline = Date.now() + budgetS * 1000;
+    let abortWait = false;
+    const watcher = (async () => {
+      while (Date.now() < deadline && !abortWait) {
+        await sleep(poll_ms);
+        const t = showTask(bus, id);
+        if (!t) break;
+        latest = t;
+        if (t.state === 'done' || t.state === 'failed') break;
+      }
+    })();
+
+    const adapterResult = await run;
+
+    // A model/selection error will never resolve by waiting out the budget.
+    if (latest.state !== 'done' && latest.state !== 'failed' &&
+        looksLikeModelFailure(`${adapterResult.stdout || ''}${adapterResult.stderr || ''}`)) {
+      abortWait = true;
     }
+    await watcher;
+
+    lastSpec = spec;
+    lastRun = adapterResult;
+    usedModel = model;
+
+    if (thread && !sessionId) {
+      const found = extractSession(adapterResult.stdout || '');
+      if (found) {
+        setThread(bus, task.to, thread, found);
+        sessionId = found;
+      }
+    }
+
+    attempts.push({
+      model: model || '(default)',
+      state: latest.state,
+      exit: adapterResult.exit ?? null,
+      seconds: adapterResult.seconds ?? null,
+    });
+
+    if (latest.state === 'done') break;
+
+    const text = `${adapterResult.stdout || ''}${adapterResult.stderr || ''}`;
+    const modelIssue = looksLikeModelFailure(text);
+    const asyncUnpicked = latest.state === 'open' && task.to === 'antigravity';
+    if (!modelIssue && !asyncUnpicked) break;
+    if (i + 1 >= candidates.length) break;
   }
 
   const healthAfter = markAgentHealth(bus, task.to, {
     ok: latest.state === 'done',
-    text: `${adapterResult.stdout || ''}${adapterResult.stderr || ''}`,
+    text: `${lastRun?.stdout || ''}${lastRun?.stderr || ''}`,
   });
 
   return {
@@ -371,16 +437,19 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 700, 
     state: latest.state,
     ok: latest.state === 'done',
     dispatched: true,
-    model: model || undefined,
+    model: usedModel || undefined,
+    attempts: attempts.length > 1 ? attempts : undefined,
     health: healthAfter || undefined,
     thread: thread ? { name: thread, session: sessionId, resumed: !!session } : undefined,
-    adapter: { command: spec.command, exit: adapterResult.exit ?? null, seconds: adapterResult.seconds ?? null },
+    adapter: lastSpec
+      ? { command: lastSpec.command, exit: lastRun?.exit ?? null, seconds: lastRun?.seconds ?? null }
+      : undefined,
     result: latest.result || null,
     hint: latest.state === 'open' || latest.state === 'claimed'
       ? `任务还在进行；用 agentbus wait ${task.id} --timeout 900 继续等`
       : undefined,
-    stdout_tail: (adapterResult.stdout || '').slice(-1500),
-    stderr_tail: (adapterResult.stderr || '').slice(-800),
-    error: adapterResult.ok === false ? adapterResult.error || `adapter exit ${adapterResult.exit}` : undefined,
+    stdout_tail: (lastRun?.stdout || '').slice(-1500),
+    stderr_tail: (lastRun?.stderr || '').slice(-800),
+    error: lastRun && lastRun.ok === false ? lastRun.error || `adapter exit ${lastRun.exit}` : undefined,
   };
 }
