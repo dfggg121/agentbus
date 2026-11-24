@@ -13,6 +13,8 @@ All notable changes to this project are documented here. Format follows [Keep a 
 - Role enforcement: workers only see register/claim/heartbeat/ref_read/complete/fail; create/dispatch/verify are rejected.
 - `agent_health` cooldown: capacity failures (503) pause an agent for 900s, other failures 120s; `dispatch --force` overrides. One success clears it.
 - Per-agent model is taken from `agents.json` and passed to the adapter (`codex -m`, `claude --model`, `gemini -m`, antigravity `--model`).
+- `bus_task_wait`: waits on bus state without starting a process, so a conductor can dispatch quickly and then poll without hitting client-side MCP call timeouts.
+- Fix: `tools/call` now awaits async handlers. Previously `bus_task_dispatch` returned `{}` over MCP (a Promise serialized as an empty object), which clients reported as `Unexpected response type`.
 
 ## [0.1.0] — 2026-11-23
 

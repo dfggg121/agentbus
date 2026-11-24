@@ -1,5 +1,5 @@
 // agentbus: MCP stdio (and optional loopback HTTP) JSON-RPC 2.0 server (§4)
-// Zero third-party dependencies. Ten tools (nine bus tools + opt-in dispatch); stdout strictly JSON-RPC lines only.
+// Zero third-party dependencies. Eleven tools (nine bus tools + opt-in dispatch + wait); stdout strictly JSON-RPC lines only.
 
 import http from 'node:http';
 import readline from 'node:readline';
@@ -15,7 +15,7 @@ import {
   listTasks,
   verifyTasks,
 } from './tasks.js';
-import { dispatchTask, dispatchEnabled } from './dispatch.js';
+import { dispatchTask, dispatchEnabled, waitForTask } from './dispatch.js';
 
 const SUPPORTED_PROTOCOL_VERSIONS = new Set(['2025-06-18', '2025-03-26']);
 const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
@@ -202,6 +202,19 @@ export const MCP_TOOLS = [
       required: ['id'],
     },
   },
+  {
+    name: 'bus_task_wait',
+    description: '等一个任务在总线上变成 done/failed（不启动进程，可放心长等）。',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        id: { type: 'string', description: '任务 id' },
+        timeout_s: { type: 'number', description: '最长等待秒数，默认 300' },
+      },
+      required: ['id'],
+    },
+  },
 ];
 
 function toolSuccess(structuredContent) {
@@ -336,7 +349,13 @@ function invokeTool(bus, name, args = {}) {
         if (!dispatchEnabled()) {
           return toolError(new Error('dispatch 未启用：服务端需设置 AGENTBUS_ENABLE_DISPATCH=1'));
         }
-        return dispatchTask(bus, { id: a.id, cwd: a.cwd, wait_s: a.wait_s, thread: a.thread || null, force: a.force === true })
+        return dispatchTask(bus, { id: a.id, cwd: a.cwd, wait_s: Math.min(Number(a.wait_s) || 20, 20), thread: a.thread || null, force: a.force === true })
+          .then((res) => toolSuccess(res.state === 'done' ? res : { ...res, hint: `任务在总线上等 ${res.to} 完成；接着调 bus_task_wait {id:"${res.id}", timeout_s:300}，不要在这一步阻塞` }))
+          .catch((err) => toolError(err));
+      }
+
+      case 'bus_task_wait': {
+        return waitForTask(bus, a.id, Number(a.timeout_s) || 300)
           .then((res) => toolSuccess(res))
           .catch((err) => toolError(err));
       }
@@ -349,7 +368,7 @@ function invokeTool(bus, name, args = {}) {
   }
 }
 
-export function handleJsonRpcMessage(bus, msg) {
+export async function handleJsonRpcMessage(bus, msg) {
   if (!msg || typeof msg !== 'object') {
     return { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid Request' } };
   }
@@ -409,7 +428,7 @@ export function handleJsonRpcMessage(bus, msg) {
       return {
         jsonrpc: '2.0',
         id: msg.id,
-        result: invokeTool(bus, toolName, toolArgs),
+        result: await invokeTool(bus, toolName, toolArgs),
       };
     }
 

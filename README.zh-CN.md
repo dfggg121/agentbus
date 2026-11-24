@@ -154,6 +154,8 @@ Antigravity 是异步起会话的，`dispatch` 可能在任务还 `open` 时就�
 agentbus wait <task-id> --timeout 900
 ```
 
+通过 MCP 调用时，`bus_task_dispatch` 最多阻塞 20 秒就返回（很多客户端对单次工具调用有超时），接着调 `bus_task_wait` 等总线即可——它只查状态、不起进程，可以放心长等。
+
 ### 导入：探测本机 agent 并分角色（onboard）
 
 在一台新机器上，不用逐个手写配置：

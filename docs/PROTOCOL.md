@@ -142,6 +142,7 @@ Transport: newline-delimited JSON-RPC 2.0 over stdio (no `Content-Length` framin
 | `bus_task_list` | — | `state`, `to`, `limit` |
 | `bus_verify` | — | `id` |
 | `bus_task_dispatch` | starts the target agent CLI, then waits | `id`, `cwd`, `wait_s`, `thread`, `force` |
+| `bus_task_wait` | waits on bus state only (no process start) | `id`, `timeout_s` |
 
 `refs` accepts `["<sha256>", …]` or `[{"sha256": "...", "note": "..."}, …]`.
 
@@ -149,7 +150,7 @@ Transport: newline-delimited JSON-RPC 2.0 over stdio (no `Content-Length` framin
 
 `AGENTBUS_ROLE` (set by `agentbus onboard`, or by hand) trims the surface:
 
-- `conductor` / unset: all ten tools.
+- `conductor` / unset: all eleven tools.
 - `worker`: `bus_register`, `bus_task_claim`, `bus_task_heartbeat`, `bus_ref_read`, `bus_task_complete`, `bus_task_fail`. Calls to `bus_task_create`, `bus_task_list`, `bus_verify` or `bus_task_dispatch` are rejected with `isError: true`, so a dispatched agent cannot spawn its own fan-out.
 
 Per-agent model choices live in `<bus root>/agents.json` (`{ "conductor": "codex", "models": { "antigravity": "gemini-4-neon" } }`), written by onboarding and read at dispatch time. The file is git-ignored; the protocol never carries preferences.
