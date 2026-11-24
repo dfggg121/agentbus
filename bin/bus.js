@@ -317,6 +317,7 @@ async function main() {
         for (const a of detected) {
           if (!knownClients.includes(a.id)) continue;
           const env = { AGENTBUS_ROLE: a.id === conductorId ? 'conductor' : 'worker' };
+          if (a.id === conductorId) env.AGENTBUS_ENABLE_DISPATCH = '1';
           const r = setupClients({
             clients: [a.id],
             root: bus.config.rootDir,
