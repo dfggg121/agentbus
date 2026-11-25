@@ -15,6 +15,8 @@ import {
   completeTask,
   failTask,
   verifyTasks,
+  addTaskMessage,
+  listTaskMessages,
 } from '../src/tasks.js';
 import { startMcpStdio, startMcpHttp } from '../src/mcp.js';
 import { setupClients, doctor, listClients, describeClients, defaultRoot } from '../src/setup.js';
@@ -106,6 +108,8 @@ function printHelp() {
       'ref <id> --name <name> [--max <bytes>] [--encoding utf8|base64] [--by <agent>]',
       'done <id> --by <agent> --lease <token> --result <path> [--field k=v]...',
       'fail <id> --by <agent> --lease <token> --reason "..."',
+      'message <id> --by <agent> --body "..." [--kind note|progress|question|blocked|answer|error] [--to <agent>] [--lease <token>]',
+      'inbox <id> [--for <agent>] [--since <seq>] [--mark-read] [--limit <n>]',
       'verify [--task <id>]',
       'list [--state <state>] [--to <agent>] [--limit <n>]',
       'dispatch <id> [--cwd <dir>] [--wait <seconds>] [--thread <name>] [--allow-dispatch]',
@@ -338,6 +342,33 @@ async function main() {
           by: typeof args.by === 'string' ? args.by : process.env.AGENTBUS_AGENT,
           lease_token: typeof args.lease === 'string' ? args.lease : null,
           reason: typeof args.reason === 'string' ? args.reason : null,
+        });
+        break;
+      }
+
+      case 'message': {
+        const envRole = String(process.env.AGENTBUS_ROLE || '').trim().toLowerCase();
+        result = addTaskMessage(bus, {
+          id: args._[1],
+          from: typeof args.by === 'string' ? args.by : process.env.AGENTBUS_AGENT,
+          to: typeof args.to === 'string' ? args.to : null,
+          kind: typeof args.kind === 'string' ? args.kind : 'note',
+          body: typeof args.body === 'string' ? args.body : '',
+          lease_token: typeof args.lease === 'string' ? args.lease : null,
+          role: envRole || 'all',
+        });
+        break;
+      }
+
+      case 'inbox': {
+        const envRole = String(process.env.AGENTBUS_ROLE || '').trim().toLowerCase();
+        result = listTaskMessages(bus, {
+          id: args._[1],
+          for_agent: typeof args.for === 'string' ? args.for : null,
+          since_id: args.since !== undefined && args.since !== true ? Number(args.since) : 0,
+          mark_read: args['mark-read'] === true || args['mark-read'] === 'true',
+          limit: args.limit !== undefined && args.limit !== true ? Number(args.limit) : 100,
+          role: envRole || 'all',
         });
         break;
       }

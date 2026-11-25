@@ -536,13 +536,15 @@ async function main() {
       'bus_task_dispatch',
       'bus_task_wait',
       'bus_task_run',
+      'bus_task_message',
+      'bus_task_inbox',
     ];
     const actualToolNames = toolsResp.map((t) => t.name);
-    const exactNine = toolsResp.length === 12 &&
+    const exactAll = toolsResp.length === 14 &&
       expectedTools.every((n) => actualToolNames.includes(n)) &&
       toolsResp.every((t) => t.inputSchema && t.inputSchema.type === 'object');
-    assertCase(29, 'MCP tools/list 恰好 12 个工具，名字与 §4.1 一致且均有 inputSchema',
-      exactNine,
+    assertCase(29, 'MCP tools/list 恰好 14 个工具，名字完整且均有 inputSchema',
+      exactAll,
       `count=${toolsResp.length} names=[${actualToolNames.join(',')}]`);
 
     const listCallResp = mcpSession.responses.find((r) => r.id === 3)?.result;
@@ -615,27 +617,33 @@ async function main() {
       doneFlatBad.rc !== 0 && doneFlatGood.rc === 0 && doneFlatGood.json?.state === 'done',
       `badRc=${doneFlatBad.rc} goodRc=${doneFlatGood.rc} state=${doneFlatGood.json?.state}`);
 
-    // 34. worker 角色：只看到 6 个工具，create/dispatch 被拒
+    // 34. worker 角色：只看到 8 个工具（含 message/inbox），create/dispatch 被拒
     const workerSession = await runMcpSession(ROOT_MAIN, ALLOWED_MAIN, [
       { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'accept-worker', version: '1.0' } } },
       { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
       { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'bus_task_create', arguments: { to: 'codex', goal: 'blocked for workers' } } },
+      { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'bus_task_dispatch', arguments: { id: accId } } },
     ], { AGENTBUS_ROLE: 'worker' });
     const workerTools = workerSession.responses.find((r) => r.id === 2)?.result?.tools || [];
     const blockedCall = workerSession.responses.find((r) => r.id === 3)?.result;
-    assertCase(34, 'worker 角色只看到 6 个工具，且 bus_task_create 被拒',
-      workerTools.length === 6 &&
+    const blockedDispatch = workerSession.responses.find((r) => r.id === 4)?.result;
+    assertCase(34, 'worker 角色恰好看到 8 个工具（含 message/inbox），且 bus_task_create/dispatch 被拒',
+      workerTools.length === 8 &&
+      workerTools.some((t) => t.name === 'bus_task_message') &&
+      workerTools.some((t) => t.name === 'bus_task_inbox') &&
       !workerTools.some((t) => t.name === 'bus_task_create') &&
-      blockedCall?.isError === true,
-      `count=${workerTools.length} names=[${workerTools.map((t) => t.name).join(',')}] isError=${blockedCall?.isError}`);
+      !workerTools.some((t) => t.name === 'bus_task_dispatch') &&
+      blockedCall?.isError === true &&
+      blockedDispatch?.isError === true,
+      `count=${workerTools.length} names=[${workerTools.map((t) => t.name).join(',')}] isError=${blockedCall?.isError}/${blockedDispatch?.isError}`);
 
     const unknownRoleSession = await runMcpSession(ROOT_MAIN, ALLOWED_MAIN, [
       { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'accept-role-typo', version: '1.0' } } },
       { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
     ], { AGENTBUS_ROLE: 'boss' });
     const unknownTools = unknownRoleSession.responses.find((r) => r.id === 2)?.result?.tools || [];
-    assertCase(67, '未知 AGENTBUS_ROLE 按 worker 最小权限处理（不泄漏 dispatch/create）',
-      unknownTools.length === 6 && !unknownTools.some((t) => t.name === 'bus_task_dispatch'),
+    assertCase(67, '未知 AGENTBUS_ROLE 按 worker 最小权限处理（8 工具，不泄漏 dispatch/create）',
+      unknownTools.length === 8 && !unknownTools.some((t) => t.name === 'bus_task_dispatch') && !unknownTools.some((t) => t.name === 'bus_task_create'),
       `count=${unknownTools.length} names=[${unknownTools.map((t) => t.name).join(',')}]`);
 
     // 35. bus_task_wait 必须返回真实结果（异步处理器没 await 时这里会是空对象）
@@ -1434,6 +1442,238 @@ async function main() {
     assertCase(65, '失败可诊断：缺二进制 / 缺配置目录 / 权限不足均返回明确 error_code 与可执行 next',
       codexHasEnvErr && codexHasMissingDir && claudeHasMissingBin && reqDirFailed && permSetupFailed && permDocDetected,
       JSON.stringify({ codexHasEnvErr, codexHasMissingDir, claudeHasMissingBin, reqDirFailed, permSetupFailed, permDocDetected }));
+
+    // 68. claim 返回完整任务信封（goal 原文逐字一致，含双引号/反斜杠/换行/中文/${} + constraints/refs/acceptance）
+    const nastyGoal = [
+      '修复 "Clash Verge" 规则解析：',
+      '路径 C:\\Users\\test\\规则\\config.yaml',
+      '模板变量 ${HTTP_PORT} 与反引号 `echo ok`',
+      '第二行：保持兼容性。',
+    ].join('\n');
+    const goalRefFile = path.join(WORK_DIR, 'goal_ref_68.txt');
+    fs.writeFileSync(goalRefFile, 'secret ref content should not appear in claim\n', 'utf8');
+    const putRef68 = runCli(['put', goalRefFile, '--by', 'hermes']);
+    const t68Cli = runCli([
+      'new', '--to', 'codex', '--from', 'hermes', '--goal', nastyGoal,
+      '--ref', `${putRef68.json?.sha256}:spec note`,
+      '--constraint', 'no external network', '--accept', 'json=true',
+    ]);
+    const t68CliId = t68Cli.json?.id;
+    const claim68Cli = runCli(['claim', t68CliId, '--by', 'codex']);
+    const t68Mcp = runCli([
+      'new', '--to', 'antigravity', '--from', 'hermes', '--goal', nastyGoal,
+      '--ref', putRef68.json?.sha256, '--constraint', 'keep order', '--accept', 'min_bytes=2',
+    ]);
+    const t68McpId = t68Mcp.json?.id;
+    const mcpClaimSess = await runMcpSession(ROOT_MAIN, ALLOWED_MAIN, [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'claim68', version: '1.0' } } },
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'bus_task_claim', arguments: { id: t68McpId, by: 'antigravity' } } },
+    ], { AGENTBUS_ROLE: 'worker' });
+    const claim68Mcp = mcpClaimSess.responses.find((r) => r.id === 2)?.result?.structuredContent;
+    const db68 = new DatabaseSync(path.join(ROOT_MAIN, 'agentbus.db'));
+    let dbGoal68 = '';
+    try { dbGoal68 = db68.prepare('SELECT goal FROM tasks WHERE id = ?').get(t68CliId)?.goal || ''; } finally { db68.close(); }
+    const refs68Clean = Array.isArray(claim68Mcp?.refs) && claim68Mcp.refs.length === 1 &&
+      !('content' in claim68Mcp.refs[0]) && Boolean(claim68Mcp.refs[0].sha256);
+    assertCase(68, 'claim（CLI 与 MCP）返回完整任务信封，goal 含引号/反斜杠/换行/中文/${} 与 DB 逐字一致',
+      claim68Cli.rc === 0 &&
+      claim68Cli.json?.goal === dbGoal68 &&
+      claim68Cli.json?.goal === nastyGoal &&
+      claim68Mcp?.goal === nastyGoal &&
+      claim68Mcp?.from === 'hermes' &&
+      Boolean(claim68Mcp?.created_at) &&
+      typeof claim68Mcp?.attempt === 'number' &&
+      Array.isArray(claim68Mcp?.constraints) && claim68Mcp.constraints[0] === 'keep order' &&
+      claim68Mcp?.acceptance?.min_bytes === '2' &&
+      refs68Clean,
+      `cliMatch=${claim68Cli.json?.goal === nastyGoal} mcpMatch=${claim68Mcp?.goal === nastyGoal} refsClean=${refs68Clean}`);
+
+    // 69. dispatch prompt 为短指针（不含 goal 正文、长度受控）+ fake agentapi 完整接收 argv 不截断
+    const { buildPrompt, dispatchTask, waitForTask } = await import('../src/dispatch.js');
+    const shortPrompt = buildPrompt(t68McpId, 'antigravity', WORK_DIR);
+    const agyBase69 = path.join(RUN_BASE, 'fake_agy_69');
+    fs.mkdirSync(agyBase69, { recursive: true });
+    const agyArgvOut69 = path.join(agyBase69, 'captured_argv.json');
+    const agyHelperJs69 = path.join(agyBase69, 'fake_agentapi_impl.mjs');
+    fs.writeFileSync(agyHelperJs69, [
+      "import { execFileSync } from 'node:child_process';",
+      "import fs from 'node:fs';",
+      "import path from 'node:path';",
+      "const argv = process.argv.slice(2);",
+      "const sub = argv[0];",
+      "if (sub === 'new-conversation') {",
+      "  fs.writeFileSync(process.env.FAKE_AGY_ARGV_OUT, JSON.stringify(argv), 'utf8');",
+      "  const promptArg = argv[argv.length - 1] || '';",
+      "  const tid = (promptArg.match(/id=([A-Za-z0-9_-]+)/) || [])[1];",
+      "  const env = { ...process.env, AGENTBUS_ALLOWED_ROOTS: process.env.AGENTBUS_FAKE_ALLOWED };",
+      "  const run = (a) => execFileSync(process.execPath, [process.env.AGENTBUS_FAKE_BIN, ...a, '--root', process.env.AGENTBUS_FAKE_ROOT], { env, encoding: 'utf8' });",
+      "  const claim = JSON.parse(run(['claim', tid, '--by', 'antigravity']));",
+      "  const out = path.join(process.env.AGENTBUS_FAKE_WORK, 'agy69_' + tid + '.json');",
+      "  fs.writeFileSync(out, JSON.stringify({ goal_len: claim.goal.length, got_clash: claim.goal.includes('Clash Verge') }), 'utf8');",
+      "  run(['done', tid, '--by', 'antigravity', '--lease', claim.lease_token, '--result', out]);",
+      "  console.log(JSON.stringify({ conversationId: 'conv-69-ok' }));",
+      "} else if (sub === 'send-message') {",
+      "  console.log(JSON.stringify({ ok: true }));",
+      "}",
+    ].join('\n'), 'utf8');
+    const agyBin69 = path.join(agyBase69, process.platform === 'win32' ? 'agentapi.bat' : 'agentapi');
+    if (process.platform === 'win32') {
+      fs.writeFileSync(agyBin69, `@echo off\r\n"${process.execPath}" "%~dp0fake_agentapi_impl.mjs" %*\r\n`, 'utf8');
+    } else {
+      fs.writeFileSync(agyBin69, `#!/bin/sh\nexec "${process.execPath}" "${agyHelperJs69}" "$@"\n`, { mode: 0o755 });
+    }
+    const agySess69 = path.join(agyBase69, 'antigravity-session.json');
+    fs.writeFileSync(agySess69, JSON.stringify({ ls_address: 'http://127.0.0.1:19999', csrf_token: 'tok-69' }), 'utf8');
+    const t69Id = runCli(['new', '--to', 'antigravity', '--from', 'hermes', '--goal', nastyGoal]).json?.id;
+    const d69 = runCli(['dispatch', t69Id, '--allow-dispatch', '--wait', '15', '--cwd', WORK_DIR], {
+      envExtra: {
+        AGENTBUS_ANTIGRAVITY_BIN: agyBin69,
+        AGENTBUS_AGY_SESSION: agySess69,
+        FAKE_AGY_ARGV_OUT: agyArgvOut69,
+        AGENTBUS_FAKE_BIN: BUS_BIN,
+        AGENTBUS_FAKE_ROOT: ROOT_MAIN,
+        AGENTBUS_FAKE_WORK: OUT_DIR,
+        AGENTBUS_FAKE_ALLOWED: ALLOWED_MAIN,
+      },
+    });
+    const capturedArgv69 = fs.existsSync(agyArgvOut69) ? JSON.parse(fs.readFileSync(agyArgvOut69, 'utf8')) : [];
+    const sentPrompt69 = String(capturedArgv69[capturedArgv69.length - 1] || '');
+    assertCase(69, 'dispatch prompt 为短指针且不含 goal 正文；fake agentapi.bat 完整接收 argv 不截断',
+      shortPrompt.length <= 600 &&
+      shortPrompt.includes(t68McpId) &&
+      shortPrompt.includes('bus_task_claim') &&
+      !shortPrompt.includes('Clash Verge') &&
+      !shortPrompt.includes('`') &&
+      d69.rc === 0 &&
+      d69.json?.state === 'done' &&
+      Array.isArray(capturedArgv69) && capturedArgv69[0] === 'new-conversation' &&
+      sentPrompt69.includes(`id=${t69Id}`) &&
+      sentPrompt69.includes('bus_task_claim') &&
+      !sentPrompt69.includes('Clash Verge') &&
+      !sentPrompt69.includes('`') &&
+      Array.isArray(d69.json?.messages) &&
+      typeof d69.json?.blocked === 'boolean',
+      `len=${shortPrompt.length} d69=${d69.json?.state} argv0=${capturedArgv69[0]} prompt=${sentPrompt69.slice(0, 120)}`);
+
+    // 70. 双向消息闭环：worker blocked(需 lease) -> show/list 反映 -> master answer(无需 lease) -> unblock -> inbox/mark_read
+    const t70Id = runCli(['new', '--to', 'codex', '--from', 'hermes', '--goal', 'msg-roundtrip']).json?.id;
+    const claim70 = runCli(['claim', t70Id, '--by', 'codex']);
+    const lease70 = claim70.json?.lease_token;
+    const noLeaseMsg = runCli(['message', t70Id, '--by', 'codex', '--kind', 'blocked', '--body', 'no lease attempt']);
+    const msgSess = await runMcpSession(ROOT_MAIN, ALLOWED_MAIN, [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'msg70', version: '1.0' } } },
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'bus_task_message', arguments: { id: t70Id, by: 'codex', kind: 'blocked', body: 'need port config', lease_token: lease70 } } },
+      { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'bus_task_inbox', arguments: { id: t70Id, for_agent: 'codex' } } },
+    ], { AGENTBUS_ROLE: 'worker' });
+    const blkRes70 = msgSess.responses.find((r) => r.id === 2)?.result?.structuredContent;
+    const workerSelfInbox70 = msgSess.responses.find((r) => r.id === 3)?.result?.structuredContent;
+    const showBlocked70 = runCli(['show', t70Id]);
+    const listBlocked70 = runCli(['list', '--limit', '20']);
+    const listEntry70 = (listBlocked70.json || []).find((x) => x.id === t70Id);
+    const ansRes70 = runCli(['message', t70Id, '--by', 'hermes', '--kind', 'answer', '--body', 'use port 7890']);
+    const workerInboxAfterAns = runCli(['inbox', t70Id, '--for', 'codex', '--mark-read']);
+    const workerInboxSince = runCli(['inbox', t70Id, '--for', 'codex', '--since', String(workerInboxAfterAns.json?.last_seq || 0)]);
+    const conductorInboxAll = runCli(['inbox', t70Id]);
+    const envRaw70 = fs.readFileSync(path.join(ROOT_MAIN, 'tasks', `${t70Id}.json`), 'utf8');
+    assertCase(70, '双向消息闭环：worker blocked 需 lease -> show/list 反映 -> master answer 解阻 -> inbox 过滤与 mark_read',
+      noLeaseMsg.rc === 2 &&
+      blkRes70?.blocked === true && Boolean(blkRes70?.blocked_at) &&
+      (workerSelfInbox70?.messages || []).length === 0 &&
+      showBlocked70.json?.blocked === true && Boolean(showBlocked70.json?.blocked_at) &&
+      showBlocked70.json?.last_message?.kind === 'blocked' &&
+      listEntry70?.blocked === true && listEntry70?.last_message?.body?.includes('need port config') &&
+      ansRes70.rc === 0 && ansRes70.json?.blocked === false && ansRes70.json?.blocked_at === null &&
+      (workerInboxAfterAns.json?.messages || []).length === 1 &&
+      workerInboxAfterAns.json.messages[0].body === 'use port 7890' &&
+      Boolean(workerInboxAfterAns.json.messages[0].read_at) &&
+      (workerInboxSince.json?.messages || []).length === 0 &&
+      (conductorInboxAll.json?.messages || []).length === 2 &&
+      !envRaw70.includes('need port config'),
+      `noLeaseRc=${noLeaseMsg.rc} blk=${blkRes70?.blocked} ansBlk=${ansRes70.json?.blocked} wInbox=${workerInboxAfterAns.json?.messages?.length} cInbox=${conductorInboxAll.json?.messages?.length}`);
+
+    // 71. bus_task_wait 在新 question 消息出现时提前返回（不等满 timeout）
+    const t71Id = runCli(['new', '--to', 'codex', '--from', 'hermes', '--goal', 'wait-early-return']).json?.id;
+    const claim71 = runCli(['claim', t71Id, '--by', 'codex']);
+    const waitBus71 = openBus({ rootOverride: ROOT_MAIN });
+    let waitRes71;
+    const waitStart71 = Date.now();
+    try {
+      setTimeout(() => {
+        runCli(['message', t71Id, '--by', 'codex', '--kind', 'question', '--body', 'which branch?', '--lease', claim71.json?.lease_token]);
+      }, 250);
+      waitRes71 = await waitForTask(waitBus71, t71Id, 10, 100);
+    } finally {
+      waitBus71.close();
+    }
+    const waitElapsed71 = Date.now() - waitStart71;
+    assertCase(71, 'bus_task_wait 在新 question 消息出现时提前返回（needs_attention=true, blocked=true）',
+      waitElapsed71 < 5000 &&
+      waitRes71?.needs_attention === true &&
+      waitRes71?.blocked === true &&
+      waitRes71?.state === 'claimed' &&
+      (waitRes71?.messages || []).some((m) => m.kind === 'question' && m.body === 'which branch?'),
+      `elapsed=${waitElapsed71}ms attention=${waitRes71?.needs_attention} blocked=${waitRes71?.blocked} state=${waitRes71?.state}`);
+
+    // 72. bus_task_fail 写入 error 消息；dispatch 非零退出写入 error 消息并保留 stderr_tail
+    const t72FailId = runCli(['new', '--to', 'codex', '--from', 'hermes', '--goal', 'fail-feedback']).json?.id;
+    const claim72 = runCli(['claim', t72FailId, '--by', 'codex']);
+    const failRes72 = runCli(['fail', t72FailId, '--by', 'codex', '--lease', claim72.json?.lease_token, '--reason', 'dependency missing xyz']);
+    const failInbox72 = runCli(['inbox', t72FailId]);
+    const crashAgent72 = path.join(RUN_BASE, 'crash_agent_72.mjs');
+    fs.writeFileSync(crashAgent72, "console.error('boom fatal crash 72'); process.exit(2);\n", 'utf8');
+    const t72DispId = runCli(['new', '--to', 'fake', '--from', 'hermes', '--goal', 'dispatch-fail-feedback']).json?.id;
+    const dispBus72 = openBus({ rootOverride: ROOT_MAIN });
+    let d72;
+    try {
+      d72 = await dispatchTask(dispBus72, {
+        id: t72DispId,
+        cwd: WORK_DIR,
+        wait_s: 5,
+        env: fakeAdapterEnv('unused', { script: crashAgent72 }),
+      });
+      dispBus72.db.prepare("UPDATE agent_health SET cooldown_until = NULL, reason = NULL WHERE agent = 'fake'").run();
+    } finally {
+      dispBus72.close();
+    }
+    const dispInbox72 = runCli(['inbox', t72DispId]);
+    assertCase(72, 'bus_task_fail 与 dispatch 非零退出均写入 kind=error 消息并保留 stderr_tail',
+      failRes72.rc === 0 &&
+      (failInbox72.json?.messages || []).some((m) => m.kind === 'error' && m.body.includes('dependency missing xyz')) &&
+      d72?.dispatched === true &&
+      d72?.blocked === true &&
+      String(d72?.stderr_tail || '').includes('boom fatal crash 72') &&
+      (d72?.messages || []).some((m) => m.kind === 'error' && m.body.includes('boom fatal crash 72')) &&
+      (dispInbox72.json?.messages || []).some((m) => m.kind === 'error'),
+      `failMsgs=${failInbox72.json?.messages?.length} d72Blk=${d72?.blocked} d72Msgs=${d72?.messages?.length}`);
+
+    // 73. 旧库迁移：无 task_messages 表与 blocked_at/last_message_at 列的旧库可自动迁移并正常读写
+    const migRoot = path.join(RUN_BASE, 'legacy_migrate_73');
+    fs.mkdirSync(migRoot, { recursive: true });
+    const legacyDbPath = path.join(migRoot, 'agentbus.db');
+    const oldDb = new DatabaseSync(legacyDbPath);
+    oldDb.exec(`
+      CREATE TABLE artifacts (sha256 TEXT PRIMARY KEY, bytes INTEGER NOT NULL, uri TEXT NOT NULL, name TEXT NOT NULL, mime TEXT, registered_by TEXT NOT NULL, registered_at TEXT NOT NULL, mtime TEXT NOT NULL);
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY, schema TEXT NOT NULL DEFAULT 'agentbus/task@1', from_agent TEXT NOT NULL, to_agent TEXT NOT NULL,
+        state TEXT NOT NULL, goal TEXT NOT NULL, constraints_json TEXT NOT NULL, refs_json TEXT NOT NULL, acceptance_json TEXT NOT NULL,
+        claimed_by TEXT, lease_token TEXT, lease_expires_at TEXT, attempt INTEGER NOT NULL DEFAULT 0, idempotency_key TEXT,
+        created_at TEXT NOT NULL, finished_at TEXT, result_json TEXT, history_json TEXT NOT NULL
+      );
+      CREATE TABLE threads (agent TEXT NOT NULL, name TEXT NOT NULL, session_id TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (agent, name));
+      CREATE TABLE agent_health (agent TEXT PRIMARY KEY, cooldown_until TEXT, reason TEXT, fails INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL);
+      CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, task_id TEXT, event TEXT NOT NULL, payload_json TEXT NOT NULL);
+      INSERT INTO tasks VALUES ('tlegacy73', 'agentbus/task@1', 'hermes', 'codex', 'open', 'legacy goal "quoted"', '[]', '[]', '{}', NULL, NULL, NULL, 0, NULL, '2026-11-24T00:00:00.000Z', NULL, NULL, '[]');
+    `);
+    oldDb.close();
+    const migList = runCli(['list', '--limit', '10'], { root: migRoot, allowed: migRoot });
+    const migClaim = runCli(['claim', 'tlegacy73', '--by', 'codex'], { root: migRoot, allowed: migRoot });
+    const migMsg = runCli(['message', 'tlegacy73', '--by', 'codex', '--kind', 'progress', '--body', 'migrated ok', '--lease', migClaim.json?.lease_token], { root: migRoot, allowed: migRoot });
+    const migInbox = runCli(['inbox', 'tlegacy73'], { root: migRoot, allowed: migRoot });
+    assertCase(73, '旧库自动迁移：缺失 task_messages 与 blocked_at/last_message_at 列可无缝迁移并操作',
+      migList.rc === 0 && migList.json?.length === 1 &&
+      migClaim.rc === 0 && migClaim.json?.goal === 'legacy goal "quoted"' &&
+      migMsg.rc === 0 && (migInbox.json?.messages || []).length === 1,
+      `listRc=${migList.rc} claimRc=${migClaim.rc} msgRc=${migMsg.rc} inbox=${migInbox.json?.messages?.length}`);
   } finally {
     try { fs.rmSync(RUN_BASE, { recursive: true, force: true }); } catch {}
   }

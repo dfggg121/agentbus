@@ -18,6 +18,8 @@ import {
   failTask,
   listTasks,
   verifyTasks,
+  addTaskMessage,
+  listTaskMessages,
 } from './tasks.js';
 import { dispatchTask, dispatchEnabled, waitForTask, maybeArchiveTask } from './dispatch.js';
 
@@ -31,6 +33,8 @@ const WORKER_TOOLS = new Set([
   'bus_ref_read',
   'bus_task_complete',
   'bus_task_fail',
+  'bus_task_message',
+  'bus_task_inbox',
 ]);
 
 let warnedRole = false;
@@ -239,15 +243,49 @@ export const MCP_TOOLS = [
   },
   {
     name: 'bus_task_wait',
-    description: '等一个任务在总线上变成 done/failed（不启动进程，可放心长等）。',
+    description: '等一个任务在总线上变成 done/failed，或出现新的 question/blocked/error 消息时提前返回。',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
       properties: {
         id: { type: 'string', description: '任务 id' },
         timeout_s: { type: 'number', description: '最长等待秒数，默认 300' },
+        since_id: { type: 'number', description: '可选：仅把 seq > since_id 的消息视为新消息' },
       },
       required: ['id'],
+    },
+  },
+  {
+    name: 'bus_task_message',
+    description: '在任务上下文中发送双向消息（提问/报阻塞/报进度/回复/报错）。领取者本人需传 lease_token；conductor 回复可省略。',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['id', 'by', 'body'],
+      properties: {
+        id: { type: 'string', description: '任务 id 或唯一前缀' },
+        by: { type: 'string', description: '发送方 agent 名' },
+        body: { type: 'string', description: '消息正文（超过 16KB 会被截断）' },
+        kind: { type: 'string', enum: ['note', 'progress', 'question', 'blocked', 'answer', 'error'], description: '消息类型，默认 note' },
+        to: { type: 'string', description: '接收方 agent 名（省略则自动路由给任务发起方或领取方）' },
+        lease_token: { type: 'string', description: '领取者本人发送消息时必须提供有效 lease_token' },
+      },
+    },
+  },
+  {
+    name: 'bus_task_inbox',
+    description: '读取任务消息收件箱（返回 messages、state、blocked、blocked_at、last_seq）。',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['id'],
+      properties: {
+        id: { type: 'string', description: '任务 id 或唯一前缀' },
+        for_agent: { type: 'string', description: '接收方 agent 名（worker 传自己，只看发给自己的广播/定向消息且不重复看自己发的）' },
+        since_id: { type: 'number', description: '仅返回 seq > since_id 的消息，默认 0' },
+        mark_read: { type: 'boolean', description: '是否将本次读到的未读消息标记为已读' },
+        limit: { type: 'number', description: '返回条数上限，默认 100，最大 500' },
+      },
     },
   },
 ];
@@ -310,9 +348,20 @@ async function invokeTool(bus, name, args = {}) {
         return toolSuccess({
           id: res.id,
           state: res.state,
+          claimed_by: res.claimed_by,
           lease_token: res.lease_token,
           expires_at: res.expires_at,
           lease_expires_at: res.lease_expires_at,
+          attempt: res.attempt,
+          from: res.from,
+          to: res.to,
+          created_at: res.created_at,
+          goal: res.goal,
+          constraints: res.constraints,
+          refs: res.refs,
+          acceptance: res.acceptance,
+          blocked_at: res.blocked_at,
+          ...(res.thread ? { thread: res.thread } : {}),
         });
       }
 
@@ -427,9 +476,37 @@ async function invokeTool(bus, name, args = {}) {
       }
 
       case 'bus_task_wait': {
-        return waitForTask(bus, a.id, Number(a.timeout_s) || 300)
+        return waitForTask(bus, a.id, Number(a.timeout_s) || 300, 250, {
+          since_id: a.since_id !== undefined ? Number(a.since_id) : undefined,
+        })
           .then((res) => toolSuccess(res))
           .catch((err) => toolError(err));
+      }
+
+      case 'bus_task_message': {
+        const res = addTaskMessage(bus, {
+          id: a.id,
+          from: a.by,
+          to: a.to || null,
+          kind: a.kind || 'note',
+          body: a.body,
+          lease_token: a.lease_token || null,
+          role: currentRole(),
+        });
+        return toolSuccess(res);
+      }
+
+      case 'bus_task_inbox': {
+        const role = currentRole();
+        const res = listTaskMessages(bus, {
+          id: a.id,
+          for_agent: a.for_agent || null,
+          since_id: a.since_id !== undefined ? Number(a.since_id) : 0,
+          mark_read: a.mark_read === true,
+          limit: a.limit !== undefined ? Number(a.limit) : 100,
+          role,
+        });
+        return toolSuccess(res);
       }
 
       default:

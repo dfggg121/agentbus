@@ -12,7 +12,7 @@ import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { showTask } from './tasks.js';
+import { showTask, listTaskMessages, latestTaskMessageSeq, ATTENTION_MESSAGE_KINDS } from './tasks.js';
 import { defaultAgySessionPath, readAgySession, detectAgentApi, discoverAgySession, archiveTaskConversations } from './agy.js';
 import { modelFor, KNOWN_MODELS, readAgentConfig, resolveAgentBin } from './agents.js';
 import { appendEvent, withImmediateTx } from './db.js';
@@ -182,21 +182,19 @@ function resolveAdapter(to, ctx) {
   return build(ctx);
 }
 
-function buildPrompt(id, goal, to, cwd, ctxRef = null) {
+export function buildPrompt(id, to, cwd, ctxRef = null) {
   const ctxLine = ctxRef
-    ? `线程账本指针：先通过 bus_ref_read 读取 ref "${ctxRef.name}"（rev=${ctxRef.rev}, sha256=${ctxRef.sha256.slice(0, 12)}），仅遵守 confirmed 决策与最新 refs。`
+    ? `线程账本指针：先用 bus_ref_read 读取 ref ${ctxRef.name}（rev=${ctxRef.rev}, sha256=${ctxRef.sha256.slice(0, 12)}），仅遵守 confirmed 决策与最新 refs。`
     : null;
   return [
-    `你是被主动调用的执行方。任务 id=${id}。`,
-    `目标：${goal}`,
-    cwd ? `工作目录：${cwd}（所有产出必须写在这个目录下，不要到别的盘或用户目录里探索）` : null,
+    `你是被主动调用的执行方。任务 id=${id}，领取者 by=${to}。`,
+    '任务正文以 bus_task_claim 返回的 goal / constraints / refs / acceptance 为准（本消息不含完整正文）。',
+    cwd ? `工作目录：${cwd}（所有产出写在此目录下，勿跨盘探索）` : null,
     ctxLine,
-    `步骤：1) bus_task_claim 领取，by 必须写 "${to}"；`,
-    '2) bus_ref_read 逐个读 refs，返回 resource_link 的按 uri 自己读文件；',
-    '3) 按需求产出结果文件；',
-    '4) bus_task_complete 交回，fields 用你实际算出的值。',
-    '注意：如果产出不是 JSON，就不要传 fields——传了会强制按 JSON 校验结果文件。',
-    '不要跳过 complete；完不成用 bus_task_fail 说明原因。',
+    `步骤：1) 调用 bus_task_claim（id=${id}, by=${to}）领取并获取完整 goal 与 refs；`,
+    '2) 用 bus_ref_read 逐个读 refs（resource_link 按 uri 自取）；',
+    '3) 需要向主控提问/报阻塞/报进度用 bus_task_message，步骤间可用 bus_task_inbox 查主控回复；',
+    '4) 产出结果后调用 bus_task_complete（非 JSON 产物勿传 fields）；完不成用 bus_task_fail 说明原因。',
   ].filter(Boolean).join('\n');
 }
 
@@ -251,7 +249,9 @@ function runAdapter(spec, { cwd, timeout_s }) {
       resolve({ ok: false, error: `启动失败: ${e.message}`, code: 'spawn_failed' });
       return;
     }
+    let timedOut = false;
     const timer = setTimeout(() => {
+      timedOut = true;
       try {
         if (process.platform === 'win32' && child.pid) {
           spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true });
@@ -263,11 +263,20 @@ function runAdapter(spec, { cwd, timeout_s }) {
 
     child.stdout.on('data', (d) => { out += d.toString('utf8'); if (out.length > 200000) out = out.slice(-200000); });
     child.stderr.on('data', (d) => { err += d.toString('utf8'); if (err.length > 200000) err = err.slice(-200000); });
-    child.on('error', (e) => { clearTimeout(timer); resolve({ ok: false, error: String(e.message || e), code: 'spawn_failed' }); });
+    child.on('error', (e) => { clearTimeout(timer); resolve({ ok: false, error: String(e.message || e), code: 'spawn_failed', timed_out: timedOut }); });
     child.on('exit', async (code) => {
       clearTimeout(timer);
-      const base = { ok: code === 0, exit: code, seconds: Math.round((Date.now() - started) / 100) / 10, stdout: out, stderr: err };
-      if (code !== 0 || typeof spec.followUp !== 'function') { resolve(base); return; }
+      const ok = !timedOut && code === 0;
+      const base = {
+        ok,
+        exit: code,
+        timed_out: timedOut,
+        ...(timedOut ? { error: `adapter timeout after ${timeout_s}s` } : {}),
+        seconds: Math.round((Date.now() - started) / 100) / 10,
+        stdout: out,
+        stderr: err,
+      };
+      if (!ok || typeof spec.followUp !== 'function') { resolve(base); return; }
       // Some CLIs (Antigravity) only stage the work on the first call; a second
       // call against the returned handle is what actually starts the run.
       let next = null;
@@ -308,20 +317,53 @@ export async function maybeArchiveTask(bus, taskId) {
 
 // Async agents (Antigravity) may start the conversation minutes after the CLI
 // returns. This lets the caller wait on the bus instead of on the child process.
-export async function waitForTask(bus, id, timeout_s = 900, poll_ms = 1000) {
+export async function waitForTask(bus, id, timeout_s = 900, poll_ms = 250, opts = {}) {
   const started = Date.now();
   const deadline = started + Math.max(1, timeout_s) * 1000;
   let latest = showTask(bus, id);
   if (!latest) throw Object.assign(new Error(`找不到任务: ${id}`), { code: 1 });
-  while (latest.state !== 'done' && latest.state !== 'failed' && Date.now() < deadline) {
-    await sleep(poll_ms);
-    latest = showTask(bus, id);
-    if (!latest) break;
+
+  const hasSince = opts?.since_id !== undefined && Number.isFinite(Number(opts.since_id));
+  const baselineSeq = hasSince ? Math.max(0, Number(opts.since_id)) : latestTaskMessageSeq(bus, latest.id);
+  let attentionTriggered = false;
+
+  if (latest.state !== 'done' && latest.state !== 'failed') {
+    if (latest.blocked) {
+      attentionTriggered = true;
+    } else if (hasSince) {
+      const initialDelta = listTaskMessages(bus, { id: latest.id, since_id: baselineSeq, limit: 50 });
+      if (initialDelta.messages.some((m) => ATTENTION_MESSAGE_KINDS.has(m.kind))) {
+        attentionTriggered = true;
+      }
+    }
   }
+
+  const interval = Math.max(50, Math.min(Number(poll_ms) || 250, 1000));
+  while (!attentionTriggered && latest && latest.state !== 'done' && latest.state !== 'failed' && Date.now() < deadline) {
+    await sleep(interval);
+    latest = showTask(bus, id);
+    if (!latest || latest.state === 'done' || latest.state === 'failed') break;
+    const delta = listTaskMessages(bus, { id: latest.id, since_id: baselineSeq, limit: 50 });
+    if (latest.blocked || delta.messages.some((m) => ATTENTION_MESSAGE_KINDS.has(m.kind))) {
+      attentionTriggered = true;
+      break;
+    }
+  }
+
+  const finalId = latest ? latest.id : id;
+  const inbox = latest
+    ? listTaskMessages(bus, { id: finalId, limit: 50 })
+    : { messages: [], last_seq: baselineSeq, blocked: false, blocked_at: null };
+
   return {
-    id,
+    id: finalId,
     state: latest ? latest.state : 'missing',
     ok: latest ? latest.state === 'done' : false,
+    blocked: latest ? Boolean(latest.blocked_at) : false,
+    blocked_at: latest ? latest.blocked_at || null : null,
+    needs_attention: attentionTriggered,
+    messages: inbox.messages,
+    last_seq: inbox.last_seq,
     result: latest ? latest.result || null : null,
     waited_s: Math.round((Date.now() - started) / 100) / 10,
   };
@@ -393,13 +435,24 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, 
   const task = showTask(bus, id);
   if (!task) throw Object.assign(new Error(`找不到任务: ${id}`), { code: 1 });
   if (task.state === 'done' || task.state === 'failed') {
-    return { id: task.id, state: task.state, dispatched: false, reason: 'already_terminal', result: task.result || null };
+    const inbox = listTaskMessages(bus, { id: task.id, limit: 20 });
+    return {
+      id: task.id,
+      state: task.state,
+      dispatched: false,
+      reason: 'already_terminal',
+      result: task.result || null,
+      blocked: inbox.blocked,
+      blocked_at: inbox.blocked_at,
+      messages: inbox.messages,
+    };
   }
   const workdir = cwd || process.cwd();
   if (!existsSync(workdir)) throw Object.assign(new Error(`cwd 不存在: ${workdir}`), { code: 1 });
 
   const health = force ? null : agentHealth(bus, task.to);
   if (health) {
+    const inbox = listTaskMessages(bus, { id: task.id, limit: 20 });
     return {
       id: task.id,
       to: task.to,
@@ -411,6 +464,9 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, 
       elapsed_s: Number(((Date.now() - t0) / 1000).toFixed(1)),
       cooldown_until: health.cooldown_until,
       detail: health.reason,
+      blocked: inbox.blocked,
+      blocked_at: inbox.blocked_at,
+      messages: inbox.messages,
       hint: `该 agent 冷却中（${health.reason}，到 ${health.cooldown_until}）；确认要重试就加 --force`,
     };
   }
@@ -488,7 +544,7 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, 
       : Math.max(15, Math.min(120, Math.floor(remainingMs / 1000)));
 
     const spec = resolveAdapter(task.to, {
-      prompt: buildPrompt(task.id, task.goal, task.to, workdir, ctxRef),
+      prompt: buildPrompt(task.id, task.to, workdir, ctxRef),
       cwd: workdir,
       busRoot: bus.config.rootDir,
       session: i === 0 ? th.sessionId : null,
@@ -517,9 +573,10 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, 
 
     const adapterResult = await run;
 
-    // A model/selection error will never resolve by waiting out the budget.
+    // A model/selection error or fast-crashing open adapter will never resolve by waiting out the budget.
     if (latest.state !== 'done' && latest.state !== 'failed' &&
-        looksLikeModelFailure(`${adapterResult.stdout || ''}${adapterResult.stderr || ''}`)) {
+        (looksLikeModelFailure(`${adapterResult.stdout || ''}${adapterResult.stderr || ''}`) ||
+         (adapterResult.ok === false && latest.state === 'open'))) {
       abortWait = true;
     }
     await watcher;
@@ -616,6 +673,41 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, 
     text: `${lastRun?.stdout || ''}${lastRun?.stderr || ''}`,
   });
 
+  const stdoutTail = (lastRun?.stdout || '').slice(-1500);
+  const stderrTail = (lastRun?.stderr || '').slice(-800);
+  const runText = `${lastRun?.stdout || ''}\n${lastRun?.stderr || ''}`;
+  const dispatchFailed = Boolean(lastRun && (lastRun.ok === false || lastRun.timed_out || looksLikeModelFailure(runText)));
+
+  if (dispatchFailed && latest.state !== 'done' && latest.state !== 'failed') {
+    const reason = lastRun.timed_out
+      ? (lastRun.error || 'dispatch 超时')
+      : looksLikeModelFailure(runText)
+        ? `模型不可用或容量不足: ${lastRun.error || `adapter exit ${lastRun.exit}`}`
+        : (lastRun.error || `adapter 非零退出 (exit=${lastRun.exit})`);
+    const parts = [reason];
+    if (stderrTail.trim()) parts.push(`stderr_tail:\n${stderrTail.trim()}`);
+    if (stdoutTail.trim()) parts.push(`stdout_tail:\n${stdoutTail.trim()}`);
+    const errBody = parts.join('\n').slice(0, 16000);
+    const now = new Date().toISOString();
+    withImmediateTx(bus.db, () => {
+      const info = bus.db.prepare(
+        'INSERT INTO task_messages (task_id, from_agent, to_agent, kind, body, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+      ).run(task.id, task.to, task.from || null, 'error', errBody, now);
+      bus.db.prepare(
+        'UPDATE tasks SET last_message_at = ?, blocked_at = COALESCE(blocked_at, ?) WHERE id = ?'
+      ).run(now, now, task.id);
+      appendEvent(bus.db, task.id, 'message', {
+        seq: Number(info.lastInsertRowid),
+        from: task.to,
+        to: task.from || null,
+        kind: 'error',
+        body: errBody.slice(0, 240),
+      });
+    });
+  }
+
+  const inbox = listTaskMessages(bus, { id: task.id, limit: 20 });
+
   return {
     id: task.id,
     to: task.to,
@@ -626,6 +718,9 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, 
     attempts: attempts.length > 1 ? attempts : undefined,
     elapsed_s: Number(((Date.now() - t0) / 1000).toFixed(1)),
     health: healthAfter || undefined,
+    blocked: inbox.blocked,
+    blocked_at: inbox.blocked_at,
+    messages: inbox.messages,
     thread: {
       name: threadName,
       session: effectiveSession,
@@ -639,11 +734,13 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, 
       ? { command: lastSpec.command, exit: lastRun?.exit ?? null, seconds: lastRun?.seconds ?? null }
       : undefined,
     result: latest.result || null,
-    hint: latest.state === 'open' || latest.state === 'claimed'
-      ? `任务还在进行；用 agentbus wait ${task.id} --timeout 900 继续等`
-      : undefined,
-    stdout_tail: (lastRun?.stdout || '').slice(-1500),
-    stderr_tail: (lastRun?.stderr || '').slice(-800),
+    hint: inbox.blocked
+      ? `任务已阻塞/等待回复；查看 messages 后用 bus_task_message(kind="answer") 回复`
+      : latest.state === 'open' || latest.state === 'claimed'
+        ? `任务还在进行；用 agentbus wait ${task.id} --timeout 900 继续等`
+        : undefined,
+    stdout_tail: stdoutTail,
+    stderr_tail: stderrTail,
     error: lastRun && lastRun.ok === false ? lastRun.error || `adapter exit ${lastRun.exit}` : undefined,
   };
 }

@@ -104,6 +104,23 @@ CREATE INDEX IF NOT EXISTS idx_events_task
 
 CREATE INDEX IF NOT EXISTS idx_events_task_event
   ON events(task_id, event, seq);
+
+CREATE TABLE IF NOT EXISTS task_messages (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id TEXT NOT NULL,
+  from_agent TEXT NOT NULL,
+  to_agent TEXT,
+  kind TEXT NOT NULL DEFAULT 'note',
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  read_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_messages_task
+  ON task_messages(task_id, seq);
+
+CREATE INDEX IF NOT EXISTS idx_task_messages_unread
+  ON task_messages(task_id, read_at, seq);
 `;
 
 export function loadConfig({ rootOverride = null, configPath = null } = {}) {
@@ -197,6 +214,12 @@ export function migrateTasksTable(db) {
   const cols = new Set(db.prepare('PRAGMA table_info(tasks)').all().map((r) => r.name));
   if (!cols.has('thread_name')) {
     db.exec('ALTER TABLE tasks ADD COLUMN thread_name TEXT DEFAULT NULL');
+  }
+  if (!cols.has('blocked_at')) {
+    db.exec('ALTER TABLE tasks ADD COLUMN blocked_at TEXT DEFAULT NULL');
+  }
+  if (!cols.has('last_message_at')) {
+    db.exec('ALTER TABLE tasks ADD COLUMN last_message_at TEXT DEFAULT NULL');
   }
 }
 

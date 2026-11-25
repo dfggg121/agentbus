@@ -22,12 +22,29 @@ function atomicWriteJson(filePath, obj) {
   fs.renameSync(tmp, filePath);
 }
 
-function rowToEnvelope(row) {
-  const refs = JSON.parse(row.refs_json).map((r) => {
+function cleanRefs(refsJson) {
+  return JSON.parse(refsJson || '[]').map((r) => {
     const clean = { name: r.name, uri: r.uri, sha256: r.sha256, bytes: r.bytes };
     if (r.note !== undefined && r.note !== '') clean.note = r.note;
     return clean;
   });
+}
+
+function summarizeMessage(m) {
+  if (!m) return null;
+  const text = String(m.body || '');
+  return {
+    seq: Number(m.seq),
+    from: m.from_agent,
+    to: m.to_agent || null,
+    kind: m.kind,
+    body: text.length > 160 ? `${text.slice(0, 157)}...` : text,
+    created_at: m.created_at,
+  };
+}
+
+function rowToEnvelope(row) {
+  const refs = cleanRefs(row.refs_json);
   const env = {
     schema: row.schema || 'agentbus/task@1',
     id: row.id,
@@ -47,6 +64,8 @@ function rowToEnvelope(row) {
     history: JSON.parse(row.history_json),
   };
   if (row.idempotency_key) env.idempotency_key = row.idempotency_key;
+  if (row.blocked_at) env.blocked_at = row.blocked_at;
+  if (row.last_message_at) env.last_message_at = row.last_message_at;
   return env;
 }
 
@@ -371,6 +390,13 @@ export function showTask(bus, idOrPrefix) {
   reapExpiredLeases(bus);
   const row = findTaskRowByIdOrPrefix(bus, idOrPrefix);
   const env = rowToEnvelope(row);
+  const lastRow = bus.db.prepare(
+    'SELECT seq, task_id, from_agent, to_agent, kind, body, created_at FROM task_messages WHERE task_id = ? ORDER BY seq DESC LIMIT 1'
+  ).get(row.id);
+  env.blocked = Boolean(row.blocked_at);
+  env.blocked_at = row.blocked_at || null;
+  env.last_message_at = row.last_message_at || null;
+  env.last_message = summarizeMessage(lastRow);
   // Guarantee no `content` field and refs have only name/uri/sha256/bytes(+optional note)
   return env;
 }
@@ -394,11 +420,30 @@ export function listTasks(bus, { state = null, to = null, limit = 50 } = {}) {
   params.push(effLimit);
 
   const rows = bus.db.prepare(
-    `SELECT id, to_agent, state, goal, refs_json, attempt, claimed_by, lease_expires_at, created_at, finished_at
+    `SELECT id, to_agent, state, goal, refs_json, attempt, claimed_by, lease_expires_at, created_at, finished_at, blocked_at, last_message_at
      FROM tasks ${where}
      ORDER BY created_at DESC
      LIMIT ?`
   ).all(...params);
+
+  const msgIds = rows.filter((r) => r.last_message_at).map((r) => r.id);
+  const lastMsgByTask = new Map();
+  if (msgIds.length > 0) {
+    const placeholders = msgIds.map(() => '?').join(',');
+    const latestMsgs = bus.db.prepare(
+      `SELECT tm.seq, tm.task_id, tm.from_agent, tm.to_agent, tm.kind, tm.body, tm.created_at
+       FROM task_messages tm
+       JOIN (
+         SELECT task_id, MAX(seq) AS max_seq
+         FROM task_messages
+         WHERE task_id IN (${placeholders})
+         GROUP BY task_id
+       ) latest ON tm.task_id = latest.task_id AND tm.seq = latest.max_seq`
+    ).all(...msgIds);
+    for (const m of latestMsgs) {
+      lastMsgByTask.set(m.task_id, summarizeMessage(m));
+    }
+  }
 
   return rows.map((r) => ({
     id: r.id,
@@ -410,6 +455,10 @@ export function listTasks(bus, { state = null, to = null, limit = 50 } = {}) {
     claimed_by: r.claimed_by,
     lease_expires_at: r.lease_expires_at,
     created_at: r.created_at,
+    blocked: Boolean(r.blocked_at),
+    blocked_at: r.blocked_at || null,
+    last_message_at: r.last_message_at || null,
+    last_message: lastMsgByTask.get(r.id) || null,
   }));
 }
 
@@ -486,6 +535,15 @@ export function claimTask(bus, { id, by, ttl_s = null }) {
       expires_at: expiresAt,
       lease_expires_at: expiresAt,
       attempt,
+      from: row.from_agent,
+      to: row.to_agent,
+      created_at: row.created_at,
+      goal: row.goal,
+      constraints: JSON.parse(row.constraints_json || '[]'),
+      refs: cleanRefs(row.refs_json),
+      acceptance: JSON.parse(row.acceptance_json || '{}'),
+      blocked_at: updated?.blocked_at || row.blocked_at || null,
+      ...(row.thread_name ? { thread: row.thread_name } : {}),
     };
   });
 }
@@ -871,7 +929,7 @@ export function completeTask(bus, { id, by, lease_token, result_path, fields = n
 
     bus.db.prepare(
       `UPDATE tasks
-       SET state = 'done', finished_at = ?, result_json = ?, history_json = ?, lease_token = NULL
+       SET state = 'done', finished_at = ?, result_json = ?, history_json = ?, lease_token = NULL, blocked_at = NULL
        WHERE id = ?`
     ).run(now, JSON.stringify(resultObj), JSON.stringify(history), row.id);
 
@@ -973,11 +1031,15 @@ export function failTask(bus, { id, by, lease_token, reason }) {
 
     bus.db.prepare(
       `UPDATE tasks
-       SET state = 'failed', finished_at = ?, lease_token = NULL, lease_expires_at = NULL, history_json = ?
+       SET state = 'failed', finished_at = ?, lease_token = NULL, lease_expires_at = NULL, history_json = ?,
+           last_message_at = ?, blocked_at = COALESCE(blocked_at, ?)
        WHERE id = ?`
-    ).run(now, JSON.stringify(history), row.id);
+    ).run(now, JSON.stringify(history), now, now, row.id);
 
     appendEvent(bus.db, row.id, 'fail', { by, reason: reasonText });
+    bus.db.prepare(
+      'INSERT INTO task_messages (task_id, from_agent, to_agent, kind, body, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(row.id, by, row.from_agent || null, 'error', reasonText.slice(0, 16000), now);
     clearTaskThreadByName(bus.db, `task:${row.id}`);
 
     const updated = bus.db.prepare('SELECT * FROM tasks WHERE id = ?').get(row.id);
@@ -1007,6 +1069,139 @@ export function failTask(bus, { id, by, lease_token, reason }) {
   }
 
   return txOut.result;
+}
+
+export const MESSAGE_KINDS = new Set(['note', 'progress', 'question', 'blocked', 'answer', 'error']);
+export const ATTENTION_MESSAGE_KINDS = new Set(['question', 'blocked', 'error']);
+
+export function addTaskMessage(bus, { id, from, to = null, kind = 'note', body, lease_token = null, role = 'all' }) {
+  if (!from || !String(from).trim()) {
+    throw Object.assign(new Error('message 需要 --by <agent>'), { code: 1 });
+  }
+  const rawText = String(body ?? '');
+  if (!rawText.trim()) {
+    throw Object.assign(new Error('message 需要 --body "..."'), { code: 1 });
+  }
+  const k = String(kind || 'note').trim().toLowerCase();
+  if (!MESSAGE_KINDS.has(k)) {
+    throw Object.assign(new Error(`未知消息类型 ${k}；可选: ${[...MESSAGE_KINDS].join(', ')}`), { code: 1 });
+  }
+  const agent = String(from).trim();
+  const storedBody = rawText.slice(0, 16000);
+
+  syncLegacyTaskFiles(bus);
+  reapExpiredLeases(bus);
+
+  return withImmediateTx(bus.db, () => {
+    const row = findTaskRowByIdOrPrefix(bus, id);
+    const now = nowIso();
+    if (row.claimed_by === agent && role !== 'conductor') {
+      if (row.state !== 'claimed' || !lease_token || row.lease_token !== lease_token || (row.lease_expires_at && row.lease_expires_at <= now)) {
+        throw Object.assign(new Error('发送消息需要有效 lease_token（领取者本人）'), { code: 2 });
+      }
+    } else if (role === 'worker' && row.to_agent !== agent && row.to_agent !== '*') {
+      throw Object.assign(new Error(`worker 无权以 ${agent} 身份向此任务发消息`), { code: 2 });
+    }
+
+    const toAgent = to && String(to).trim()
+      ? String(to).trim()
+      : (row.claimed_by === agent ? row.from_agent : (row.claimed_by || (row.to_agent !== '*' ? row.to_agent : null)));
+    const info = bus.db.prepare(
+      'INSERT INTO task_messages (task_id, from_agent, to_agent, kind, body, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(row.id, agent, toAgent || null, k, storedBody, now);
+    const seq = Number(info.lastInsertRowid);
+
+    if (ATTENTION_MESSAGE_KINDS.has(k)) {
+      bus.db.prepare('UPDATE tasks SET last_message_at = ?, blocked_at = COALESCE(blocked_at, ?) WHERE id = ?').run(now, now, row.id);
+    } else if (k === 'answer') {
+      bus.db.prepare('UPDATE tasks SET last_message_at = ?, blocked_at = NULL WHERE id = ?').run(now, row.id);
+    } else {
+      bus.db.prepare('UPDATE tasks SET last_message_at = ? WHERE id = ?').run(now, row.id);
+    }
+
+    appendEvent(bus.db, row.id, 'message', { seq, from: agent, to: toAgent || null, kind: k, body: storedBody.slice(0, 240) });
+    const updated = bus.db.prepare('SELECT * FROM tasks WHERE id = ?').get(row.id);
+    writeEnvelopeMirror(bus, updated);
+
+    return {
+      ok: true,
+      id: row.id,
+      seq,
+      from: agent,
+      to: toAgent || null,
+      kind: k,
+      body: storedBody,
+      state: updated.state,
+      blocked: Boolean(updated.blocked_at),
+      blocked_at: updated.blocked_at || null,
+      last_message_at: updated.last_message_at || now,
+      created_at: now,
+    };
+  });
+}
+
+export function listTaskMessages(bus, { id, for_agent = null, since_id = 0, mark_read = false, limit = 100, role = 'all' } = {}) {
+  syncLegacyTaskFiles(bus);
+  const row = findTaskRowByIdOrPrefix(bus, id);
+  const since = Math.max(0, Number(since_id) || 0);
+  const cap = Math.min(500, Math.max(1, Number(limit) || 100));
+  const explicitFor = for_agent && String(for_agent).trim() ? String(for_agent).trim() : null;
+  const effectiveFor = explicitFor || (
+    role === 'worker'
+      ? (process.env.AGENTBUS_AGENT || row.claimed_by || (row.to_agent !== '*' ? row.to_agent : null))
+      : null
+  );
+
+  const params = [row.id, since];
+  let sql = 'SELECT seq, task_id, from_agent, to_agent, kind, body, created_at, read_at FROM task_messages WHERE task_id = ? AND seq > ?';
+  if (effectiveFor) {
+    sql += ' AND (to_agent IS NULL OR to_agent = ?) AND from_agent <> ?';
+    params.push(effectiveFor, effectiveFor);
+  }
+  sql += ' ORDER BY seq ASC LIMIT ?';
+  params.push(cap);
+
+  const rawMessages = bus.db.prepare(sql).all(...params);
+  let readStamp = null;
+  if (mark_read && rawMessages.some((m) => !m.read_at)) {
+    readStamp = nowIso();
+    const unreadSeqs = rawMessages.filter((m) => !m.read_at).map((m) => Number(m.seq));
+    withImmediateTx(bus.db, () => {
+      const upd = bus.db.prepare('UPDATE task_messages SET read_at = ? WHERE seq = ? AND read_at IS NULL');
+      for (const seq of unreadSeqs) upd.run(readStamp, seq);
+    });
+  }
+
+  const messages = rawMessages.map((m) => ({
+    seq: Number(m.seq),
+    task_id: m.task_id,
+    from: m.from_agent,
+    to: m.to_agent || null,
+    from_agent: m.from_agent,
+    to_agent: m.to_agent || null,
+    kind: m.kind,
+    body: m.body,
+    created_at: m.created_at,
+    read_at: m.read_at || readStamp || null,
+  }));
+
+  const updated = bus.db.prepare('SELECT state, blocked_at, last_message_at FROM tasks WHERE id = ?').get(row.id);
+  return {
+    ok: true,
+    id: row.id,
+    state: updated.state,
+    blocked: Boolean(updated.blocked_at),
+    blocked_at: updated.blocked_at || null,
+    last_message_at: updated.last_message_at || null,
+    messages,
+    last_seq: messages.length ? Number(messages[messages.length - 1].seq) : since,
+  };
+}
+
+export function latestTaskMessageSeq(bus, id) {
+  const row = findTaskRowByIdOrPrefix(bus, id);
+  const r = bus.db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM task_messages WHERE task_id = ?').get(row.id);
+  return Number(r?.seq || 0);
 }
 
 export function verifyTasks(bus, { id = null } = {}) {
