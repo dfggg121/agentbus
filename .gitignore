@@ -11,6 +11,7 @@ var/
 # local scratch
 _*.txt
 *.log
+out/
 node_modules/
 coverage/
 .DS_Store
