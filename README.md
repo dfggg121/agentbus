@@ -197,6 +197,7 @@ Model inference dominates, not the bus: Codex 45.5s, Antigravity 30s — communi
 ```
 agentbus archive <conversation-id> --dry-run
 agentbus archive <conversation-id> --port 9222
+agentbus archive --title-contains <taskid>   # sweep duplicate conversations
 agentbus onboard --archive-on-done        # persistent, stored in agents.json
 AGENTBUS_ARCHIVE_ON_DONE=1                # one-off, for this process only
 ```

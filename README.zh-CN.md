@@ -207,6 +207,7 @@ agentbus onboard --conductor codex --allow /path/to/workspace
 ```
 agentbus archive <conversation-id> --dry-run       # 只匹配，不点击
 agentbus archive <conversation-id> --port 9222
+agentbus archive --title-contains <taskid>          # 归档该任务的全部重复会话
 agentbus onboard --archive-on-done                  # 持久开启：写进 agents.json，重启也生效
 AGENTBUS_ARCHIVE_ON_DONE=1                          # 单次运行临时开启
 ```
