@@ -104,21 +104,73 @@ export function detectAgentApi(home = os.homedir(), opts = {}) {
   return resolveAgentBin('antigravity', { home, ...opts }).bin;
 }
 
+function splitEnvPathList(raw, platform = process.platform) {
+  if (!raw || !String(raw).trim()) return [];
+  const text = String(raw).trim();
+  const delim = platform === 'win32'
+    ? ';'
+    : (text.includes(';') ? ';' : (text.includes(':') && !/^[A-Za-z]:[\\/]/.test(text) ? ':' : path.delimiter));
+  return text
+    .split(delim)
+    .map((s) => s.trim().replace(/^"(.*)"$/, '$1').trim())
+    .filter(Boolean);
+}
+
 // Antigravity keeps its live coordinates in a daemon hub file. Reading it beats
 // asking the user to export env vars by hand, and the file is per-run so a stale
 // copy is detected by its pid.
-function daemonDirs() {
+export function resolveDaemonDirs({
+  home = null,
+  env = process.env,
+  platform = process.platform,
+  existingOnly = false,
+} = {}) {
   const dirs = [];
-  if (process.env.AGENTBUS_AGY_DAEMON_DIR) dirs.push(process.env.AGENTBUS_AGY_DAEMON_DIR);
-  dirs.push(path.join(os.homedir(), '.gemini', 'antigravity', 'daemon'));
-  if (process.env.APPDATA) dirs.push(path.join(process.env.APPDATA, 'Antigravity', 'daemon'));
-  dirs.push('E:/ai/AntigravityApp_data/dot_gemini/antigravity/daemon');
-  return dirs.filter((d) => fs.existsSync(d));
+  for (const d of splitEnvPathList(env?.AGENTBUS_AGY_DAEMON_DIR, platform)) {
+    dirs.push(d);
+  }
+  const resolvedHome = home || (platform === 'win32'
+    ? (env?.USERPROFILE || env?.HOME || os.homedir())
+    : (env?.HOME || os.homedir()));
+  const normalizeDir = (d) => {
+    if (platform !== 'win32' && d.startsWith('/')) return path.posix.normalize(d);
+    return path.resolve(d);
+  };
+  const pathJoin = (platform !== 'win32' && String(resolvedHome).startsWith('/')) ? path.posix.join : path.join;
+
+  dirs.push(pathJoin(resolvedHome, '.gemini', 'antigravity', 'daemon'));
+  if (platform === 'win32') {
+    const appData = env?.APPDATA && String(env.APPDATA).trim()
+      ? String(env.APPDATA).trim()
+      : pathJoin(resolvedHome, 'AppData', 'Roaming');
+    dirs.push(pathJoin(appData, 'Antigravity', 'daemon'));
+  } else if (platform === 'darwin') {
+    dirs.push(pathJoin(resolvedHome, 'Library', 'Application Support', 'Antigravity', 'daemon'));
+  } else {
+    dirs.push(pathJoin(resolvedHome, '.config', 'Antigravity', 'daemon'));
+  }
+
+  const seen = new Set();
+  const out = [];
+  for (const d of dirs) {
+    const norm = normalizeDir(d);
+    const key = platform === 'win32' ? norm.toLowerCase() : norm;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (!existingOnly || fs.existsSync(norm)) {
+      out.push(norm);
+    }
+  }
+  return out;
 }
 
-export function discoverAgySession() {
+export function daemonDirs(opts = {}) {
+  return resolveDaemonDirs({ ...opts, existingOnly: true });
+}
+
+export function discoverAgySession(opts = {}) {
   let best = null;
-  for (const dir of daemonDirs()) {
+  for (const dir of daemonDirs(opts)) {
     let entries = [];
     try {
       entries = fs.readdirSync(dir).filter((f) => /^hub_\d+\.json$/.test(f));

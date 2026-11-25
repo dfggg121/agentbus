@@ -13,10 +13,10 @@ Thanks for taking a look. This project is intentionally small; the bar for new s
 ## Development
 
 ```bash
-git clone https://github.com/USERNAME/agentbus.git
+git clone https://github.com/dfggg121/agentbus.git
 cd agentbus
 node --version          # must be >= 22.5
-node test/accept.mjs    # 31 assertions
+node test/accept.mjs    # self-contained; 104 cases currently
 ```
 
 With the optional legacy fixtures (maintainers only):

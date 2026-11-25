@@ -29,11 +29,15 @@ Core clients (`optional: false`) are always targeted when running `agentbus setu
 ### Role & Dispatch Flags
 
 ```bash
-# Worker role (default; 8 tools, dispatch disabled)
+# Worker role (default; 9 tools, dispatch disabled)
 agentbus setup --client windsurf --root ~/.agentbus --allow /path/to/workspace --role worker
 
-# Conductor role (14 tools, dispatch enabled)
+# Conductor role (15 tools, dispatch enabled)
 agentbus setup --client codex --root ~/.agentbus --allow /path/to/workspace --role conductor --allow-dispatch
+
+# Repair missing agentbus entries for installed codex/antigravity/dsh/hermes
+# (idempotent, backs up before write; other clients stay out of scope)
+agentbus doctor --fix
 ```
 
 - `--role <conductor|worker>`: defaults to `worker`; unknown values fall back to `worker`.

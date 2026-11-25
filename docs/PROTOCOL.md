@@ -121,8 +121,9 @@ open ─────────────────▶ claimed ────
 | `must_not_contain` | string or array; none may appear |
 | `min_bytes` / `max_bytes` | size bounds, numeric strings |
 | `fields` | map; each key must equal the parsed JSON's top-level value (numbers compared numerically) |
+| `allow_ref_drift` | `"true"` / `true` → complete proceeds with `complete_with_ref_drift` event and warning even if a ref changed |
 
-Completion order is fixed: lease → re-hash every ref → result file exists → acceptance → persist → `done`.
+Completion order is fixed: lease → re-hash every ref → result file exists → acceptance → persist → `done`. Failures in ref drift, acceptance, or `require_ref_read` persist a `kind=error` message and `blocked_at` before throwing.
 
 ---
 
@@ -139,17 +140,34 @@ Transport: newline-delimited JSON-RPC 2.0 over stdio (no `Content-Length` framin
 | `bus_ref_read` | `id`, `name` | `max_bytes`, `encoding`, `by` |
 | `bus_task_complete` | `id`, `by`, `lease_token`, `result_path` | `fields` |
 | `bus_task_fail` | `id`, `by`, `lease_token`, `reason` | — |
+| `bus_task_recover` | `id`, `by`, `action` | `reason`, `to`, `result_path`, `allow_ref_drift`, `fields` |
 | `bus_task_list` | — | `state`, `to`, `limit` |
 | `bus_verify` | — | `id` |
 | `bus_task_dispatch` | starts the target agent CLI, then waits | `id`, `ids`, `cwd`, `wait_s` (default 3 over MCP), `thread`, `force` |
-| `bus_task_wait` | waits on bus state or new attention messages | `id`, `timeout_s`, `since_id` |
+| `bus_task_wait` | waits on bus state, stalled expiry, or new attention messages | `id`, `timeout_s`, `since_id` |
 | `bus_task_run` | create + dispatch in one call | `to`, `goal`, `refs`, `acceptance`, `cwd`, `wait_s`, `thread` |
 | `bus_task_message` | `id`, `by`, `body` | `kind`, `to`, `lease_token` |
 | `bus_task_inbox` | `id` | `for_agent`, `since_id`, `mark_read`, `limit` |
 
 `refs` accepts `["<sha256>", …]` or `[{"sha256": "...", "note": "..."}, …]`.
 
-`bus_task_claim` returns the full task envelope (`goal`, `constraints`, `refs`, `acceptance`, `from`, `created_at`, `attempt`, `blocked_at`, and `thread` when set) alongside `lease_token` and `lease_expires_at`, so `dispatch` prompts only pass a short pointer (`id=...`, `by=...`) and never inline `goal` text or shell-quoted payloads.
+`bus_task_claim` returns the full task envelope (`goal`, `constraints`, `refs`, `acceptance`, `from`, `created_at`, `attempt`, `blocked_at`, `heartbeat_hint`, and `thread` when set) alongside `lease_token` and `lease_expires_at`, so `dispatch` prompts only pass a short pointer (`id=...`, `by=...`) and never inline `goal` text or shell-quoted payloads.
+
+### Task recovery (`bus_task_recover` / `agentbus recover`)
+
+Recovers stuck `open` or `claimed` tasks without requiring an active lease:
+
+- `retry`: clears lease & `blocked_at`, returns to `open` (same `to`), increments `attempt`.
+- `release`: same as `retry` without incrementing `attempt`.
+- `fail`: transitions to `failed`, clears lease & `blocked_at`, records a `kind=error` message.
+- `reassign`: changes `to` to the new agent, clears lease & `blocked_at`, returns to `open`.
+- `adopt`: transitions `open`/`claimed` to `done` using an existing validated `result_path` (respects `acceptance`; `allow_ref_drift=true` records `recover_adopt` and permits drifted refs).
+
+Minimal CLI example:
+
+```bash
+agentbus recover <id> --by hermes --action adopt --result /abs/path/report.json --allow-drift --reason "adopting verified output"
+```
 
 ### Bidirectional task messages
 
@@ -206,8 +224,8 @@ Write points: `done` (artifacts + proposals), `failed` (avoid only), and rotatio
 
 `AGENTBUS_ROLE` (set by `agentbus setup --role` or `agentbus onboard`, or by hand) trims the surface:
 
-- `conductor` / `all` / unset: all 14 tools.
-- `worker` (or any unrecognized role, falling back to least privilege): 8 tools — `bus_register`, `bus_task_claim`, `bus_task_heartbeat`, `bus_ref_read`, `bus_task_complete`, `bus_task_fail`, `bus_task_message`, `bus_task_inbox`. Calls to `bus_task_create`, `bus_task_list`, `bus_verify`, `bus_task_dispatch`, `bus_task_wait`, or `bus_task_run` are rejected with `isError: true`, so a dispatched agent cannot spawn its own fan-out.
+- `conductor` / `all` / unset: all 15 tools.
+- `worker` (or any unrecognized role, falling back to least privilege): 9 tools — `bus_register`, `bus_task_claim`, `bus_task_heartbeat`, `bus_ref_read`, `bus_task_complete`, `bus_task_fail`, `bus_task_recover` (restricted to tasks where `by` is `from` or `to`), `bus_task_message`, `bus_task_inbox`. Calls to `bus_task_create`, `bus_task_list`, `bus_verify`, `bus_task_dispatch`, `bus_task_wait`, or `bus_task_run` are rejected with `isError: true`, so a dispatched agent cannot spawn its own fan-out.
 
 Per-agent model choices live in `<bus root>/agents.json` (`{ "conductor": "codex", "models": { "antigravity": "gemini-4-neon" } }`), written by onboarding and read at dispatch time. The file is git-ignored; the protocol never carries preferences.
 

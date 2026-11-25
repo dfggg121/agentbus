@@ -1,6 +1,7 @@
 // agentbus: MCP stdio (and optional loopback HTTP) JSON-RPC 2.0 server (§4)
-// Zero third-party dependencies. Twelve tools (nine bus tools + dispatch/run/wait); stdout strictly JSON-RPC lines only.
+// Zero third-party dependencies. Fifteen tools (nine bus tools + recover + dispatch/run/wait + message/inbox); stdout strictly JSON-RPC lines only.
 
+import fs from 'node:fs';
 import http from 'node:http';
 import readline from 'node:readline';
 import { createRequire } from 'node:module';
@@ -16,6 +17,8 @@ import {
   readTaskRef,
   completeTask,
   failTask,
+  recoverTask,
+  reapExpiredLeases,
   listTasks,
   verifyTasks,
   addTaskMessage,
@@ -33,6 +36,7 @@ const WORKER_TOOLS = new Set([
   'bus_ref_read',
   'bus_task_complete',
   'bus_task_fail',
+  'bus_task_recover',
   'bus_task_message',
   'bus_task_inbox',
 ]);
@@ -98,7 +102,7 @@ export const MCP_TOOLS = [
           },
         },
         constraints: { type: 'array', items: { type: 'string' }, description: '约束列表' },
-        acceptance: { type: 'object', description: '验收条款：json / must_contain / must_not_contain / min_bytes / max_bytes / fields / require_ref_read' },
+        acceptance: { type: 'object', description: '验收条款：json / must_contain / must_not_contain / min_bytes / max_bytes / fields / require_ref_read / allow_ref_drift' },
         from: { type: 'string', description: '发起方 agent 名' },
         idempotency_key: { type: 'string', description: '幂等键，同 from 重复提交返回同一任务 id' },
         thread: { type: 'string', description: '关联跨任务线程名（若已有 context@1 账本则自动挂载指针）' },
@@ -178,6 +182,25 @@ export const MCP_TOOLS = [
         by: { type: 'string', description: '领取方 agent 名' },
         lease_token: { type: 'string', description: 'claim 返回的租约令牌' },
         reason: { type: 'string', description: '失败原因' },
+      },
+    },
+  },
+  {
+    name: 'bus_task_recover',
+    description: '恢复卡住的任务：retry / release / fail / reassign / adopt（conductor 可恢复任意任务；worker 仅限自己是 from/to 的任务）。',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['id', 'by', 'action'],
+      properties: {
+        id: { type: 'string', description: '任务 id 或唯一前缀' },
+        by: { type: 'string', description: '操作方 agent 名' },
+        action: { type: 'string', enum: ['retry', 'release', 'fail', 'reassign', 'adopt'], description: '恢复动作' },
+        reason: { type: 'string', description: '恢复原因说明' },
+        to: { type: 'string', description: 'reassign 时的目标 agent 名' },
+        result_path: { type: 'string', description: 'adopt 时的结果文件绝对路径或 file:// URI' },
+        allow_ref_drift: { type: 'boolean', description: 'adopt 时是否允许引用漂移' },
+        fields: { type: 'object', description: 'adopt 时可选的额外顶层 JSON 字段严格等值校验' },
       },
     },
   },
@@ -352,6 +375,7 @@ async function invokeTool(bus, name, args = {}) {
           lease_token: res.lease_token,
           expires_at: res.expires_at,
           lease_expires_at: res.lease_expires_at,
+          heartbeat_hint: res.heartbeat_hint,
           attempt: res.attempt,
           from: res.from,
           to: res.to,
@@ -409,6 +433,24 @@ async function invokeTool(bus, name, args = {}) {
           reason: a.reason,
         });
         return toolSuccess({ state: res.state, id: res.id, reason: res.reason });
+      }
+
+      case 'bus_task_recover': {
+        const res = recoverTask(bus, {
+          id: a.id,
+          by: a.by,
+          action: a.action,
+          reason: a.reason ?? null,
+          to: a.to ?? null,
+          result_path: a.result_path ?? a.result ?? null,
+          allow_ref_drift: a.allow_ref_drift === true || a.allow_drift === true,
+          role: currentRole(),
+          fields: a.fields || null,
+        });
+        if (res.state === 'done') {
+          await maybeArchiveTask(bus, res.id);
+        }
+        return toolSuccess(res);
       }
 
       case 'bus_task_list': {
@@ -590,12 +632,57 @@ export async function handleJsonRpcMessage(bus, msg) {
   }
 }
 
+function verifyMcpBusWritable(bus) {
+  const rootDir = bus?.config?.rootDir;
+  const dbPath = bus?.config?.dbPath;
+  if (rootDir) {
+    try {
+      fs.accessSync(rootDir, fs.constants.R_OK | fs.constants.W_OK);
+    } catch (err) {
+      throw Object.assign(
+        new Error(`MCP 启动自检失败：agentbus 根目录不可写 ${rootDir} (${err.code || 'EACCES'})；请检查权限或运行 agentbus doctor --fix`),
+        { code: 1 }
+      );
+    }
+  }
+  if (dbPath && fs.existsSync(dbPath)) {
+    try {
+      fs.accessSync(dbPath, fs.constants.R_OK | fs.constants.W_OK);
+    } catch (err) {
+      throw Object.assign(
+        new Error(`MCP 启动自检失败：agentbus 数据库不可写 ${dbPath} (${err.code || 'EACCES'})；请检查权限或运行 agentbus doctor --fix`),
+        { code: 1 }
+      );
+    }
+  }
+}
+
+function startLeaseReaper(bus) {
+  let stopped = false;
+  const timer = setInterval(() => {
+    if (stopped) return;
+    try {
+      reapExpiredLeases(bus);
+    } catch (err) {
+      process.stderr.write(`[agentbus] reapExpiredLeases error: ${err?.message || err}\n`);
+    }
+  }, 30000);
+  if (typeof timer.unref === 'function') timer.unref();
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
+}
+
 export function startMcpStdio(bus) {
+  verifyMcpBusWritable(bus);
+  const stopReaper = startLeaseReaper(bus);
   return new Promise((resolve) => {
     let closed = false;
     const shutdown = () => {
       if (closed) return;
       closed = true;
+      stopReaper();
       bus.close();
       resolve();
     };
@@ -632,10 +719,12 @@ export function startMcpStdio(bus) {
  * Never started by default (§1).
  */
 export function startMcpHttp(bus, bindSpec) {
+  verifyMcpBusWritable(bus);
   const m = /^127\.0\.0\.1:(\d+)$/.exec(String(bindSpec || '').trim());
   if (!m) {
     throw Object.assign(new Error('--http 仅允许绑定 127.0.0.1:<port>'), { code: 1 });
   }
+  const stopReaper = startLeaseReaper(bus);
   const port = Number(m[1]);
   const server = http.createServer((req, res) => {
     if (req.method !== 'POST') {
@@ -666,11 +755,12 @@ export function startMcpHttp(bus, bindSpec) {
   });
 
   return new Promise((resolve, reject) => {
-    server.on('error', (e) => { bus.close(); reject(e); });
+    server.on('error', (e) => { stopReaper(); bus.close(); reject(e); });
     server.listen(port, '127.0.0.1', () => {
       process.stderr.write(`agentbus MCP HTTP listening on http://127.0.0.1:${port}\n`);
     });
     const stop = () => {
+      stopReaper();
       server.close(() => { bus.close(); resolve(); process.exit(0); });
     };
     process.on('SIGINT', stop);

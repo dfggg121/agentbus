@@ -176,19 +176,32 @@ export function reapExpiredLeases(bus) {
       const nextState = exceeded ? 'failed' : 'open';
       const history = JSON.parse(row.history_json || '[]');
       history.push({ at: now, state: nextState, by: 'system', reason: 'lease_expired' });
+      const msgBody = `lease_expired: previous_claimed_by=${row.claimed_by || 'unknown'} attempt=${nextAttempt} next_state=${nextState}`;
 
       bus.db.prepare(
         `UPDATE tasks
          SET state = ?, claimed_by = NULL, lease_token = NULL, lease_expires_at = NULL,
-             attempt = ?, finished_at = ?, history_json = ?
+             blocked_at = NULL, last_message_at = ?, attempt = ?, finished_at = ?, history_json = ?
          WHERE id = ? AND state = 'claimed'`
       ).run(
         nextState,
+        now,
         nextAttempt,
         exceeded ? now : null,
         JSON.stringify(history),
         row.id
       );
+
+      const msgInfo = bus.db.prepare(
+        'INSERT INTO task_messages (task_id, from_agent, to_agent, kind, body, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+      ).run(row.id, 'system', row.from_agent || null, 'error', msgBody, now);
+      appendEvent(bus.db, row.id, 'message', {
+        seq: Number(msgInfo.lastInsertRowid),
+        from: 'system',
+        to: row.from_agent || null,
+        kind: 'error',
+        body: msgBody.slice(0, 240),
+      });
 
       appendEvent(bus.db, row.id, 'lease_expired', {
         previous_claimed_by: row.claimed_by,
@@ -487,20 +500,48 @@ export function claimTask(bus, { id, by, ttl_s = null }) {
 
     if (state === 'claimed' && row.lease_expires_at && row.lease_expires_at <= now) {
       attempt += 1;
+      const prevClaimedBy = row.claimed_by || 'unknown';
       if (attempt > bus.config.maxAttempts) {
         history.push({ at: now, state: 'failed', by: 'system', reason: 'lease_expired' });
+        const msgBody = `lease_expired: previous_claimed_by=${prevClaimedBy} attempt=${attempt} next_state=failed`;
         bus.db.prepare(
           `UPDATE tasks SET state='failed', claimed_by=NULL, lease_token=NULL, lease_expires_at=NULL,
-           attempt=?, finished_at=?, history_json=? WHERE id=?`
-        ).run(attempt, now, JSON.stringify(history), row.id);
-        appendEvent(bus.db, row.id, 'lease_expired', { attempt, next_state: 'failed' });
+           blocked_at=NULL, last_message_at=?, attempt=?, finished_at=?, history_json=? WHERE id=?`
+        ).run(now, attempt, now, JSON.stringify(history), row.id);
+        const msgInfo = bus.db.prepare(
+          'INSERT INTO task_messages (task_id, from_agent, to_agent, kind, body, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+        ).run(row.id, 'system', row.from_agent || null, 'error', msgBody, now);
+        appendEvent(bus.db, row.id, 'message', {
+          seq: Number(msgInfo.lastInsertRowid),
+          from: 'system',
+          to: row.from_agent || null,
+          kind: 'error',
+          body: msgBody.slice(0, 240),
+        });
+        appendEvent(bus.db, row.id, 'lease_expired', { previous_claimed_by: prevClaimedBy, attempt, next_state: 'failed' });
+        clearTaskThreadByName(bus.db, `task:${row.id}`);
         const upd = bus.db.prepare('SELECT * FROM tasks WHERE id = ?').get(row.id);
         writeEnvelopeMirror(bus, upd);
         throw Object.assign(new Error(`任务已因租约过期超过最大重试次数进入 failed`), { code: 2 });
       }
       state = 'open';
+      const msgBody = `lease_expired: previous_claimed_by=${prevClaimedBy} attempt=${attempt} next_state=open`;
       history.push({ at: now, state: 'open', by: 'system', reason: 'lease_expired' });
-      appendEvent(bus.db, row.id, 'lease_expired', { attempt, next_state: 'open' });
+      bus.db.prepare(
+        `UPDATE tasks SET state='open', claimed_by=NULL, lease_token=NULL, lease_expires_at=NULL,
+         blocked_at=NULL, last_message_at=?, attempt=?, history_json=? WHERE id=?`
+      ).run(now, attempt, JSON.stringify(history), row.id);
+      const msgInfo = bus.db.prepare(
+        'INSERT INTO task_messages (task_id, from_agent, to_agent, kind, body, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+      ).run(row.id, 'system', row.from_agent || null, 'error', msgBody, now);
+      appendEvent(bus.db, row.id, 'message', {
+        seq: Number(msgInfo.lastInsertRowid),
+        from: 'system',
+        to: row.from_agent || null,
+        kind: 'error',
+        body: msgBody.slice(0, 240),
+      });
+      appendEvent(bus.db, row.id, 'lease_expired', { previous_claimed_by: prevClaimedBy, attempt, next_state: 'open' });
     }
 
     if (state !== 'open') {
@@ -526,6 +567,7 @@ export function claimTask(bus, { id, by, ttl_s = null }) {
     const updated = bus.db.prepare('SELECT * FROM tasks WHERE id = ?').get(row.id);
     writeEnvelopeMirror(bus, updated);
 
+    const heartbeatIntervalS = Math.max(60, Math.min(300, Math.floor(ttl / 3)));
     return {
       ok: true,
       id: row.id,
@@ -534,6 +576,7 @@ export function claimTask(bus, { id, by, ttl_s = null }) {
       lease_token: leaseToken,
       expires_at: expiresAt,
       lease_expires_at: expiresAt,
+      heartbeat_hint: `每 ${heartbeatIntervalS} 秒调用一次 bus_task_heartbeat（当前租约 TTL=${ttl}s），否则租约过期会被回收`,
       attempt,
       from: row.from_agent,
       to: row.to_agent,
@@ -722,7 +765,16 @@ function runAcceptanceChecks(acceptance, resultPath, resultBytes, extraFields = 
   const acc = acceptance && typeof acceptance === 'object' ? acceptance : {};
   // `--accept k=v` 落成扁平键；`fields` 是嵌套写法。两种都要当字段断言，
   // 否则用 --accept 建的任务会“零校验”直接 done。
-  const RESERVED = new Set(['min_bytes', 'max_bytes', 'json', 'must_contain', 'must_not_contain', 'fields', 'require_ref_read']);
+  const RESERVED = new Set([
+    'min_bytes',
+    'max_bytes',
+    'json',
+    'must_contain',
+    'must_not_contain',
+    'fields',
+    'require_ref_read',
+    'allow_ref_drift',
+  ]);
   const flatFields = {};
   for (const [k, v] of Object.entries(acc)) {
     if (!RESERVED.has(k)) flatFields[k] = v;
@@ -884,35 +936,82 @@ export function completeTask(bus, { id, by, lease_token, result_path, fields = n
       throw Object.assign(new Error('租约 token 或领取者不匹配'), { code: 2 });
     }
 
-    // 2. Recompute SHA-256 of EVERY ref -> reject on any drift
+    const acceptance = JSON.parse(row.acceptance_json || '{}');
+    const allowRefDrift = acceptance.allow_ref_drift === true || acceptance.allow_ref_drift === 'true';
+
+    // 2. Recompute SHA-256 of EVERY ref -> reject on any drift unless allow_ref_drift
     const refs = JSON.parse(row.refs_json || '[]');
     const drifted = [];
     for (const ref of refs) {
       const v = verifyRefIntegrity(ref, bus.config);
       if (!v.ok) drifted.push(`${ref.name}(${v.reason})`);
     }
-    if (drifted.length > 0) {
-      throw Object.assign(new Error(`引用已漂移 (drift)，拒绝收工: ${drifted.join(', ')}`), { code: 1 });
+    const persistReject = (err, eventName, eventPayload) => {
+      const errMsg = String(err?.message || err || 'complete failed');
+      if (eventName) {
+        appendEvent(bus.db, row.id, eventName, eventPayload || {});
+      }
+      const info = bus.db.prepare(
+        'INSERT INTO task_messages (task_id, from_agent, to_agent, kind, body, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+      ).run(row.id, by, row.from_agent || null, 'error', errMsg.slice(0, 16000), now);
+      bus.db.prepare(
+        'UPDATE tasks SET last_message_at = ?, blocked_at = COALESCE(blocked_at, ?) WHERE id = ?'
+      ).run(now, now, row.id);
+      appendEvent(bus.db, row.id, 'message', {
+        seq: Number(info.lastInsertRowid),
+        from: by,
+        to: row.from_agent || null,
+        kind: 'error',
+        body: errMsg.slice(0, 240),
+      });
+      const updated = bus.db.prepare('SELECT * FROM tasks WHERE id = ?').get(row.id);
+      if (updated) writeEnvelopeMirror(bus, updated);
+      return { __rejectedError: err };
+    };
+
+    if (drifted.length > 0 && !allowRefDrift) {
+      return persistReject(
+        Object.assign(new Error(`引用已漂移 (drift)，拒绝收工: ${drifted.join(', ')}`), { code: 1 }),
+        'complete_drift_rejected',
+        { by, attempt: Number(row.attempt || 0), drifted },
+      );
     }
 
-    // 3. Result file must exist, be inside allowed_roots, and be a regular file
-    const { fsPath: resPath, uri: resUri, stat: resStat } = resolveAndValidatePath(result_path, bus.config, { checkSize: true });
-
-    // 4. Evaluate acceptance clauses (§6.3) — failure keeps task in 'claimed'
-    const acceptance = JSON.parse(row.acceptance_json || '{}');
-    runAcceptanceChecks(acceptance, resPath, resStat.size, fields);
+    // 3 & 4. Result file validation & acceptance clauses (§6.3) — failure persists error message + blocked_at and keeps task in 'claimed'
+    let resPath;
+    let resUri;
+    let resStat;
+    try {
+      const resolvedRes = resolveAndValidatePath(result_path, bus.config, { checkSize: true });
+      resPath = resolvedRes.fsPath;
+      resUri = resolvedRes.uri;
+      resStat = resolvedRes.stat;
+      runAcceptanceChecks(acceptance, resPath, resStat.size, fields);
+    } catch (err) {
+      return persistReject(
+        err,
+        'complete_acceptance_rejected',
+        { by, attempt: Number(row.attempt || 0), reason: String(err?.message || err) },
+      );
+    }
 
     // 4.5 ref_read audit gate (warn vs strict)
     const audit = evaluateRefReadAudit(bus, row, by);
     if (!audit.ok && audit.mode === 'strict') {
-      return {
-        __auditRejected: {
-          taskId: row.id,
+      return persistReject(
+        Object.assign(
+          new Error(`ref_read 审计拦截：交工前必须通过 bus_ref_read 读取全部引用 (${audit.missing.join(', ')})`),
+          { code: 1 }
+        ),
+        'complete_audit_rejected',
+        {
+          by,
           attempt: Number(row.attempt || 0),
-          missing: audit.missing,
+          missing_refs: audit.missing,
           resumed: audit.resumed,
+          mode: 'strict',
         },
-      };
+      );
     }
 
     // 5. Hash result file, commit state=done, record events & mirror envelope
@@ -932,6 +1031,14 @@ export function completeTask(bus, { id, by, lease_token, result_path, fields = n
        SET state = 'done', finished_at = ?, result_json = ?, history_json = ?, lease_token = NULL, blocked_at = NULL
        WHERE id = ?`
     ).run(now, JSON.stringify(resultObj), JSON.stringify(history), row.id);
+
+    if (drifted.length > 0 && allowRefDrift) {
+      appendEvent(bus.db, row.id, 'complete_with_ref_drift', {
+        by,
+        attempt: Number(row.attempt || 0),
+        drifted,
+      });
+    }
 
     if (!audit.ok && audit.mode === 'warn') {
       appendEvent(bus.db, row.id, 'complete_audit_warning', {
@@ -958,9 +1065,17 @@ export function completeTask(bus, { id, by, lease_token, result_path, fields = n
       result_bytes: resStat.size,
       result: resultObj,
     };
+    const warnings = [];
+    if (drifted.length > 0 && allowRefDrift) {
+      warnings.push('completed_with_ref_drift');
+      doneResult.drifted_refs = drifted;
+    }
     if (!audit.ok && audit.mode === 'warn') {
-      doneResult.warnings = ['completed_without_bus_ref_read'];
+      warnings.push('completed_without_bus_ref_read');
       doneResult.missing_refs = audit.missing;
+    }
+    if (warnings.length > 0) {
+      doneResult.warnings = warnings;
     }
 
     return {
@@ -972,21 +1087,8 @@ export function completeTask(bus, { id, by, lease_token, result_path, fields = n
     };
   });
 
-  if (txOut && txOut.__auditRejected) {
-    const rej = txOut.__auditRejected;
-    withImmediateTx(bus.db, () => {
-      appendEvent(bus.db, rej.taskId, 'complete_audit_rejected', {
-        by,
-        attempt: rej.attempt,
-        missing_refs: rej.missing,
-        resumed: rej.resumed,
-        mode: 'strict',
-      });
-    });
-    throw Object.assign(
-      new Error(`ref_read 审计拦截：交工前必须通过 bus_ref_read 读取全部引用 (${rej.missing.join(', ')})`),
-      { code: 1 }
-    );
+  if (txOut && txOut.__rejectedError) {
+    throw txOut.__rejectedError;
   }
 
   if (txOut.threadName && !contextLedgerDisabled()) {
@@ -1002,6 +1104,290 @@ export function completeTask(bus, { id, by, lease_token, result_path, fields = n
   }
 
   return txOut.doneResult;
+}
+
+export const RECOVER_ACTIONS = new Set(['retry', 'release', 'fail', 'reassign', 'adopt']);
+
+export function recoverTask(bus, {
+  id,
+  by,
+  action,
+  reason = null,
+  to = null,
+  result_path = null,
+  allow_ref_drift = false,
+  role = 'all',
+  fields = null,
+}) {
+  if (!by || typeof by !== 'string' || !by.trim()) {
+    throw Object.assign(new Error('recover 需要 --by <agent>'), { code: 1 });
+  }
+  const agent = by.trim();
+  const act = String(action || '').trim().toLowerCase();
+  if (!RECOVER_ACTIONS.has(act)) {
+    throw Object.assign(new Error(`未知 recover action: ${action || ''}；可选: ${[...RECOVER_ACTIONS].join(', ')}`), { code: 1 });
+  }
+  const reasonText = reason !== null && reason !== undefined && String(reason).trim() ? String(reason).trim() : null;
+
+  if (act === 'reassign' && (!to || typeof to !== 'string' || !to.trim())) {
+    throw Object.assign(new Error('recover reassign 需要 --to <agent>'), { code: 1 });
+  }
+  if (act === 'adopt' && (!result_path || typeof result_path !== 'string' || !result_path.trim())) {
+    throw Object.assign(new Error('recover adopt 需要 --result <path>'), { code: 1 });
+  }
+
+  syncLegacyTaskFiles(bus);
+
+  const txOut = withImmediateTx(bus.db, () => {
+    const row = findTaskRowByIdOrPrefix(bus, id);
+    const now = nowIso();
+
+    if (role === 'worker') {
+      const envAgent = process.env.AGENTBUS_AGENT && String(process.env.AGENTBUS_AGENT).trim();
+      if (envAgent && agent !== envAgent) {
+        throw Object.assign(new Error(`worker 角色无权冒用其他 agent 身份 ${agent} (expected=${envAgent})`), { code: 2 });
+      }
+      const allowedByParticipant =
+        agent === row.from_agent ||
+        agent === row.to_agent ||
+        (row.to_agent === '*' && row.claimed_by === agent);
+      if (!allowedByParticipant) {
+        throw Object.assign(new Error(`worker 角色无权以 ${agent} 身份恢复无关任务 ${row.id}`), { code: 2 });
+      }
+      if (row.state === 'claimed' && row.claimed_by && row.claimed_by !== agent && agent !== row.from_agent) {
+        throw Object.assign(new Error(`worker 角色无权恢复由 ${row.claimed_by} 持有的任务 ${row.id}`), { code: 2 });
+      }
+    }
+
+    if (row.state !== 'open' && row.state !== 'claimed') {
+      throw Object.assign(new Error(`任务当前状态为 ${row.state}，不能执行 recover ${act}`), { code: 2 });
+    }
+
+    const history = JSON.parse(row.history_json || '[]');
+    const msgKind = act === 'fail' ? 'error' : 'note';
+    const baseMsg = `recovered_by=${agent} action=${act} reason=${reasonText || 'none'}`;
+    let msgBody = baseMsg;
+    let outcomeStatus = null;
+    let resPath = null;
+    let resultObj = null;
+    let drifted = [];
+    let allowDrift = false;
+
+    const assertUpdated = (info) => {
+      if (!info || info.changes !== 1) {
+        throw Object.assign(new Error(`任务 ${row.id} 状态已变更，无法重复执行 recover ${act}`), { code: 2 });
+      }
+    };
+
+    if (act === 'retry' || act === 'release') {
+      const nextAttempt = act === 'retry' ? Number(row.attempt || 0) + 1 : Number(row.attempt || 0);
+      history.push({
+        at: now,
+        state: 'open',
+        by: agent,
+        action: act,
+        ...(reasonText ? { reason: reasonText } : {}),
+      });
+      assertUpdated(bus.db.prepare(
+        `UPDATE tasks
+         SET state = 'open', claimed_by = NULL, lease_token = NULL, lease_expires_at = NULL,
+             blocked_at = NULL, finished_at = NULL, last_message_at = ?, attempt = ?, history_json = ?
+         WHERE id = ? AND state IN ('open', 'claimed')`
+      ).run(now, nextAttempt, JSON.stringify(history), row.id));
+      appendEvent(bus.db, row.id, `recover_${act}`, {
+        action: act,
+        by: agent,
+        recovered_by: agent,
+        reason: reasonText,
+        previous_state: row.state,
+        previous_claimed_by: row.claimed_by,
+        attempt: nextAttempt,
+      });
+    } else if (act === 'fail') {
+      outcomeStatus = 'failed';
+      history.push({
+        at: now,
+        state: 'failed',
+        by: agent,
+        action: 'fail',
+        ...(reasonText ? { reason: reasonText } : {}),
+      });
+      assertUpdated(bus.db.prepare(
+        `UPDATE tasks
+         SET state = 'failed', claimed_by = NULL, lease_token = NULL, lease_expires_at = NULL,
+             blocked_at = NULL, finished_at = ?, last_message_at = ?, history_json = ?
+         WHERE id = ? AND state IN ('open', 'claimed')`
+      ).run(now, now, JSON.stringify(history), row.id));
+      appendEvent(bus.db, row.id, 'recover_fail', {
+        action: 'fail',
+        by: agent,
+        recovered_by: agent,
+        reason: reasonText,
+        previous_state: row.state,
+        previous_claimed_by: row.claimed_by,
+      });
+      clearTaskThreadByName(bus.db, `task:${row.id}`);
+    } else if (act === 'reassign') {
+      const newTo = to.trim();
+      msgBody = `${baseMsg} to=${newTo}`;
+      history.push({
+        at: now,
+        state: 'open',
+        by: agent,
+        action: 'reassign',
+        to: newTo,
+        ...(reasonText ? { reason: reasonText } : {}),
+      });
+      assertUpdated(bus.db.prepare(
+        `UPDATE tasks
+         SET to_agent = ?, state = 'open', claimed_by = NULL, lease_token = NULL, lease_expires_at = NULL,
+             blocked_at = NULL, finished_at = NULL, last_message_at = ?, history_json = ?
+         WHERE id = ? AND state IN ('open', 'claimed')`
+      ).run(newTo, now, JSON.stringify(history), row.id));
+      appendEvent(bus.db, row.id, 'recover_reassign', {
+        action: 'reassign',
+        by: agent,
+        recovered_by: agent,
+        previous_to: row.to_agent,
+        to: newTo,
+        reason: reasonText,
+        previous_state: row.state,
+        previous_claimed_by: row.claimed_by,
+      });
+      clearTaskThreadByName(bus.db, `task:${row.id}`);
+    } else if (act === 'adopt') {
+      outcomeStatus = 'done';
+      const acceptance = JSON.parse(row.acceptance_json || '{}');
+      const taskAllowsDrift = acceptance.allow_ref_drift === true || acceptance.allow_ref_drift === 'true';
+      if (role === 'worker' && allow_ref_drift === true && !taskAllowsDrift) {
+        throw Object.assign(new Error('worker 角色无权绕过引用漂移校验 (allow_ref_drift)'), { code: 2 });
+      }
+      allowDrift = Boolean(allow_ref_drift) || taskAllowsDrift;
+
+      const resolved = resolveAndValidatePath(result_path, bus.config, { checkSize: true });
+      resPath = resolved.fsPath;
+      const resUri = resolved.uri;
+      const resStat = resolved.stat;
+
+      const refs = JSON.parse(row.refs_json || '[]');
+      for (const ref of refs) {
+        const v = verifyRefIntegrity(ref, bus.config);
+        if (!v.ok) drifted.push(`${ref.name}(${v.reason})`);
+      }
+      if (drifted.length > 0 && !allowDrift) {
+        throw Object.assign(new Error(`引用已漂移 (drift)，拒绝 adopt: ${drifted.join(', ')}`), { code: 1 });
+      }
+
+      runAcceptanceChecks(acceptance, resPath, resStat.size, fields);
+
+      const resultSha = sha256File(resPath);
+      resultObj = {
+        uri: resUri,
+        sha256: resultSha,
+        bytes: resStat.size,
+        by: agent,
+        at: now,
+      };
+      msgBody = `${baseMsg} result_uri=${resUri}${drifted.length > 0 ? ` allow_ref_drift=true drifted=${drifted.join(',')}` : ''}`;
+      history.push({
+        at: now,
+        state: 'done',
+        by: agent,
+        action: 'adopt',
+        ...(reasonText ? { reason: reasonText } : {}),
+      });
+      assertUpdated(bus.db.prepare(
+        `UPDATE tasks
+         SET state = 'done', finished_at = ?, result_json = ?, history_json = ?,
+             lease_token = NULL, lease_expires_at = NULL, blocked_at = NULL, last_message_at = ?
+         WHERE id = ? AND state IN ('open', 'claimed')`
+      ).run(now, JSON.stringify(resultObj), JSON.stringify(history), now, row.id));
+
+      if (drifted.length > 0 && allowDrift) {
+        appendEvent(bus.db, row.id, 'complete_with_ref_drift', {
+          by: agent,
+          via: 'recover_adopt',
+          attempt: Number(row.attempt || 0),
+          drifted,
+        });
+      }
+      appendEvent(bus.db, row.id, 'recover_adopt', {
+        action: 'adopt',
+        by: agent,
+        recovered_by: agent,
+        reason: reasonText,
+        allow_ref_drift: allowDrift,
+        drifted,
+        previous_state: row.state,
+        result_sha256: resultSha,
+        result_bytes: resStat.size,
+      });
+      clearTaskThreadByName(bus.db, `task:${row.id}`);
+    }
+
+    const msgInfo = bus.db.prepare(
+      'INSERT INTO task_messages (task_id, from_agent, to_agent, kind, body, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(row.id, agent, null, msgKind, msgBody.slice(0, 16000), now);
+    const msgSeq = Number(msgInfo.lastInsertRowid);
+    appendEvent(bus.db, row.id, 'message', {
+      seq: msgSeq,
+      from: agent,
+      to: null,
+      kind: msgKind,
+      body: msgBody.slice(0, 240),
+    });
+
+    const updated = bus.db.prepare('SELECT * FROM tasks WHERE id = ?').get(row.id);
+    writeEnvelopeMirror(bus, updated);
+
+    const out = {
+      ok: true,
+      id: row.id,
+      action: act,
+      previous_state: row.state,
+      state: updated.state,
+      to: updated.to_agent,
+      attempt: updated.attempt,
+      blocked: Boolean(updated.blocked_at),
+      blocked_at: updated.blocked_at || null,
+      recovered_by: agent,
+      reason: reasonText,
+      message_seq: msgSeq,
+    };
+    if (act === 'adopt' && resultObj) {
+      out.result_sha256 = resultObj.sha256;
+      out.result_bytes = resultObj.bytes;
+      out.result = resultObj;
+      if (drifted.length > 0 && allowDrift) {
+        out.warnings = ['adopted_with_ref_drift'];
+        out.drifted_refs = drifted;
+      }
+    }
+
+    return {
+      out,
+      outcomeStatus,
+      threadName: updated?.thread_name || null,
+      updatedEnvelope: rowToEnvelope(updated),
+      resPath,
+      resultObj,
+    };
+  });
+
+  if (txOut.outcomeStatus && txOut.threadName && !contextLedgerDisabled()) {
+    try {
+      recordContextOutcome(bus, txOut.threadName, {
+        task: txOut.updatedEnvelope,
+        status: txOut.outcomeStatus,
+        ...(txOut.outcomeStatus === 'done'
+          ? { result: txOut.resultObj, resultPath: txOut.resPath }
+          : { reason: reasonText || 'recover_fail' }),
+        actor: agent,
+      });
+    } catch {}
+  }
+
+  return txOut.out;
 }
 
 export function failTask(bus, { id, by, lease_token, reason }) {

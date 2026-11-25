@@ -532,6 +532,7 @@ async function main() {
       'bus_ref_read',
       'bus_task_complete',
       'bus_task_fail',
+      'bus_task_recover',
       'bus_task_list',
       'bus_verify',
       'bus_task_dispatch',
@@ -541,10 +542,10 @@ async function main() {
       'bus_task_inbox',
     ];
     const actualToolNames = toolsResp.map((t) => t.name);
-    const exactAll = toolsResp.length === 14 &&
+    const exactAll = toolsResp.length === 15 &&
       expectedTools.every((n) => actualToolNames.includes(n)) &&
       toolsResp.every((t) => t.inputSchema && t.inputSchema.type === 'object');
-    assertCase(29, 'MCP tools/list 恰好 14 个工具，名字完整且均有 inputSchema',
+    assertCase(29, 'MCP tools/list 恰好 15 个工具，名字完整且均有 inputSchema',
       exactAll,
       `count=${toolsResp.length} names=[${actualToolNames.join(',')}]`);
 
@@ -618,7 +619,7 @@ async function main() {
       doneFlatBad.rc !== 0 && doneFlatGood.rc === 0 && doneFlatGood.json?.state === 'done',
       `badRc=${doneFlatBad.rc} goodRc=${doneFlatGood.rc} state=${doneFlatGood.json?.state}`);
 
-    // 34. worker 角色：只看到 8 个工具（含 message/inbox），create/dispatch 被拒
+    // 34. worker 角色：只看到 9 个工具（含 recover/message/inbox），create/dispatch 被拒
     const workerSession = await runMcpSession(ROOT_MAIN, ALLOWED_MAIN, [
       { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'accept-worker', version: '1.0' } } },
       { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
@@ -628,8 +629,9 @@ async function main() {
     const workerTools = workerSession.responses.find((r) => r.id === 2)?.result?.tools || [];
     const blockedCall = workerSession.responses.find((r) => r.id === 3)?.result;
     const blockedDispatch = workerSession.responses.find((r) => r.id === 4)?.result;
-    assertCase(34, 'worker 角色恰好看到 8 个工具（含 message/inbox），且 bus_task_create/dispatch 被拒',
-      workerTools.length === 8 &&
+    assertCase(34, 'worker 角色恰好看到 9 个工具（含 recover/message/inbox），且 bus_task_create/dispatch 被拒',
+      workerTools.length === 9 &&
+      workerTools.some((t) => t.name === 'bus_task_recover') &&
       workerTools.some((t) => t.name === 'bus_task_message') &&
       workerTools.some((t) => t.name === 'bus_task_inbox') &&
       !workerTools.some((t) => t.name === 'bus_task_create') &&
@@ -643,8 +645,8 @@ async function main() {
       { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
     ], { AGENTBUS_ROLE: 'boss' });
     const unknownTools = unknownRoleSession.responses.find((r) => r.id === 2)?.result?.tools || [];
-    assertCase(67, '未知 AGENTBUS_ROLE 按 worker 最小权限处理（8 工具，不泄漏 dispatch/create）',
-      unknownTools.length === 8 && !unknownTools.some((t) => t.name === 'bus_task_dispatch') && !unknownTools.some((t) => t.name === 'bus_task_create'),
+    assertCase(67, '未知 AGENTBUS_ROLE 按 worker 最小权限处理（9 工具，不泄漏 dispatch/create）',
+      unknownTools.length === 9 && !unknownTools.some((t) => t.name === 'bus_task_dispatch') && !unknownTools.some((t) => t.name === 'bus_task_create'),
       `count=${unknownTools.length} names=[${unknownTools.map((t) => t.name).join(',')}]`);
 
     // 35. bus_task_wait 必须返回真实结果（异步处理器没 await 时这里会是空对象）
@@ -2451,6 +2453,1092 @@ async function main() {
     } finally {
       guardCdpServer.close();
     }
+
+    // 84-93. Reliability & Recovery suite
+    const relRoot = path.join(RUN_BASE, 'rel_bus');
+    const relWork = path.join(RUN_BASE, 'rel_work');
+    fs.mkdirSync(relRoot, { recursive: true });
+    fs.mkdirSync(relWork, { recursive: true });
+    const relAllowed = [relRoot, relWork, DEMO_REFS].join(path.delimiter);
+    runCli(['init'], { root: relRoot, allowed: relAllowed });
+
+    // 84. recover retry & release
+    const t84Id = runCli(['new', '--to', 'antigravity', '--from', 'hermes', '--goal', 'recover-retry-test'], { root: relRoot, allowed: relAllowed }).json?.id;
+    const c84 = runCli(['claim', t84Id, '--by', 'antigravity'], { root: relRoot, allowed: relAllowed }).json;
+    runCli(['message', t84Id, '--by', 'antigravity', '--kind', 'blocked', '--body', 'stuck on step 1', '--lease', c84.lease_token], { root: relRoot, allowed: relAllowed });
+    const retry84 = runCli(['recover', t84Id, '--by', 'hermes', '--action', 'retry', '--reason', 'clear stuck lease'], { root: relRoot, allowed: relAllowed });
+    const showAfterRetry84 = runCli(['show', t84Id], { root: relRoot, allowed: relAllowed }).json;
+    const inboxAfterRetry84 = runCli(['inbox', t84Id], { root: relRoot, allowed: relAllowed }).json;
+    const reclaim84 = runCli(['claim', t84Id, '--by', 'antigravity'], { root: relRoot, allowed: relAllowed });
+    const release84 = runCli(['recover', t84Id, '--by', 'hermes', '--action', 'release', '--reason', 'park for later'], { root: relRoot, allowed: relAllowed });
+    const relDb84 = new DatabaseSync(path.join(relRoot, 'agentbus.db'));
+    const evtRetry84 = relDb84.prepare("SELECT COUNT(*) AS c FROM events WHERE task_id = ? AND event = 'recover_retry'").get(t84Id)?.c ?? 0;
+    relDb84.close();
+    assertCase(84, 'recover retry/release: claimed+blocked 回 open、清 blocked_at、retry 加 attempt 且 release 不加、可重新 claim',
+      retry84.rc === 0 &&
+      retry84.json?.state === 'open' &&
+      retry84.json?.attempt === 1 &&
+      showAfterRetry84?.state === 'open' &&
+      showAfterRetry84?.blocked === false &&
+      showAfterRetry84?.blocked_at === null &&
+      showAfterRetry84?.to === 'antigravity' &&
+      (inboxAfterRetry84?.messages || []).some((m) => m.body.includes('recovered_by=hermes') && m.body.includes('action=retry') && m.body.includes('clear stuck lease')) &&
+      evtRetry84 >= 1 &&
+      reclaim84.rc === 0 &&
+      reclaim84.json?.state === 'claimed' &&
+      release84.rc === 0 &&
+      release84.json?.state === 'open' &&
+      release84.json?.attempt === 1,
+      `retry=${JSON.stringify(retry84.json)} show=${showAfterRetry84?.state}/${showAfterRetry84?.blocked_at} reclaim=${reclaim84.rc} release=${JSON.stringify(release84.json)}`);
+
+    // 85. recover fail
+    const t85Id = runCli(['new', '--to', 'antigravity', '--from', 'hermes', '--goal', 'recover-fail-test'], { root: relRoot, allowed: relAllowed }).json?.id;
+    runCli(['claim', t85Id, '--by', 'antigravity'], { root: relRoot, allowed: relAllowed });
+    const fail85 = runCli(['recover', t85Id, '--by', 'hermes', '--action', 'fail', '--reason', 'manual abort'], { root: relRoot, allowed: relAllowed });
+    const show85 = runCli(['show', t85Id], { root: relRoot, allowed: relAllowed }).json;
+    const inbox85 = runCli(['inbox', t85Id], { root: relRoot, allowed: relAllowed }).json;
+    assertCase(85, 'recover fail: 无需 lease 直接置 failed、清 blocked_at、写 kind=error 消息',
+      fail85.rc === 0 &&
+      fail85.json?.state === 'failed' &&
+      show85?.state === 'failed' &&
+      Boolean(show85?.finished_at) &&
+      show85?.blocked_at === null &&
+      (inbox85?.messages || []).some((m) => m.kind === 'error' && m.body.includes('action=fail') && m.body.includes('manual abort')),
+      `fail=${JSON.stringify(fail85.json)} show=${show85?.state}/${show85?.finished_at}`);
+
+    // 86. recover reassign
+    const t86Id = runCli(['new', '--to', 'antigravity', '--from', 'hermes', '--goal', 'recover-reassign-test'], { root: relRoot, allowed: relAllowed }).json?.id;
+    runCli(['claim', t86Id, '--by', 'antigravity'], { root: relRoot, allowed: relAllowed });
+    const reas86 = runCli(['recover', t86Id, '--by', 'hermes', '--action', 'reassign', '--to', 'codex', '--reason', 'hand over'], { root: relRoot, allowed: relAllowed });
+    const oldClaim86 = runCli(['claim', t86Id, '--by', 'antigravity'], { root: relRoot, allowed: relAllowed });
+    const newClaim86 = runCli(['claim', t86Id, '--by', 'codex'], { root: relRoot, allowed: relAllowed });
+    assertCase(86, 'recover reassign: 修改 to_agent 为新 agent、原 agent claim 遭拒(rc=2)、新 agent 可 claim',
+      reas86.rc === 0 &&
+      reas86.json?.state === 'open' &&
+      reas86.json?.to === 'codex' &&
+      oldClaim86.rc === 2 &&
+      newClaim86.rc === 0 &&
+      newClaim86.json?.claimed_by === 'codex',
+      `reas=${JSON.stringify(reas86.json)} oldRc=${oldClaim86.rc} newRc=${newClaim86.rc}`);
+
+    // 87. recover adopt
+    const ref87File = path.join(relWork, 'ref87.txt');
+    fs.writeFileSync(ref87File, 'initial-ref-87', 'utf8');
+    const put87 = runCli(['put', ref87File, '--by', 'hermes'], { root: relRoot, allowed: relAllowed }).json;
+    const t87Id = runCli(['new', '--to', 'antigravity', '--from', 'hermes', '--goal', 'recover-adopt-test', '--ref', put87.sha256, '--accept', 'json=true', '--accept', 'status=ok'], { root: relRoot, allowed: relAllowed }).json?.id;
+    const c87 = runCli(['claim', t87Id, '--by', 'antigravity'], { root: relRoot, allowed: relAllowed }).json;
+    runCli(['message', t87Id, '--by', 'antigravity', '--kind', 'blocked', '--body', 'finished but ref drifted', '--lease', c87.lease_token], { root: relRoot, allowed: relAllowed });
+    // Release back to open (while keeping blocked_at manually set in DB to simulate open+blocked)
+    const relDb87 = new DatabaseSync(path.join(relRoot, 'agentbus.db'));
+    relDb87.prepare("UPDATE tasks SET state = 'open', claimed_by = NULL, lease_token = NULL, lease_expires_at = NULL WHERE id = ?").run(t87Id);
+    relDb87.close();
+    // Mutate ref to simulate drift
+    fs.writeFileSync(ref87File, 'modified-ref-87', 'utf8');
+    const adoptMissing87 = runCli(['recover', t87Id, '--by', 'hermes', '--action', 'adopt', '--result', path.join(relWork, 'nonexistent_87.json'), '--allow-drift'], { root: relRoot, allowed: relAllowed });
+    const badAcc87 = path.join(relWork, 'bad_acc_87.json');
+    fs.writeFileSync(badAcc87, JSON.stringify({ status: 'nope' }), 'utf8');
+    const adoptBadAcc87 = runCli(['recover', t87Id, '--by', 'hermes', '--action', 'adopt', '--result', badAcc87, '--allow-drift'], { root: relRoot, allowed: relAllowed });
+    const goodRes87 = path.join(relWork, 'good_res_87.json');
+    fs.writeFileSync(goodRes87, JSON.stringify({ status: 'ok' }), 'utf8');
+    const adoptStrictDrift87 = runCli(['recover', t87Id, '--by', 'hermes', '--action', 'adopt', '--result', goodRes87], { root: relRoot, allowed: relAllowed });
+    const adoptOk87 = runCli(['recover', t87Id, '--by', 'hermes', '--action', 'adopt', '--result', goodRes87, '--allow-drift', '--reason', 'accepted with drift'], { root: relRoot, allowed: relAllowed });
+    const relDb87b = new DatabaseSync(path.join(relRoot, 'agentbus.db'));
+    const evtAdopt87 = relDb87b.prepare("SELECT COUNT(*) AS c FROM events WHERE task_id = ? AND event = 'recover_adopt'").get(t87Id)?.c ?? 0;
+    relDb87b.close();
+    assertCase(87, 'recover adopt: open+blocked 凭合格结果文件转 done、不存在路径/不满足验收/默认drift均拒绝、--allow-drift 放行并记 recover_adopt',
+      adoptMissing87.rc === 1 &&
+      adoptBadAcc87.rc === 1 &&
+      adoptStrictDrift87.rc === 1 &&
+      adoptOk87.rc === 0 &&
+      adoptOk87.json?.state === 'done' &&
+      adoptOk87.json?.blocked === false &&
+      evtAdopt87 >= 1,
+      `miss=${adoptMissing87.rc} acc=${adoptBadAcc87.rc} strict=${adoptStrictDrift87.rc} ok=${JSON.stringify(adoptOk87.json)} evt=${evtAdopt87}`);
+
+    // 88. lease 过期自动回收后 blocked_at 为空，并出现 lease_expired error 消息
+    const t88Id = runCli(['new', '--to', 'codex', '--from', 'hermes', '--goal', 'reap-clears-blocked'], { root: relRoot, allowed: relAllowed }).json?.id;
+    const c88 = runCli(['claim', t88Id, '--by', 'codex', '--ttl', '1'], { root: relRoot, allowed: relAllowed }).json;
+    runCli(['message', t88Id, '--by', 'codex', '--kind', 'blocked', '--body', 'before expiry', '--lease', c88.lease_token], { root: relRoot, allowed: relAllowed });
+    await sleep(1400);
+    const show88 = runCli(['show', t88Id], { root: relRoot, allowed: relAllowed }).json;
+    const inbox88 = runCli(['inbox', t88Id], { root: relRoot, allowed: relAllowed }).json;
+    assertCase(88, 'lease 过期自动回收后 blocked_at 为空，并出现 lease_expired kind=error 消息',
+      show88?.state === 'open' &&
+      show88?.attempt === 1 &&
+      show88?.blocked === false &&
+      show88?.blocked_at === null &&
+      (inbox88?.messages || []).some((m) => m.kind === 'error' && m.body.includes('lease_expired') && m.body.includes('codex')),
+      `show=${JSON.stringify(show88)} msgs=${JSON.stringify(inbox88?.messages)}`);
+
+    // 89. waitForTask 在租约过期回到 open 时立即返回 stalled=true；buildPrompt 含第 0 步且 claim 含 heartbeat_hint
+    const t89Id = runCli(['new', '--to', 'codex', '--from', 'hermes', '--goal', 'wait-stalled-test'], { root: relRoot, allowed: relAllowed }).json?.id;
+    const c89 = runCli(['claim', t89Id, '--by', 'codex', '--ttl', '1'], { root: relRoot, allowed: relAllowed }).json;
+    const prompt89 = buildPrompt(t89Id, 'codex', relWork);
+    const waitBus89 = openBus({ rootOverride: relRoot });
+    let waitRes89;
+    const waitStart89 = Date.now();
+    try {
+      waitRes89 = await waitForTask(waitBus89, t89Id, 15, 100);
+    } finally {
+      waitBus89.close();
+    }
+    const waitElapsed89 = Date.now() - waitStart89;
+    assertCase(89, 'waitForTask 在租约过期回到 open 时立即返回 stalled=true；buildPrompt 含 heartbeat 第 0 步且 claim 含 heartbeat_hint',
+      waitElapsed89 < 6000 &&
+      waitRes89?.needs_attention === true &&
+      waitRes89?.stalled === true &&
+      waitRes89?.reason === 'lease_expired' &&
+      Boolean(waitRes89?.recover_hint) &&
+      prompt89.includes('bus_task_heartbeat') &&
+      Boolean(c89?.heartbeat_hint),
+      `elapsed=${waitElapsed89}ms wait=${JSON.stringify(waitRes89)} hbHint=${c89?.heartbeat_hint}`);
+
+    // 90. completeTask drift/acceptance 失败写 kind=error 消息与 blocked_at；allow_ref_drift=true 时允许并带 warning
+    const ref90File = path.join(relWork, 'ref90.txt');
+    fs.writeFileSync(ref90File, 'v1', 'utf8');
+    const put90 = runCli(['put', ref90File, '--by', 'hermes'], { root: relRoot, allowed: relAllowed }).json;
+    const t90StrictId = runCli(['new', '--to', 'codex', '--from', 'hermes', '--goal', 'complete-error-trace', '--ref', put90.sha256], { root: relRoot, allowed: relAllowed }).json?.id;
+    const c90Strict = runCli(['claim', t90StrictId, '--by', 'codex'], { root: relRoot, allowed: relAllowed }).json;
+    const res90 = path.join(relWork, 'res90.json');
+    fs.writeFileSync(res90, JSON.stringify({ ok: true }), 'utf8');
+    fs.writeFileSync(ref90File, 'v2-drifted', 'utf8');
+    const doneFail90 = runCli(['done', t90StrictId, '--by', 'codex', '--lease', c90Strict.lease_token, '--result', res90], { root: relRoot, allowed: relAllowed });
+    const showFail90 = runCli(['show', t90StrictId], { root: relRoot, allowed: relAllowed }).json;
+    const inboxFail90 = runCli(['inbox', t90StrictId], { root: relRoot, allowed: relAllowed }).json;
+
+    const t90AllowId = runCli(['new', '--to', 'codex', '--from', 'hermes', '--goal', 'allow-drift-ok', '--ref', put90.sha256, '--accept', 'allow_ref_drift=true', '--accept', 'json=true'], { root: relRoot, allowed: relAllowed }).json?.id;
+    const c90Allow = runCli(['claim', t90AllowId, '--by', 'codex'], { root: relRoot, allowed: relAllowed }).json;
+    const doneAllow90 = runCli(['done', t90AllowId, '--by', 'codex', '--lease', c90Allow.lease_token, '--result', res90], { root: relRoot, allowed: relAllowed });
+    const relDb90 = new DatabaseSync(path.join(relRoot, 'agentbus.db'));
+    const evtDrift90 = relDb90.prepare("SELECT COUNT(*) AS c FROM events WHERE task_id = ? AND event = 'complete_with_ref_drift'").get(t90AllowId)?.c ?? 0;
+    relDb90.close();
+    assertCase(90, 'completeTask drift 默认拒绝并写 error 消息与 blocked_at；allow_ref_drift=true 时放行并带 warning 与事件',
+      doneFail90.rc === 1 &&
+      showFail90?.state === 'claimed' &&
+      showFail90?.blocked === true &&
+      (inboxFail90?.messages || []).some((m) => m.kind === 'error' && /drift|漂移/.test(m.body)) &&
+      doneAllow90.rc === 0 &&
+      doneAllow90.json?.state === 'done' &&
+      Array.isArray(doneAllow90.json?.warnings) &&
+      doneAllow90.json.warnings.includes('completed_with_ref_drift') &&
+      evtDrift90 >= 1,
+      `failRc=${doneFail90.rc} blk=${showFail90?.blocked} allow=${JSON.stringify(doneAllow90.json)} evt=${evtDrift90}`);
+
+    // 91. MCP worker 角色包含 bus_task_recover，不能 recover 无关任务，可 recover 自己参与的任务
+    const t91OtherId = runCli(['new', '--to', 'codex', '--from', 'hermes', '--goal', 'worker-recover-auth-other'], { root: relRoot, allowed: relAllowed }).json?.id;
+    const t91MineId = runCli(['new', '--to', 'antigravity', '--from', 'hermes', '--goal', 'worker-recover-auth-mine'], { root: relRoot, allowed: relAllowed }).json?.id;
+    runCli(['claim', t91MineId, '--by', 'antigravity'], { root: relRoot, allowed: relAllowed });
+    const workerRec91 = await runMcpSession(relRoot, relAllowed, [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'w91', version: '1.0' } } },
+      { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
+      { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'bus_task_recover', arguments: { id: t91OtherId, by: 'antigravity', action: 'fail', reason: 'cross-agent' } } },
+      { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'bus_task_recover', arguments: { id: t91MineId, by: 'antigravity', action: 'retry', reason: 'self-retry' } } },
+    ], { AGENTBUS_ROLE: 'worker' });
+    const wTools91 = workerRec91.responses.find((r) => r.id === 2)?.result?.tools || [];
+    const wOther91 = workerRec91.responses.find((r) => r.id === 3)?.result;
+    const wMine91 = workerRec91.responses.find((r) => r.id === 4)?.result;
+    assertCase(91, 'worker MCP tools/list 包含 bus_task_recover（9 工具），禁止 recover 无关任务，允许 recover 自身任务',
+      wTools91.length === 9 &&
+      wTools91.some((t) => t.name === 'bus_task_recover') &&
+      wOther91?.isError === true &&
+      wMine91?.isError !== true &&
+      wMine91?.structuredContent?.state === 'open',
+      `count=${wTools91.length} otherErr=${wOther91?.isError} mine=${JSON.stringify(wMine91?.structuredContent)}`);
+
+    const isolatedNoBinEnv = {
+      PATH: '',
+      Path: '',
+      SCOOP: '',
+      SCOOP_GLOBAL: '',
+      VOLTA_HOME: '',
+      NVM_HOME: '',
+      NVM_SYMLINK: '',
+      NVM_DIR: '',
+      npm_config_prefix: '',
+      AGENTBUS_CODEX_BIN: '',
+      AGENTBUS_CLAUDE_BIN: '',
+      AGENTBUS_GEMINI_BIN: '',
+      AGENTBUS_ANTIGRAVITY_BIN: '',
+      AGENTBUS_OPENCODE_BIN: '',
+      AGENTBUS_HERMES_BIN: '',
+      AGENTBUS_DSH_BIN: '',
+    };
+    const makeFakeBin = (dir, name) => {
+      fs.mkdirSync(dir, { recursive: true });
+      const file = path.join(dir, process.platform === 'win32' ? `${name}.cmd` : name);
+      if (process.platform === 'win32') {
+        fs.writeFileSync(file, '@echo off\r\nexit /b 0\r\n', 'utf8');
+      } else {
+        fs.writeFileSync(file, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      }
+      return file;
+    };
+
+    // 92. doctor --fix 恢复被删掉的 codex 与 antigravity 条目，保留已有其他配置与多行 TOML 数组，第二次 changed=false
+    const fixHome92 = path.join(RUN_BASE, 'fix_home_92');
+    const fixRoot92 = path.join(RUN_BASE, 'fix_root_92');
+    const fixAllow92 = path.join(RUN_BASE, 'fix_allow_92');
+    fs.mkdirSync(path.join(fixHome92, '.codex'), { recursive: true });
+    fs.mkdirSync(path.join(fixHome92, '.gemini', 'config'), { recursive: true });
+    fs.mkdirSync(fixAllow92, { recursive: true });
+    const codexCfg92 = path.join(fixHome92, '.codex', 'config.toml');
+    const agyCfg92 = path.join(fixHome92, '.gemini', 'config', 'mcp_config.json');
+    fs.writeFileSync(
+      codexCfg92,
+      '# user comment\nmodel = "gpt-5"\n\n[mcp_servers.other_tool]\ncommand = "echo"\nargs = [\n  "--flag",\n  "val",\n]\n',
+      'utf8',
+    );
+    fs.writeFileSync(agyCfg92, JSON.stringify({ mcpServers: { keep_me: { command: 'node', args: ['x.js'] } } }, null, 2) + '\n', 'utf8');
+    const fakeCodex92 = makeFakeBin(path.join(RUN_BASE, 'bins92'), 'codex');
+    const fakeAgy92 = makeFakeBin(path.join(RUN_BASE, 'bins92'), 'agentapi');
+    const fixEnv92 = {
+      ...isolatedNoBinEnv,
+      AGENTBUS_CODEX_BIN: fakeCodex92,
+      AGENTBUS_ANTIGRAVITY_BIN: fakeAgy92,
+    };
+
+    const fixRun1_92 = runCli(['doctor', '--fix', '--home', fixHome92, '--allow', fixAllow92, '--json'], { root: fixRoot92, allowed: fixAllow92, envExtra: fixEnv92 });
+    const fixRun2_92 = runCli(['doctor', '--fix', '--home', fixHome92, '--allow', fixAllow92, '--json'], { root: fixRoot92, allowed: fixAllow92, envExtra: fixEnv92 });
+    const codexAfter92 = fs.readFileSync(codexCfg92, 'utf8');
+    const agyAfter92 = JSON.parse(fs.readFileSync(agyCfg92, 'utf8'));
+    const noUninstalledDirs92 = ['.dsh', '.hermes', '.codeium', '.kiro', '.lmstudio', '.cline'].every((d) => !fs.existsSync(path.join(fixHome92, d)));
+    assertCase(92, 'doctor --fix 在临时 home 恢复被删的 codex(TOML 含多行数组) 与 antigravity(JSON) 条目，保留原有配置，第二次 changed=false 且不建未安装目录',
+      fixRun1_92.rc === 0 &&
+      fixRun1_92.json?.changed === true &&
+      (fixRun1_92.json?.repaired || []).some((r) => r.client === 'codex' && r.config === codexCfg92 && r.backup && fs.existsSync(r.backup)) &&
+      (fixRun1_92.json?.repaired || []).some((r) => r.client === 'antigravity' && r.config === agyCfg92 && r.backup && fs.existsSync(r.backup)) &&
+      codexAfter92.includes('# user comment') &&
+      codexAfter92.includes('[mcp_servers.other_tool]') &&
+      codexAfter92.includes('"--flag"') &&
+      codexAfter92.includes('[mcp_servers.agentbus]') &&
+      Boolean(agyAfter92?.mcpServers?.keep_me) &&
+      Boolean(agyAfter92?.mcpServers?.agentbus) &&
+      fixRun2_92.rc === 0 &&
+      fixRun2_92.json?.changed === false &&
+      (fixRun2_92.json?.repaired || []).length === 0 &&
+      noUninstalledDirs92,
+      `r1=${JSON.stringify(fixRun1_92.json)} r2Changed=${fixRun2_92.json?.changed} noExtra=${noUninstalledDirs92}`);
+
+    // 93. doctor --fix 对损坏 JSON/TOML 不覆盖并报告 manual/skipped；DSH 与 Hermes 幂等恢复
+    const fixHome93 = path.join(RUN_BASE, 'fix_home_93');
+    const fixRoot93 = path.join(RUN_BASE, 'fix_root_93');
+    const fixAllow93 = path.join(RUN_BASE, 'fix_allow_93');
+    fs.mkdirSync(path.join(fixHome93, '.gemini'), { recursive: true });
+    fs.mkdirSync(path.join(fixHome93, '.codex'), { recursive: true });
+    fs.mkdirSync(path.join(fixHome93, '.dsh', 'profiles', 'desktop'), { recursive: true });
+    const hermesCfgDir93 = process.platform === 'win32'
+      ? path.join(fixHome93, 'AppData', 'Local', 'hermes')
+      : path.join(fixHome93, '.hermes');
+    fs.mkdirSync(hermesCfgDir93, { recursive: true });
+    fs.mkdirSync(fixAllow93, { recursive: true });
+
+    const brokenJson93 = '{ "mcpServers": { broken';
+    const brokenToml93 = '[unclosed_section\nfoo = "bar"\n';
+    const geminiCfg93 = path.join(fixHome93, '.gemini', 'settings.json');
+    const codexCfg93 = path.join(fixHome93, '.codex', 'config.toml');
+    const dshCfg93 = path.join(fixHome93, '.dsh', 'profiles', 'desktop', 'cordis.patch.yml');
+    const hermesCfg93 = path.join(hermesCfgDir93, 'config.yaml');
+    fs.writeFileSync(geminiCfg93, brokenJson93, 'utf8');
+    fs.writeFileSync(codexCfg93, brokenToml93, 'utf8');
+    fs.writeFileSync(dshCfg93, '- insert:\n    - id: other-plugin\n      name: other\n', 'utf8');
+    fs.writeFileSync(hermesCfg93, 'mcp_servers:\n  other_srv:\n    command: echo\n', 'utf8');
+
+    const fakeCodex93 = makeFakeBin(path.join(RUN_BASE, 'bins93'), 'codex');
+    const fakeHermesJs93 = path.join(RUN_BASE, 'fake_hermes_93.mjs');
+    fs.writeFileSync(fakeHermesJs93, [
+      "import fs from 'node:fs';",
+      "const argv = process.argv.slice(2);",
+      "const cfg = process.env.TARGET_HERMES_CFG_93;",
+      "if (argv[0] === 'mcp' && argv[1] === 'add') {",
+      "  const prev = fs.existsSync(cfg) ? fs.readFileSync(cfg, 'utf8') : '';",
+      "  if (!/\\bagentbus\\s*:/.test(prev)) fs.writeFileSync(cfg, prev.trimEnd() + '\\n  agentbus:\\n    command: node\\n', 'utf8');",
+      "  process.exit(0);",
+      "}",
+      "if (argv[0] === 'mcp' && argv[1] === 'list') {",
+      "  const txt = fs.existsSync(cfg) ? fs.readFileSync(cfg, 'utf8') : '';",
+      "  console.log(/\\bagentbus\\s*:/.test(txt) ? 'agentbus (stdio)' : 'No MCP servers');",
+      "  process.exit(0);",
+      "}",
+      "process.exit(1);",
+    ].join('\n'), 'utf8');
+    const fakeHermesBin93 = path.join(RUN_BASE, process.platform === 'win32' ? 'hermes_93.cmd' : 'hermes_93');
+    if (process.platform === 'win32') {
+      fs.writeFileSync(fakeHermesBin93, `@echo off\r\n"${process.execPath}" "%~dp0fake_hermes_93.mjs" %*\r\n`, 'utf8');
+    } else {
+      fs.writeFileSync(fakeHermesBin93, `#!/bin/sh\nexec "${process.execPath}" "${fakeHermesJs93}" "$@"\n`, { mode: 0o755 });
+    }
+
+    const fixEnv93 = {
+      ...isolatedNoBinEnv,
+      AGENTBUS_CODEX_BIN: fakeCodex93,
+      AGENTBUS_HERMES_BIN: fakeHermesBin93,
+      TARGET_HERMES_CFG_93: hermesCfg93,
+    };
+    const fixRun1_93 = runCli(['doctor', '--fix', '--home', fixHome93, '--allow', fixAllow93, '--json'], { root: fixRoot93, allowed: fixAllow93, envExtra: fixEnv93 });
+    const fixRun2_93 = runCli(['doctor', '--fix', '--home', fixHome93, '--allow', fixAllow93, '--json'], { root: fixRoot93, allowed: fixAllow93, envExtra: fixEnv93 });
+    const dshAfter93 = fs.readFileSync(dshCfg93, 'utf8');
+    const hermesAfter93 = fs.readFileSync(hermesCfg93, 'utf8');
+    const codexManual93 = (fixRun1_93.json?.issues || []).find((i) => i.client === 'codex');
+    assertCase(93, 'doctor --fix 对损坏 TOML 先备份不覆盖并报 manual； Gemini 等未授权客户端不自动改写；DSH 与 Hermes 幂等恢复',
+      fs.readFileSync(geminiCfg93, 'utf8') === brokenJson93 &&
+      fs.readFileSync(codexCfg93, 'utf8') === brokenToml93 &&
+      (fixRun1_93.json?.skipped || []).some((s) => s.client === 'gemini' && s.result === 'out_of_scope') &&
+      codexManual93?.result === 'manual' &&
+      Boolean(codexManual93?.backup && fs.existsSync(codexManual93.backup)) &&
+      (fixRun1_93.json?.repaired || []).some((r) => r.client === 'dsh') &&
+      (fixRun1_93.json?.repaired || []).some((r) => r.client === 'hermes') &&
+      dshAfter93.includes('id: other-plugin') &&
+      dshAfter93.includes('id: agentbus-mcp') &&
+      hermesAfter93.includes('other_srv:') &&
+      hermesAfter93.includes('agentbus:') &&
+      fixRun2_93.json?.changed === false &&
+      !(fixRun2_93.json?.repaired || []).some((r) => r.client === 'dsh' || r.client === 'hermes'),
+      `r1=${JSON.stringify(fixRun1_93.json)} r2=${JSON.stringify(fixRun2_93.json)}`);
+
+    // 94. MCP bus_task_wait 返回 stalled/reason/recover_hint + setup --repair 别名 + MCP 只读自检拦截不可写 DB
+    const t94Id = runCli(['new', '--to', 'codex', '--from', 'hermes', '--goal', 'mcp-wait-stalled-94'], { root: relRoot, allowed: relAllowed }).json?.id;
+    runCli(['claim', t94Id, '--by', 'codex', '--ttl', '1'], { root: relRoot, allowed: relAllowed });
+    await sleep(1300);
+    const mcpWait94 = await runMcpSession(relRoot, relAllowed, [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'wait94', version: '1.0' } } },
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'bus_task_wait', arguments: { id: t94Id, timeout_s: 10 } } },
+    ]);
+    const waitPayload94 = mcpWait94.responses.find((r) => r.id === 2)?.result?.structuredContent;
+
+    const repairHome94 = path.join(RUN_BASE, 'repair_home_94');
+    const repairRoot94 = path.join(RUN_BASE, 'repair_root_94');
+    const repairAllow94 = path.join(RUN_BASE, 'repair_allow_94');
+    fs.mkdirSync(path.join(repairHome94, '.codex'), { recursive: true });
+    fs.mkdirSync(repairAllow94, { recursive: true });
+    const fakeCodex94 = makeFakeBin(path.join(RUN_BASE, 'bins94'), 'codex');
+    const repairAlias94 = runCli(['setup', '--repair', '--home', repairHome94, '--allow', repairAllow94], {
+      root: repairRoot94,
+      allowed: repairAllow94,
+      envExtra: { ...isolatedNoBinEnv, AGENTBUS_CODEX_BIN: fakeCodex94 },
+    });
+
+    const roRoot94 = path.join(RUN_BASE, 'ro_root_94');
+    runCli(['init'], { root: roRoot94, allowed: roRoot94 });
+    const roDb94 = path.join(roRoot94, 'agentbus.db');
+    let roMcpRes94 = null;
+    try {
+      fs.chmodSync(roDb94, 0o444);
+      roMcpRes94 = runCli(['mcp'], { root: roRoot94, allowed: roRoot94 });
+    } finally {
+      try { fs.chmodSync(roDb94, 0o666); } catch {}
+    }
+
+    assertCase(94, 'MCP bus_task_wait 同步 stalled/reason/recover_hint；setup --repair 等价可用；MCP 启动对不可写库报清晰错误',
+      waitPayload94?.stalled === true &&
+      waitPayload94?.needs_attention === true &&
+      waitPayload94?.reason === 'lease_expired' &&
+      Boolean(waitPayload94?.recover_hint) &&
+      repairAlias94.rc === 0 &&
+      repairAlias94.json?.changed === true &&
+      (repairAlias94.json?.repaired || []).some((r) => r.client === 'codex') &&
+      roMcpRes94?.rc === 1 &&
+      /不可写|readonly|permission/i.test(roMcpRes94?.stderr || ''),
+      `wait=${JSON.stringify(waitPayload94)} repair=${JSON.stringify(repairAlias94.json)} roMcp=${roMcpRes94?.rc}:${roMcpRes94?.stderr?.slice(0, 160)}`);
+
+    // 95. doctor --fix 安全边界：只有配置目录或配置残留且无二进制的客户端报 not_installed 且不创建/修改任何文件；非白名单客户端即使有二进制也不自动写入
+    const dirOnlyHome95 = path.join(RUN_BASE, 'dir_only_home_95');
+    const dirOnlyRoot95 = path.join(RUN_BASE, 'dir_only_root_95');
+    const dirOnlyAllow95 = path.join(RUN_BASE, 'dir_only_allow_95');
+    fs.mkdirSync(dirOnlyAllow95, { recursive: true });
+    // Empty config directories only (no binaries, no files)
+    for (const relDir of [
+      '.codex',
+      path.join('.gemini', 'config'),
+      path.join('.gemini', 'antigravity'),
+      path.join('.dsh', 'profiles', 'desktop'),
+      '.hermes',
+      path.join('AppData', 'Local', 'hermes'),
+      '.cursor',
+      path.join('.config', 'opencode'),
+      path.join('AppData', 'Roaming', 'Claude'),
+    ]) {
+      fs.mkdirSync(path.join(dirOnlyHome95, relDir), { recursive: true });
+    }
+    const dirOnlyRun95 = runCli(['doctor', '--fix', '--home', dirOnlyHome95, '--allow', dirOnlyAllow95, '--json'], {
+      root: dirOnlyRoot95,
+      allowed: dirOnlyAllow95,
+      envExtra: isolatedNoBinEnv,
+    });
+    const noFilesCreated95 = [
+      path.join(dirOnlyHome95, '.codex', 'config.toml'),
+      path.join(dirOnlyHome95, '.gemini', 'config', 'mcp_config.json'),
+      path.join(dirOnlyHome95, '.gemini', 'antigravity', 'mcp_config.json'),
+      path.join(dirOnlyHome95, '.gemini', 'settings.json'),
+      path.join(dirOnlyHome95, '.dsh', 'profiles', 'desktop', 'cordis.patch.yml'),
+      path.join(dirOnlyHome95, '.hermes', 'config.yaml'),
+      path.join(dirOnlyHome95, 'AppData', 'Local', 'hermes', 'config.yaml'),
+      path.join(dirOnlyHome95, '.cursor', 'mcp.json'),
+      path.join(dirOnlyHome95, '.config', 'opencode', 'opencode.json'),
+      path.join(dirOnlyHome95, 'AppData', 'Roaming', 'Claude', 'claude_desktop_config.json'),
+    ].every((f) => !fs.existsSync(f));
+    const fourNotInstalled95 = ['codex', 'antigravity', 'dsh', 'hermes'].every((id) =>
+      (dirOnlyRun95.json?.skipped || []).some((s) => s.client === id && s.result === 'not_installed')
+    );
+
+    // Leftover config files without binaries + non-whitelisted clients WITH binaries
+    const leftoverHome95 = path.join(RUN_BASE, 'leftover_home_95');
+    const leftoverRoot95 = path.join(RUN_BASE, 'leftover_root_95');
+    const leftoverAllow95 = path.join(RUN_BASE, 'leftover_allow_95');
+    fs.mkdirSync(leftoverAllow95, { recursive: true });
+    const loCodex95 = path.join(leftoverHome95, '.codex', 'config.toml');
+    const loAgy95 = path.join(leftoverHome95, '.gemini', 'config', 'mcp_config.json');
+    const loHermes95 = process.platform === 'win32'
+      ? path.join(leftoverHome95, 'AppData', 'Local', 'hermes', 'config.yaml')
+      : path.join(leftoverHome95, '.hermes', 'config.yaml');
+    const loGemini95 = path.join(leftoverHome95, '.gemini', 'settings.json');
+    const loCursor95 = path.join(leftoverHome95, '.cursor', 'mcp.json');
+    const loOpencode95 = path.join(leftoverHome95, '.config', 'opencode', 'opencode.json');
+    const loClaudeDesktop95 = process.platform === 'win32'
+      ? path.join(leftoverHome95, 'AppData', 'Roaming', 'Claude', 'claude_desktop_config.json')
+      : process.platform === 'darwin'
+        ? path.join(leftoverHome95, 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json')
+        : path.join(leftoverHome95, '.config', 'Claude', 'claude_desktop_config.json');
+    const loSeeds95 = [
+      [loCodex95, 'model = "leftover"\n'],
+      [loAgy95, '{"mcpServers":{}}\n'],
+      [loHermes95, 'mcp_servers: {}\n'],
+      [loGemini95, '{"mcpServers":{}}\n'],
+      [loCursor95, '{"mcpServers":{}}\n'],
+      [loOpencode95, '{"mcp":{}}\n'],
+      [loClaudeDesktop95, '{"mcpServers":{}}\n'],
+    ];
+    for (const [fp, content] of loSeeds95) {
+      fs.mkdirSync(path.dirname(fp), { recursive: true });
+      fs.writeFileSync(fp, content, 'utf8');
+    }
+    const fakeBins95 = path.join(RUN_BASE, 'bins95');
+    const loRun95 = runCli(['doctor', '--fix', '--home', leftoverHome95, '--allow', leftoverAllow95, '--json'], {
+      root: leftoverRoot95,
+      allowed: leftoverAllow95,
+      envExtra: {
+        ...isolatedNoBinEnv,
+        AGENTBUS_GEMINI_BIN: makeFakeBin(fakeBins95, 'gemini'),
+        AGENTBUS_CLAUDE_BIN: makeFakeBin(fakeBins95, 'claude'),
+        AGENTBUS_OPENCODE_BIN: makeFakeBin(fakeBins95, 'opencode'),
+      },
+    });
+    const loTargetedGemini95 = runCli(['doctor', '--fix', '--client', 'gemini', '--home', leftoverHome95, '--allow', leftoverAllow95, '--json'], {
+      root: leftoverRoot95,
+      allowed: leftoverAllow95,
+      envExtra: {
+        ...isolatedNoBinEnv,
+        AGENTBUS_GEMINI_BIN: makeFakeBin(fakeBins95, 'gemini'),
+      },
+    });
+    const loAllUntouched95 = loSeeds95.every(([fp, content]) => fs.readFileSync(fp, 'utf8') === content);
+    const loNoBackups95 = loSeeds95.every(([fp]) =>
+      !fs.readdirSync(path.dirname(fp)).some((n) => n.startsWith(`${path.basename(fp)}.bak-`))
+    );
+    const loOutOfScope95 = ['claude', 'gemini', 'cursor', 'opencode', 'claude-desktop'].every((id) =>
+      (loRun95.json?.skipped || []).some((s) => s.client === id && s.result === 'out_of_scope')
+    );
+    const loLeftoverNotInst95 = ['codex', 'antigravity', 'dsh', 'hermes'].every((id) =>
+      (loRun95.json?.skipped || []).some((s) => s.client === id && s.result === 'not_installed')
+    );
+
+    assertCase(95, 'doctor --fix 仅有配置目录/残留配置且无二进制报 not_installed 且不创建文件；非白名单客户端即使有二进制/指定 --client 也不写入',
+      dirOnlyRun95.rc === 0 &&
+      dirOnlyRun95.json?.changed === false &&
+      (dirOnlyRun95.json?.repaired || []).length === 0 &&
+      fourNotInstalled95 &&
+      noFilesCreated95 &&
+      loRun95.rc === 0 &&
+      loRun95.json?.changed === false &&
+      (loRun95.json?.repaired || []).length === 0 &&
+      loTargetedGemini95.json?.changed === false &&
+      (loTargetedGemini95.json?.skipped || []).some((s) => s.client === 'gemini' && s.result === 'out_of_scope') &&
+      loAllUntouched95 &&
+      loNoBackups95 &&
+      loOutOfScope95 &&
+      loLeftoverNotInst95,
+      `dirOnly=${JSON.stringify(dirOnlyRun95.json)} noFiles=${noFilesCreated95} loUntouched=${loAllUntouched95} loNoBak=${loNoBackups95} outScope=${loOutOfScope95}`);
+
+    // 96. 全量 4 白名单客户端在单次临时 home 恢复与幂等 + DSH/Hermes 损坏配置只备份报 manual + recoverTask 权限/终态防重防越权
+    const all4Home96 = path.join(RUN_BASE, 'all4_home_96');
+    const all4Root96 = path.join(RUN_BASE, 'all4_root_96');
+    const all4Allow96 = path.join(RUN_BASE, 'all4_allow_96');
+    fs.mkdirSync(all4Allow96, { recursive: true });
+    fs.mkdirSync(path.join(all4Home96, '.codex'), { recursive: true });
+    fs.mkdirSync(path.join(all4Home96, '.gemini', 'config'), { recursive: true });
+    fs.mkdirSync(path.join(all4Home96, '.dsh', 'profiles', 'desktop'), { recursive: true });
+    const hermesDir96 = process.platform === 'win32'
+      ? path.join(all4Home96, 'AppData', 'Local', 'hermes')
+      : path.join(all4Home96, '.hermes');
+    fs.mkdirSync(hermesDir96, { recursive: true });
+
+    const codexCfg96 = path.join(all4Home96, '.codex', 'config.toml');
+    const agyCfg96 = path.join(all4Home96, '.gemini', 'config', 'mcp_config.json');
+    const dshCfg96 = path.join(all4Home96, '.dsh', 'profiles', 'desktop', 'cordis.patch.yml');
+    const hermesCfg96 = path.join(hermesDir96, 'config.yaml');
+    fs.writeFileSync(codexCfg96, '# keep\nmodel = "gpt-5"\n', 'utf8');
+    fs.writeFileSync(agyCfg96, '{"mcpServers":{"other":{"command":"echo"}}}\n', 'utf8');
+    fs.writeFileSync(dshCfg96, '- insert:\n    - id: keep-96\n      name: keep\n', 'utf8');
+    fs.writeFileSync(hermesCfg96, 'mcp_servers:\n  keep_96:\n    command: echo\n', 'utf8');
+
+    const bins96 = path.join(RUN_BASE, 'bins96');
+    fs.mkdirSync(bins96, { recursive: true });
+    const fakeHermesJs96 = path.join(RUN_BASE, 'fake_hermes_96.mjs');
+    fs.writeFileSync(fakeHermesJs96, [
+      "import fs from 'node:fs';",
+      "const argv = process.argv.slice(2);",
+      "const cfg = process.env.TARGET_HERMES_CFG_96;",
+      "if (argv[0] === 'mcp' && argv[1] === 'add') {",
+      "  const prev = fs.existsSync(cfg) ? fs.readFileSync(cfg, 'utf8') : '';",
+      "  if (!/\\bagentbus\\s*:/.test(prev)) fs.writeFileSync(cfg, prev.trimEnd() + '\\n  agentbus:\\n    command: node\\n', 'utf8');",
+      "  process.exit(0);",
+      "}",
+      "if (argv[0] === 'mcp' && argv[1] === 'list') {",
+      "  const txt = fs.existsSync(cfg) ? fs.readFileSync(cfg, 'utf8') : '';",
+      "  console.log(/\\bagentbus\\s*:/.test(txt) ? 'agentbus (stdio)' : 'No MCP servers');",
+      "  process.exit(0);",
+      "}",
+      "process.exit(1);",
+    ].join('\n'), 'utf8');
+    const fakeHermesBin96 = path.join(bins96, process.platform === 'win32' ? 'hermes.cmd' : 'hermes');
+    if (process.platform === 'win32') {
+      fs.writeFileSync(fakeHermesBin96, `@echo off\r\n"${process.execPath}" "%~dp0..\\fake_hermes_96.mjs" %*\r\n`, 'utf8');
+    } else {
+      fs.writeFileSync(fakeHermesBin96, `#!/bin/sh\nexec "${process.execPath}" "${fakeHermesJs96}" "$@"\n`, { mode: 0o755 });
+    }
+    const env96 = {
+      ...isolatedNoBinEnv,
+      AGENTBUS_CODEX_BIN: makeFakeBin(bins96, 'codex'),
+      AGENTBUS_ANTIGRAVITY_BIN: makeFakeBin(bins96, 'agentapi'),
+      AGENTBUS_HERMES_BIN: fakeHermesBin96,
+      TARGET_HERMES_CFG_96: hermesCfg96,
+    };
+    const all4Run1_96 = runCli(['doctor', '--fix', '--home', all4Home96, '--allow', all4Allow96, '--json'], { root: all4Root96, allowed: all4Allow96, envExtra: env96 });
+    const all4Run2_96 = runCli(['doctor', '--fix', '--home', all4Home96, '--allow', all4Allow96, '--json'], { root: all4Root96, allowed: all4Allow96, envExtra: env96 });
+    const all4RepairedIds96 = new Set((all4Run1_96.json?.repaired || []).map((r) => r.client));
+    const all4BothOk96 = ['codex', 'antigravity', 'dsh', 'hermes'].every((id) => all4RepairedIds96.has(id));
+
+    // Corrupted DSH + Corrupted Hermes YAML backup & manual without overwrite
+    const badYamlHome96 = path.join(RUN_BASE, 'bad_yaml_home_96');
+    const badYamlRoot96 = path.join(RUN_BASE, 'bad_yaml_root_96');
+    const badYamlAllow96 = path.join(RUN_BASE, 'bad_yaml_allow_96');
+    fs.mkdirSync(badYamlAllow96, { recursive: true });
+    const badDshCfg96 = path.join(badYamlHome96, '.dsh', 'profiles', 'desktop', 'cordis.patch.yml');
+    const badHermesDir96 = process.platform === 'win32'
+      ? path.join(badYamlHome96, 'AppData', 'Local', 'hermes')
+      : path.join(badYamlHome96, '.hermes');
+    const badHermesCfg96 = path.join(badHermesDir96, 'config.yaml');
+    fs.mkdirSync(path.dirname(badDshCfg96), { recursive: true });
+    fs.mkdirSync(badHermesDir96, { recursive: true });
+    const badDshContent96 = 'not_a_list: true\n';
+    const badHermesContent96 = 'mcp_servers: "broken_scalar"\n';
+    fs.writeFileSync(badDshCfg96, badDshContent96, 'utf8');
+    fs.writeFileSync(badHermesCfg96, badHermesContent96, 'utf8');
+    const badYamlRun96 = runCli(['doctor', '--fix', '--home', badYamlHome96, '--allow', badYamlAllow96, '--json'], {
+      root: badYamlRoot96,
+      allowed: badYamlAllow96,
+      envExtra: { ...isolatedNoBinEnv, AGENTBUS_HERMES_BIN: fakeHermesBin96 },
+    });
+    const dshManual96 = (badYamlRun96.json?.issues || []).find((i) => i.client === 'dsh');
+    const hermesManual96 = (badYamlRun96.json?.issues || []).find((i) => i.client === 'hermes');
+
+    // recoverTask security & duplicate recovery check
+    const ref96 = path.join(relWork, 'ref96.txt');
+    fs.writeFileSync(ref96, 'orig-96', 'utf8');
+    const put96 = runCli(['put', ref96, '--by', 'hermes'], { root: relRoot, allowed: relAllowed }).json;
+    const t96Id = runCli(['new', '--to', 'antigravity', '--from', 'hermes', '--goal', 'worker-recover-sec', '--ref', put96.sha256], { root: relRoot, allowed: relAllowed }).json?.id;
+    const res96 = path.join(relWork, 'res96.json');
+    fs.writeFileSync(res96, '{"ok":true}', 'utf8');
+    fs.writeFileSync(ref96, 'drifted-96', 'utf8');
+    const workerDriftCli96 = runCli(['recover', t96Id, '--by', 'antigravity', '--action', 'adopt', '--result', res96, '--allow-drift'], {
+      root: relRoot,
+      allowed: relAllowed,
+      envExtra: { AGENTBUS_ROLE: 'worker', AGENTBUS_AGENT: 'antigravity' },
+    });
+    const workerCrossCli96 = runCli(['recover', t96Id, '--by', 'codex', '--action', 'fail', '--reason', 'hijack'], {
+      root: relRoot,
+      allowed: relAllowed,
+      envExtra: { AGENTBUS_ROLE: 'worker', AGENTBUS_AGENT: 'codex' },
+    });
+    const conductorAdopt96 = runCli(['recover', t96Id, '--by', 'hermes', '--action', 'adopt', '--result', res96, '--allow-drift'], {
+      root: relRoot,
+      allowed: relAllowed,
+      envExtra: { AGENTBUS_ROLE: 'conductor' },
+    });
+    const dupRecover96 = runCli(['recover', t96Id, '--by', 'hermes', '--action', 'retry', '--reason', 'dup'], {
+      root: relRoot,
+      allowed: relAllowed,
+    });
+
+    assertCase(96, '4 白名单客户端在临时 home 全部恢复且二次幂等；损坏 DSH/Hermes 只备份报 manual；worker recover 防越权防漂移绕过与终态防重',
+      all4Run1_96.rc === 0 &&
+      all4Run1_96.json?.changed === true &&
+      all4BothOk96 &&
+      all4Run2_96.rc === 0 &&
+      all4Run2_96.json?.changed === false &&
+      (all4Run2_96.json?.repaired || []).length === 0 &&
+      dshManual96?.result === 'manual' &&
+      Boolean(dshManual96?.backup && fs.existsSync(dshManual96.backup)) &&
+      fs.readFileSync(badDshCfg96, 'utf8') === badDshContent96 &&
+      hermesManual96?.result === 'manual' &&
+      Boolean(hermesManual96?.backup && fs.existsSync(hermesManual96.backup)) &&
+      fs.readFileSync(badHermesCfg96, 'utf8') === badHermesContent96 &&
+      workerDriftCli96.rc === 2 &&
+      workerCrossCli96.rc === 2 &&
+      conductorAdopt96.rc === 0 &&
+      conductorAdopt96.json?.state === 'done' &&
+      dupRecover96.rc === 2,
+      `all4=${[...all4RepairedIds96].join(',')} r2=${all4Run2_96.json?.changed} dshM=${dshManual96?.result} hrmM=${hermesManual96?.result} wDrift=${workerDriftCli96.rc} wCross=${workerCrossCli96.rc} cAdopt=${conductorAdopt96.rc} dup=${dupRecover96.rc}`);
+
+    // 97. 回归：Windows 大写 COMSPEC / 缺失 ComSpec 且 PATH='' 时，hermes.cmd 与 doctor --fix 仍正常调用且二次幂等
+    const hermesEnvHome97 = path.join(RUN_BASE, 'hermes_env_home_97');
+    const hermesEnvRoot97 = path.join(RUN_BASE, 'hermes_env_root_97');
+    const hermesEnvAllow97 = path.join(RUN_BASE, 'hermes_env_allow_97');
+    fs.mkdirSync(hermesEnvAllow97, { recursive: true });
+    const hermesDir97 = process.platform === 'win32'
+      ? path.join(hermesEnvHome97, 'AppData', 'Local', 'hermes')
+      : path.join(hermesEnvHome97, '.hermes');
+    fs.mkdirSync(hermesDir97, { recursive: true });
+    const hermesCfg97 = path.join(hermesDir97, 'config.yaml');
+    fs.writeFileSync(hermesCfg97, 'mcp_servers:\n  keep_97:\n    command: echo\n', 'utf8');
+    const env97 = {
+      ...isolatedNoBinEnv,
+      ComSpec: '',
+      COMSPEC: '',
+      AGENTBUS_HERMES_BIN: fakeHermesBin96,
+      TARGET_HERMES_CFG_96: hermesCfg97,
+    };
+    const run1_97 = runCli(['doctor', '--fix', '--home', hermesEnvHome97, '--allow', hermesEnvAllow97, '--json'], { root: hermesEnvRoot97, allowed: hermesEnvAllow97, envExtra: env97 });
+    const run2_97 = runCli(['doctor', '--fix', '--home', hermesEnvHome97, '--allow', hermesEnvAllow97, '--json'], { root: hermesEnvRoot97, allowed: hermesEnvAllow97, envExtra: env97 });
+    const hermesAfter97 = fs.readFileSync(hermesCfg97, 'utf8');
+    assertCase(97, '缺失 ComSpec / PATH 为空时 Hermes doctor --fix 不报 cmd.exe ENOENT 且二次幂等',
+      run1_97.rc === 0 &&
+      run1_97.json?.changed === true &&
+      (run1_97.json?.repaired || []).some((r) => r.client === 'hermes') &&
+      hermesAfter97.includes('keep_97:') &&
+      hermesAfter97.includes('agentbus:') &&
+      run2_97.rc === 0 &&
+      run2_97.json?.changed === false &&
+      (run2_97.json?.repaired || []).length === 0,
+      `r1=${JSON.stringify(run1_97.json)} r2=${JSON.stringify(run2_97.json)}`);
+
+    // 98. 去硬编码路径 + daemonDirs 三平台解析 + AGENTBUS_AGY_DAEMON_DIR 优先级与导出提示
+    const { resolveDaemonDirs, discoverAgySession, exportAgySession } = await import('../src/agy.js');
+    const sourceFiles98 = [
+      ...fs.readdirSync(path.join(PKG_ROOT, 'src')).filter((f) => f.endsWith('.js')).map((f) => path.join(PKG_ROOT, 'src', f)),
+      ...fs.readdirSync(path.join(PKG_ROOT, 'bin')).filter((f) => f.endsWith('.js')).map((f) => path.join(PKG_ROOT, 'bin', f)),
+    ];
+    const hardcodedHits98 = [];
+    for (const sf of sourceFiles98) {
+      const txt = fs.readFileSync(sf, 'utf8');
+      if (/E:\/ai|E:\\ai|C:\/Users\/|C:\\Users\\/i.test(txt)) {
+        hardcodedHits98.push(path.basename(sf));
+      }
+    }
+
+    const agyBase98 = path.join(RUN_BASE, 'agy_98');
+    const agyOv1_98 = path.join(agyBase98, 'override1');
+    const agyOv2_98 = path.join(agyBase98, 'override2');
+    const agyWinHome98 = path.join(agyBase98, 'win_home');
+    const agyWinAppData98 = path.join(agyBase98, 'win_appdata');
+    const agyMacHome98 = path.join(agyBase98, 'mac_home');
+    const agyLinHome98 = path.join(agyBase98, 'lin_home');
+    for (const d of [
+      agyOv1_98,
+      agyOv2_98,
+      path.join(agyWinHome98, '.gemini', 'antigravity', 'daemon'),
+      path.join(agyWinAppData98, 'Antigravity', 'daemon'),
+      path.join(agyMacHome98, '.gemini', 'antigravity', 'daemon'),
+      path.join(agyMacHome98, 'Library', 'Application Support', 'Antigravity', 'daemon'),
+      path.join(agyLinHome98, '.gemini', 'antigravity', 'daemon'),
+      path.join(agyLinHome98, '.config', 'Antigravity', 'daemon'),
+    ]) fs.mkdirSync(d, { recursive: true });
+
+    const dirsWin98 = resolveDaemonDirs({
+      home: agyWinHome98,
+      platform: 'win32',
+      env: {
+        AGENTBUS_AGY_DAEMON_DIR: [agyOv1_98, agyOv2_98].join(path.delimiter),
+        APPDATA: agyWinAppData98,
+      },
+    });
+    const dirsMac98 = resolveDaemonDirs({
+      home: agyMacHome98,
+      platform: 'darwin',
+      env: { AGENTBUS_AGY_DAEMON_DIR: agyOv1_98 },
+    });
+    const dirsLin98 = resolveDaemonDirs({
+      home: agyLinHome98,
+      platform: 'linux',
+      env: {},
+    });
+
+    const hubFile98 = path.join(agyOv2_98, 'hub_12345.json');
+    fs.writeFileSync(hubFile98, JSON.stringify({ httpPort: 45678, csrfToken: 'tok-98', pid: 12345 }), 'utf8');
+    const foundSess98 = discoverAgySession({
+      home: agyWinHome98,
+      platform: 'win32',
+      env: { AGENTBUS_AGY_DAEMON_DIR: [agyOv1_98, agyOv2_98].join(path.delimiter), APPDATA: agyWinAppData98 },
+    });
+    let missingSessErr98 = '';
+    const emptyAgyHome98 = path.join(agyBase98, 'empty_home');
+    fs.mkdirSync(emptyAgyHome98, { recursive: true });
+    const prevEnvAgy98 = {
+      ANTIGRAVITY_LS_ADDRESS: process.env.ANTIGRAVITY_LS_ADDRESS,
+      ANTIGRAVITY_CSRF_TOKEN: process.env.ANTIGRAVITY_CSRF_TOKEN,
+      AGENTBUS_AGY_DAEMON_DIR: process.env.AGENTBUS_AGY_DAEMON_DIR,
+      APPDATA: process.env.APPDATA,
+      USERPROFILE: process.env.USERPROFILE,
+      HOME: process.env.HOME,
+    };
+    try {
+      delete process.env.ANTIGRAVITY_LS_ADDRESS;
+      delete process.env.ANTIGRAVITY_CSRF_TOKEN;
+      delete process.env.AGENTBUS_AGY_DAEMON_DIR;
+      process.env.APPDATA = path.join(emptyAgyHome98, 'AppData', 'Roaming');
+      process.env.USERPROFILE = emptyAgyHome98;
+      process.env.HOME = emptyAgyHome98;
+      exportAgySession(path.join(agyBase98, 'out_sess.json'));
+    } catch (err) {
+      missingSessErr98 = String(err?.message || err);
+    } finally {
+      for (const [k, v] of Object.entries(prevEnvAgy98)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+
+    assertCase(98, 'src/bin 无本机硬编码路径；daemonDirs 支持三平台与 AGENTBUS_AGY_DAEMON_DIR 多路径；缺失会话清晰报错',
+      hardcodedHits98.length === 0 &&
+      dirsWin98[0] === path.resolve(agyOv1_98) &&
+      dirsWin98[1] === path.resolve(agyOv2_98) &&
+      dirsWin98.includes(path.join(agyWinHome98, '.gemini', 'antigravity', 'daemon')) &&
+      dirsWin98.includes(path.join(agyWinAppData98, 'Antigravity', 'daemon')) &&
+      dirsMac98[0] === path.resolve(agyOv1_98) &&
+      dirsMac98.includes(path.join(agyMacHome98, '.gemini', 'antigravity', 'daemon')) &&
+      dirsLin98[0] === path.join(agyLinHome98, '.gemini', 'antigravity', 'daemon') &&
+      foundSess98?.ls_address === 'http://127.0.0.1:45678' &&
+      foundSess98?.csrf_token === 'tok-98' &&
+      /集成终端/.test(missingSessErr98),
+      `hits=${hardcodedHits98.join(',')} win=${JSON.stringify(dirsWin98)} err=${missingSessErr98}`);
+
+    // 99. watch 立即退出语义：done(0)、blocked(1)、failed(1)、stalled/lease_expired(1)，单行 JSON 且无 history
+    const watchRoot99 = path.join(RUN_BASE, 'watch_root_99');
+    const watchWork99 = path.join(RUN_BASE, 'watch_work_99');
+    fs.mkdirSync(watchWork99, { recursive: true });
+    const watchAllow99 = [watchRoot99, watchWork99, DEMO_REFS].join(path.delimiter);
+    runCli(['init'], { root: watchRoot99, allowed: watchAllow99 });
+    const refFile99 = path.join(watchWork99, 'ref99.txt');
+    fs.writeFileSync(refFile99, 'watch-99', 'utf8');
+    const put99 = runCli(['put', refFile99, '--by', 'hermes'], { root: watchRoot99, allowed: watchAllow99 }).json;
+    const res99 = path.join(watchWork99, 'res99.json');
+    fs.writeFileSync(res99, JSON.stringify({ ok: true, tag: 'watch-99' }), 'utf8');
+
+    // 99a: already done
+    const tDone99 = runCli(['new', '--to', 'codex', '--from', 'hermes', '--goal', 'watch-done', '--ref', put99.sha256], { root: watchRoot99, allowed: watchAllow99 }).json.id;
+    const clDone99 = runCli(['claim', tDone99, '--by', 'codex'], { root: watchRoot99, allowed: watchAllow99 }).json;
+    runCli(['done', tDone99, '--by', 'codex', '--lease', clDone99.lease_token, '--result', res99], { root: watchRoot99, allowed: watchAllow99 });
+    const wDone99 = runCli(['watch', tDone99, '--json'], { root: watchRoot99, allowed: watchAllow99 });
+    const wDoneLines99 = wDone99.stdout.trim().split(/\r?\n/);
+
+    // 99b: blocked
+    const tBlk99 = runCli(['new', '--to', 'codex', '--from', 'hermes', '--goal', 'watch-blocked', '--ref', put99.sha256], { root: watchRoot99, allowed: watchAllow99 }).json.id;
+    const clBlk99 = runCli(['claim', tBlk99, '--by', 'codex'], { root: watchRoot99, allowed: watchAllow99 }).json;
+    runCli(['message', tBlk99, '--by', 'codex', '--lease', clBlk99.lease_token, '--kind', 'blocked', '--body', 'need input'], { root: watchRoot99, allowed: watchAllow99 });
+    const wBlk99 = runCli(['watch', tBlk99, '--json'], { root: watchRoot99, allowed: watchAllow99 });
+
+    // 99c: failed
+    const tFail99 = runCli(['new', '--to', 'codex', '--from', 'hermes', '--goal', 'watch-failed', '--ref', put99.sha256], { root: watchRoot99, allowed: watchAllow99 }).json.id;
+    const clFail99 = runCli(['claim', tFail99, '--by', 'codex'], { root: watchRoot99, allowed: watchAllow99 }).json;
+    runCli(['fail', tFail99, '--by', 'codex', '--lease', clFail99.lease_token, '--reason', 'boom'], { root: watchRoot99, allowed: watchAllow99 });
+    const wFail99 = runCli(['watch', tFail99, '--json'], { root: watchRoot99, allowed: watchAllow99 });
+
+    // 99d: stalled (unreaped expired lease detected read-only)
+    const tStall99 = runCli(['new', '--to', 'codex', '--from', 'hermes', '--goal', 'watch-stalled', '--ref', put99.sha256], { root: watchRoot99, allowed: watchAllow99 }).json.id;
+    runCli(['claim', tStall99, '--by', 'codex', '--ttl', '1'], { root: watchRoot99, allowed: watchAllow99 });
+    const stallDb99 = new DatabaseSync(path.join(watchRoot99, 'agentbus.db'));
+    stallDb99.prepare('UPDATE tasks SET lease_expires_at = ? WHERE id = ?').run(new Date(Date.now() - 5000).toISOString(), tStall99);
+    stallDb99.close();
+    const wStall99 = runCli(['watch', tStall99, '--json'], { root: watchRoot99, allowed: watchAllow99 });
+
+    assertCase(99, 'watch 立即检查：done(0) 输出 result 且无 history；blocked/failed/stalled 立即 exit 1',
+      wDone99.rc === 0 &&
+      wDoneLines99.length === 1 &&
+      wDone99.json?.id === tDone99 &&
+      wDone99.json?.state === 'done' &&
+      Boolean(wDone99.json?.finished_at) &&
+      wDone99.json?.result?.bytes > 0 &&
+      wDone99.json?.stalled === false &&
+      wDone99.json?.waited_s !== undefined &&
+      !('history' in (wDone99.json || {})) &&
+      wBlk99.rc === 1 &&
+      wBlk99.json?.blocked === true &&
+      Boolean(wBlk99.json?.blocked_at) &&
+      wFail99.rc === 1 &&
+      wFail99.json?.state === 'failed' &&
+      wStall99.rc === 1 &&
+      wStall99.json?.stalled === true,
+      `done=${wDone99.rc}:${JSON.stringify(wDone99.json)} blk=${wBlk99.rc} fail=${wFail99.rc} stall=${wStall99.rc}:${JSON.stringify(wStall99.json)}`);
+
+    // 100. watch 轮询 open/claimed -> done（含 fake DB 与非 TTY stdin 关闭），超时 exit 3，非法 interval exit 1
+    const fakeWatchDb100 = path.join(RUN_BASE, 'fake_watch_100.db');
+    {
+      const fdb = new DatabaseSync(fakeWatchDb100);
+      fdb.exec('CREATE TABLE tasks (id TEXT PRIMARY KEY, state TEXT NOT NULL, attempt INTEGER DEFAULT 0, lease_expires_at TEXT, blocked_at TEXT, finished_at TEXT, result_json TEXT, history_json TEXT)');
+      fdb.prepare("INSERT INTO tasks (id, state, attempt, history_json) VALUES (?, 'open', 0, '[]')").run('tfake100');
+      fdb.close();
+    }
+    const fakeWatchDir100 = path.join(RUN_BASE, 'fake_watch_root_100');
+    fs.mkdirSync(fakeWatchDir100, { recursive: true });
+    fs.copyFileSync(fakeWatchDb100, path.join(fakeWatchDir100, 'agentbus.db'));
+    const childWatch100 = spawn(process.execPath, [BUS_BIN, 'watch', 'tfake100', '--root', fakeWatchDir100, '--interval', '2', '--timeout', '15', '--json'], {
+      cwd: PKG_ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    let cwOut100 = '';
+    let cwErr100 = '';
+    childWatch100.stdout.on('data', (d) => { cwOut100 += d.toString('utf8'); });
+    childWatch100.stderr.on('data', (d) => { cwErr100 += d.toString('utf8'); });
+    setTimeout(() => {
+      const fdb2 = new DatabaseSync(path.join(fakeWatchDir100, 'agentbus.db'));
+      fdb2.prepare("UPDATE tasks SET state = 'claimed' WHERE id = 'tfake100'").run();
+      fdb2.close();
+    }, 300);
+    setTimeout(() => {
+      const fdb3 = new DatabaseSync(path.join(fakeWatchDir100, 'agentbus.db'));
+      fdb3.prepare("UPDATE tasks SET state = 'done', finished_at = ?, result_json = ? WHERE id = 'tfake100'")
+        .run(new Date().toISOString(), JSON.stringify({ ok: true, from: 'fake-db' }));
+      fdb3.close();
+    }, 800);
+    const cwCode100 = await new Promise((resolve) => childWatch100.on('exit', resolve));
+    const cwJson100 = (() => { try { return JSON.parse(cwOut100); } catch { return null; } })();
+
+    // Timeout exit 3 & invalid interval exit 1
+    const tOpen100 = runCli(['new', '--to', 'codex', '--from', 'hermes', '--goal', 'watch-timeout', '--ref', put99.sha256], { root: watchRoot99, allowed: watchAllow99 }).json.id;
+    const wTimeout100 = runCli(['watch', tOpen100, '--interval', '2', '--timeout', '1', '--json'], { root: watchRoot99, allowed: watchAllow99 });
+    const wBadInt100 = runCli(['watch', tOpen100, '--interval', '1'], { root: watchRoot99, allowed: watchAllow99 });
+
+    assertCase(100, 'watch 在非 TTY(stdin=ignore) 下轮询 fake DB 到 done(rc=0)；超时 exit 3；非法 interval exit 1',
+      cwCode100 === 0 &&
+      !/tty/i.test(cwErr100) &&
+      cwJson100?.state === 'done' &&
+      cwJson100?.result?.from === 'fake-db' &&
+      cwJson100?.waited_s >= 1 &&
+      cwJson100?.waited_s <= 6 &&
+      wTimeout100.rc === 3 &&
+      wTimeout100.json?.timed_out === true &&
+      wBadInt100.rc === 1,
+      `cw=${cwCode100}:${cwOut100}:${cwErr100} timeout=${wTimeout100.rc}:${JSON.stringify(wTimeout100.json)} badInt=${wBadInt100.rc}`);
+
+    // 101. dispatch 默认返回值不变；dispatch --watch 在异步 adapter 后继续等待至 done(0) 与 timeout(3)
+    const asyncAdapter101 = path.join(RUN_BASE, 'async_adapter_101.mjs');
+    fs.writeFileSync(asyncAdapter101, [
+      "console.log(JSON.stringify({ conversationId: 'async-conv-101' }));",
+      "process.exit(0);",
+    ].join('\n'), 'utf8');
+    const envDisp101 = {
+      AGENTBUS_ENABLE_DISPATCH: '1',
+      AGENTBUS_ADAPTER_ASYNCFAKE: JSON.stringify({ command: process.execPath, args: [asyncAdapter101, '{prompt}'] }),
+    };
+    const tDispDef101 = runCli(['new', '--to', 'asyncfake', '--from', 'hermes', '--goal', 'disp-default', '--ref', put99.sha256], { root: watchRoot99, allowed: watchAllow99 }).json.id;
+    const resDef101 = runCli(['dispatch', tDispDef101, '--cwd', watchWork99, '--wait', '1'], { root: watchRoot99, allowed: watchAllow99, envExtra: envDisp101 });
+
+    const tDispWatch101 = runCli(['new', '--to', 'asyncfake', '--from', 'hermes', '--goal', 'disp-watch-ok', '--ref', put99.sha256], { root: watchRoot99, allowed: watchAllow99 }).json.id;
+    const childDispWatch101 = spawn(process.execPath, [
+      BUS_BIN, 'dispatch', tDispWatch101, '--root', watchRoot99, '--cwd', watchWork99, '--wait', '1', '--force', '--watch', '--interval', '2', '--timeout', '15',
+    ], {
+      cwd: PKG_ROOT,
+      env: { ...process.env, AGENTBUS_ALLOWED_ROOTS: watchAllow99, ...envDisp101 },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    let dwOut101 = '';
+    childDispWatch101.stdout.on('data', (d) => { dwOut101 += d.toString('utf8'); });
+    setTimeout(() => {
+      const cl = runCli(['claim', tDispWatch101, '--by', 'asyncfake'], { root: watchRoot99, allowed: watchAllow99 }).json;
+      if (cl?.lease_token) {
+        runCli(['done', tDispWatch101, '--by', 'asyncfake', '--lease', cl.lease_token, '--result', res99], { root: watchRoot99, allowed: watchAllow99 });
+      }
+    }, 5800);
+    const dwCode101 = await new Promise((resolve) => childDispWatch101.on('exit', resolve));
+    const dwJson101 = (() => { try { return JSON.parse(dwOut101); } catch { return null; } })();
+
+    const tDispTo101 = runCli(['new', '--to', 'asyncfake', '--from', 'hermes', '--goal', 'disp-watch-timeout', '--ref', put99.sha256], { root: watchRoot99, allowed: watchAllow99 }).json.id;
+    const dwTo101 = runCli(['dispatch', tDispTo101, '--cwd', watchWork99, '--wait', '1', '--force', '--watch', '--interval', '2', '--timeout', '1'], {
+      root: watchRoot99, allowed: watchAllow99, envExtra: envDisp101,
+    });
+
+    assertCase(101, 'dispatch 默认行为/返回值字段不变；dispatch --watch 等到 done(0) 与超时(3)',
+      resDef101.rc === 1 &&
+      resDef101.json?.state === 'open' &&
+      !('watch' in (resDef101.json || {})) &&
+      !('timed_out' in (resDef101.json || {})) &&
+      Boolean(resDef101.json?.hint) &&
+      dwCode101 === 0 &&
+      dwJson101?.state === 'done' &&
+      dwJson101?.dispatched === true &&
+      dwJson101?.watch?.state === 'done' &&
+      dwTo101.rc === 3 &&
+      dwTo101.json?.timed_out === true,
+      `def=${JSON.stringify(resDef101.json)} dw=${dwCode101}:${dwOut101.slice(0, 200)} dwTo=${dwTo101.rc}`);
+
+    // 102. doctorBootstrap 纯函数：node_sqlite、allowed_roots、agents_json
+    const {
+      doctorBootstrap,
+      checkNodeSqlite,
+      evaluateAllowedRoots,
+      evaluateAgentsJson,
+      evaluateStaleMcp,
+    } = await import('../src/setup.js');
+
+    const nsOk102 = await checkNodeSqlite({ nodeVersion: 'v22.5.0', sqliteAvailable: true });
+    const nsLowVer102 = await checkNodeSqlite({ nodeVersion: 'v20.18.0', sqliteAvailable: true });
+    const nsNoSqlite102 = await checkNodeSqlite({ nodeVersion: 'v22.10.0', sqliteAvailable: false });
+
+    const arBase102 = path.join(RUN_BASE, 'ar_102');
+    const arSub102 = path.join(arBase102, 'proj');
+    const arOut102 = path.join(RUN_BASE, 'ar_outside_102');
+    fs.mkdirSync(arSub102, { recursive: true });
+    fs.mkdirSync(arOut102, { recursive: true });
+    const arPass102 = evaluateAllowedRoots({ allowedRoots: [arBase102], cwd: arSub102 });
+    const arFail102 = evaluateAllowedRoots({ allowedRoots: [arBase102], cwd: arOut102 });
+
+    const agDirMissing102 = path.join(RUN_BASE, 'ag_missing_102');
+    const agDirEmpty102 = path.join(RUN_BASE, 'ag_empty_102');
+    const agDirBad102 = path.join(RUN_BASE, 'ag_bad_102');
+    const agDirOk102 = path.join(RUN_BASE, 'ag_ok_102');
+    for (const d of [agDirMissing102, agDirEmpty102, agDirBad102, agDirOk102]) fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(agDirEmpty102, 'agents.json'), JSON.stringify({ conductor: 'hermes', models: { codex: '' } }), 'utf8');
+    fs.writeFileSync(path.join(agDirBad102, 'agents.json'), '{broken json', 'utf8');
+    fs.writeFileSync(path.join(agDirOk102, 'agents.json'), JSON.stringify({ conductor: 'hermes', models: { codex: 'gpt-5' }, archive_on_done: false }), 'utf8');
+
+    const agMiss102 = evaluateAgentsJson({ root: agDirMissing102, env: {} });
+    const agEmp102 = evaluateAgentsJson({ root: agDirEmpty102, env: {} });
+    const agBad102 = evaluateAgentsJson({ root: agDirBad102, env: {} });
+    const agOk102 = evaluateAgentsJson({ root: agDirOk102, env: {} });
+
+    assertCase(102, 'doctorBootstrap 纯函数：node_sqlite 版本/sqlite、allowed_roots、agents_json(缺/空模型/损坏/正常)',
+      nsOk102.status === 'pass' &&
+      nsLowVer102.status === 'fail' &&
+      nsNoSqlite102.status === 'fail' &&
+      arPass102.status === 'pass' &&
+      arFail102.status === 'fail' &&
+      agMiss102.status === 'warn' &&
+      agEmp102.status === 'warn' &&
+      agBad102.status === 'fail' &&
+      agOk102.status === 'pass',
+      JSON.stringify({ nsLowVer102, arFail102, agMiss102, agEmp102, agBad102, agOk102 }));
+
+    // 103. doctorBootstrap 纯函数：clients(无客户端warn)、archive_cdp、stale_mcp(mock进程)
+    const bsHomeEmpty103 = path.join(RUN_BASE, 'bs_home_empty_103');
+    const bsRootOk103 = path.join(RUN_BASE, 'bs_root_ok_103');
+    const bsWork103 = path.join(RUN_BASE, 'bs_work_103');
+    fs.mkdirSync(bsHomeEmpty103, { recursive: true });
+    fs.mkdirSync(bsWork103, { recursive: true });
+    runCli(['init'], { root: bsRootOk103, allowed: bsWork103 });
+    fs.writeFileSync(path.join(bsRootOk103, 'agents.json'), JSON.stringify({ conductor: 'hermes', models: { codex: 'gpt-5' }, archive_on_done: false }), 'utf8');
+
+    const bsClean103 = await doctorBootstrap({
+      root: bsRootOk103,
+      home: bsHomeEmpty103,
+      cwd: bsWork103,
+      env: { PATH: '', AGENTBUS_ALLOWED_ROOTS: bsWork103 },
+      processes: [],
+      codeMtimeMs: 1000,
+    });
+    const mapClean103 = Object.fromEntries(bsClean103.checks.map((c) => [c.id, c]));
+
+    const bsCheckArchiveFail103 = await doctorBootstrap({
+      root: bsRootOk103,
+      home: bsHomeEmpty103,
+      cwd: bsWork103,
+      env: { PATH: '', AGENTBUS_ALLOWED_ROOTS: bsWork103 },
+      checkArchive: true,
+      probeCdp: async () => ({ reachable: false, hasAntigravityPage: false, error: 'ECONNREFUSED' }),
+      processes: [],
+    });
+
+    const bsArchiveWarn103 = await doctorBootstrap({
+      root: bsRootOk103,
+      home: bsHomeEmpty103,
+      cwd: bsWork103,
+      env: { PATH: '', AGENTBUS_ALLOWED_ROOTS: bsWork103, AGENTBUS_ARCHIVE_ON_DONE: '1' },
+      probeCdp: async () => ({ reachable: false, hasAntigravityPage: false, error: 'ECONNREFUSED' }),
+      processes: [],
+    });
+
+    const bsStaleFail103 = await doctorBootstrap({
+      root: bsRootOk103,
+      home: bsHomeEmpty103,
+      cwd: bsWork103,
+      env: { PATH: '', AGENTBUS_ALLOWED_ROOTS: bsWork103 },
+      processes: [{ pid: 99999, createdAtMs: 500, commandLine: 'node /app/bin/bus.js mcp --root /var' }],
+      codeMtimeMs: 1000,
+    });
+    const staleFresh103 = evaluateStaleMcp({
+      processes: [{ pid: 99998, createdAtMs: 1500, commandLine: 'node /app/bin/bus.js mcp --root /var' }],
+      codeMtimeMs: 1000,
+    });
+    const staleErr103 = evaluateStaleMcp({ probeError: 'ps failed' });
+
+    assertCase(103, 'doctorBootstrap 纯函数：无客户端标 warn 不 fail；archive_cdp 仅开启/--check-archive 探测；stale_mcp 准确判定',
+      bsClean103.ok === true &&
+      mapClean103.clients?.status === 'warn' &&
+      mapClean103.archive_cdp?.status === 'pass' &&
+      mapClean103.stale_mcp?.status === 'pass' &&
+      bsCheckArchiveFail103.ok === false &&
+      bsCheckArchiveFail103.checks.find((c) => c.id === 'archive_cdp')?.status === 'fail' &&
+      bsArchiveWarn103.ok === true &&
+      bsArchiveWarn103.checks.find((c) => c.id === 'archive_cdp')?.status === 'warn' &&
+      bsStaleFail103.ok === false &&
+      bsStaleFail103.checks.find((c) => c.id === 'stale_mcp')?.status === 'fail' &&
+      staleFresh103.status === 'pass' &&
+      staleErr103.status === 'warn',
+      `clean=${JSON.stringify(bsClean103.summary)} archFail=${bsCheckArchiveFail103.ok} staleFail=${bsStaleFail103.ok}`);
+
+    // 104. doctor --bootstrap CLI 端到端：7 项 id 齐全、只读不建文件、只读 DB / 越界 cwd exit 1、非法参数 exit 2
+    const bsCliHome104 = path.join(RUN_BASE, 'bs_cli_home_104');
+    const bsCliUninit104 = path.join(RUN_BASE, 'bs_cli_uninit_104');
+    fs.mkdirSync(bsCliHome104, { recursive: true });
+    const bsCliRun104 = runCli(['doctor', '--bootstrap', '--root', bsCliUninit104, '--home', bsCliHome104, '--cwd', bsWork103, '--json'], {
+      root: bsCliUninit104,
+      allowed: bsWork103,
+      envExtra: isolatedNoBinEnv,
+    });
+    const bsIds104 = (bsCliRun104.json?.checks || []).map((c) => c.id);
+    const expectedIds104 = ['node_sqlite', 'bus_root', 'allowed_roots', 'agents_json', 'clients', 'archive_cdp', 'stale_mcp'];
+    const idsMatch104 = JSON.stringify(bsIds104) === JSON.stringify(expectedIds104);
+    const allValidStatus104 = (bsCliRun104.json?.checks || []).every((c) => ['pass', 'warn', 'fail'].includes(c.status) && 'detail' in c && 'fix' in c);
+    const nothingCreated104 = !fs.existsSync(bsCliUninit104) && fs.readdirSync(bsCliHome104).length === 0;
+
+    // Read-only DB -> bus_root fail & exit 1
+    const bsRoRoot104 = path.join(RUN_BASE, 'bs_ro_root_104');
+    runCli(['init'], { root: bsRoRoot104, allowed: bsWork103 });
+    const bsRoDb104 = path.join(bsRoRoot104, 'agentbus.db');
+    let bsRoRun104 = null;
+    try {
+      fs.chmodSync(bsRoDb104, 0o444);
+      bsRoRun104 = runCli(['doctor', '--bootstrap', '--root', bsRoRoot104, '--home', bsCliHome104, '--cwd', bsWork103, '--json'], {
+        root: bsRoRoot104,
+        allowed: bsWork103,
+      });
+    } finally {
+      try { fs.chmodSync(bsRoDb104, 0o666); } catch {}
+    }
+
+    // Invalid flag -> exit 2
+    const bsBadCmd104 = runCli(['doctor', '--bootstrap', '--port', 'notaport'], { root: bsRootOk103, allowed: bsWork103 });
+
+    assertCase(104, 'doctor --bootstrap CLI：输出 7 项检查、严格只读不建文件、只读 DB exit 1、命令异常 exit 2',
+      (bsCliRun104.rc === 0 || bsCliRun104.rc === 1) &&
+      idsMatch104 &&
+      allValidStatus104 &&
+      nothingCreated104 &&
+      bsRoRun104?.rc === 1 &&
+      bsRoRun104?.json?.ok === false &&
+      bsRoRun104?.json?.checks?.find((c) => c.id === 'bus_root')?.status === 'fail' &&
+      bsBadCmd104.rc === 2,
+      `rc=${bsCliRun104.rc} ids=${bsIds104.join(',')} created=${!nothingCreated104} ro=${bsRoRun104?.rc} bad=${bsBadCmd104.rc}`);
   } finally {
     try { fs.rmSync(RUN_BASE, { recursive: true, force: true }); } catch {}
   }

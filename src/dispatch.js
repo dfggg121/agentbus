@@ -12,10 +12,11 @@ import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { showTask, listTaskMessages, latestTaskMessageSeq, ATTENTION_MESSAGE_KINDS } from './tasks.js';
 import { defaultAgySessionPath, readAgySession, detectAgentApi, discoverAgySession, archiveTaskConversations } from './agy.js';
 import { modelFor, KNOWN_MODELS, readAgentConfig, resolveAgentBin } from './agents.js';
-import { appendEvent, withImmediateTx } from './db.js';
+import { appendEvent, openBusReadOnly, withImmediateTx } from './db.js';
 import {
   threadUsable,
   getThread,
@@ -191,7 +192,8 @@ export function buildPrompt(id, to, cwd, ctxRef = null) {
     '任务正文以 bus_task_claim 返回的 goal / constraints / refs / acceptance 为准（本消息不含完整正文）。',
     cwd ? `工作目录：${cwd}（所有产出写在此目录下，勿跨盘探索）` : null,
     ctxLine,
-    `步骤：1) 调用 bus_task_claim（id=${id}, by=${to}）领取并获取完整 goal 与 refs；`,
+    '步骤：0) 长任务每 3-5 分钟调用 bus_task_heartbeat 续租，否则租约过期会被回收；',
+    `1) 调用 bus_task_claim（id=${id}, by=${to}）领取并获取完整 goal 与 refs；`,
     '2) 用 bus_ref_read 逐个读 refs（resource_link 按 uri 自取）；',
     '3) 需要向主控提问/报阻塞/报进度用 bus_task_message，步骤间可用 bus_task_inbox 查主控回复；',
     '4) 产出结果后调用 bus_task_complete（非 JSON 产物勿传 fields）；完不成用 bus_task_fail 说明原因。',
@@ -228,7 +230,11 @@ function runAdapter(spec, { cwd, timeout_s }) {
       const exe = String(spec.command).replace(/\//g, '\\');
       const inner = [exe, ...spec.args].map(winQuote).join(' ');
       const line = `"${inner}"`;
-      command = process.env.ComSpec || 'cmd.exe';
+      const comspec = process.env.ComSpec && String(process.env.ComSpec).trim();
+      const sysRootCmd = path.win32.join(process.env.SystemRoot || process.env.windir || 'C:\\Windows', 'System32', 'cmd.exe');
+      command = (comspec && existsSync(comspec))
+        ? comspec
+        : (existsSync(sysRootCmd) ? sysRootCmd : (existsSync('C:\\Windows\\System32\\cmd.exe') ? 'C:\\Windows\\System32\\cmd.exe' : 'cmd.exe'));
       args = ['/d', '/s', '/c', line];
       extra = { windowsVerbatimArguments: true };
     }
@@ -405,6 +411,13 @@ export async function maybeArchiveTask(bus, taskId) {
   return payload;
 }
 
+function isLeaseExpiredStalled(task) {
+  if (!task || task.state !== 'open' || Number(task.attempt || 0) <= 0) return false;
+  const hist = Array.isArray(task.history) ? task.history : [];
+  const last = hist[hist.length - 1];
+  return last?.by === 'system' && last?.reason === 'lease_expired';
+}
+
 // Async agents (Antigravity) may start the conversation minutes after the CLI
 // returns. This lets the caller wait on the bus instead of on the child process.
 export async function waitForTask(bus, id, timeout_s = 900, poll_ms = 250, opts = {}) {
@@ -416,9 +429,23 @@ export async function waitForTask(bus, id, timeout_s = 900, poll_ms = 250, opts 
   const hasSince = opts?.since_id !== undefined && Number.isFinite(Number(opts.since_id));
   const baselineSeq = hasSince ? Math.max(0, Number(opts.since_id)) : latestTaskMessageSeq(bus, latest.id);
   let attentionTriggered = false;
+  let stalled = false;
+  let stalledReason = null;
+  let recoverHint = null;
+
+  const markStalledIfExpired = (task) => {
+    if (!isLeaseExpiredStalled(task)) return false;
+    attentionTriggered = true;
+    stalled = true;
+    stalledReason = 'lease_expired';
+    recoverHint = `任务 ${task.id} 租约已过期回到 open (attempt=${task.attempt})，建议调用 bus_task_recover / agentbus recover ${task.id} --action retry 或 reassign`;
+    return true;
+  };
 
   if (latest.state !== 'done' && latest.state !== 'failed') {
-    if (latest.blocked) {
+    if (markStalledIfExpired(latest)) {
+      // stalled
+    } else if (latest.blocked) {
       attentionTriggered = true;
     } else if (hasSince) {
       const initialDelta = listTaskMessages(bus, { id: latest.id, since_id: baselineSeq, limit: 50 });
@@ -428,11 +455,12 @@ export async function waitForTask(bus, id, timeout_s = 900, poll_ms = 250, opts 
     }
   }
 
-  const interval = Math.max(50, Math.min(Number(poll_ms) || 250, 1000));
+  const interval = Math.max(50, Math.min(Number(poll_ms) || 250, 30000));
   while (!attentionTriggered && latest && latest.state !== 'done' && latest.state !== 'failed' && Date.now() < deadline) {
     await sleep(interval);
     latest = showTask(bus, id);
     if (!latest || latest.state === 'done' || latest.state === 'failed') break;
+    if (markStalledIfExpired(latest)) break;
     const delta = listTaskMessages(bus, { id: latest.id, since_id: baselineSeq, limit: 50 });
     if (latest.blocked || delta.messages.some((m) => ATTENTION_MESSAGE_KINDS.has(m.kind))) {
       attentionTriggered = true;
@@ -452,11 +480,184 @@ export async function waitForTask(bus, id, timeout_s = 900, poll_ms = 250, opts 
     blocked: latest ? Boolean(latest.blocked_at) : false,
     blocked_at: latest ? latest.blocked_at || null : null,
     needs_attention: attentionTriggered,
+    stalled,
+    reason: stalledReason,
+    recover_hint: recoverHint,
     messages: inbox.messages,
     last_seq: inbox.last_seq,
     result: latest ? latest.result || null : null,
     waited_s: Math.round((Date.now() - started) / 100) / 10,
   };
+}
+
+function safeJsonParse(raw, fallback) {
+  if (!raw || typeof raw !== 'string') return fallback;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+export function normalizeWatchInterval(val, fallback = 5) {
+  if (val === undefined || val === null) return fallback;
+  const n = Number(val);
+  if (!Number.isFinite(n) || n < 2 || n > 30) {
+    throw Object.assign(new Error(`--interval 必须在 2 到 30 秒之间: ${val}`), { code: 1 });
+  }
+  return n;
+}
+
+export function normalizeWatchTimeout(val, fallback = 3600) {
+  if (val === undefined || val === null) return fallback;
+  const n = Number(val);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw Object.assign(new Error(`--timeout 必须是正数: ${val}`), { code: 1 });
+  }
+  return n;
+}
+
+function inspectWatchRow(row, nowIsoStr) {
+  const state = row.state;
+  const blockedAt = row.blocked_at || null;
+  const blocked = Boolean(blockedAt);
+  const finishedAt = row.finished_at || null;
+  const result = safeJsonParse(row.result_json, null);
+  const history = safeJsonParse(row.history_json, []);
+  const reapedStalled = isLeaseExpiredStalled({ state, attempt: row.attempt, history });
+  const unreapedExpired = state === 'claimed' && Boolean(row.lease_expires_at) && String(row.lease_expires_at) <= nowIsoStr;
+  const stalled = reapedStalled || unreapedExpired;
+
+  let done = false;
+  let reason = null;
+  if (state === 'done') {
+    done = true;
+  } else if (state === 'failed') {
+    done = true;
+    reason = 'failed';
+  } else if (stalled) {
+    done = true;
+    reason = 'lease_expired';
+  } else if (blocked) {
+    done = true;
+    reason = 'blocked';
+  }
+
+  return {
+    done,
+    state,
+    ok: state === 'done',
+    blocked,
+    blocked_at: blockedAt,
+    finished_at: finishedAt,
+    result,
+    stalled,
+    reason,
+  };
+}
+
+// Low-overhead, read-only, TTY-free single-task watcher for background polling.
+export async function watchTask({
+  rootOverride = null,
+  dbPath = null,
+  id,
+  interval_s = 5,
+  timeout_s = 3600,
+} = {}) {
+  if (!id || typeof id !== 'string' || !id.trim()) {
+    throw Object.assign(new Error('缺少任务 id: agentbus watch <task-id>'), { code: 1 });
+  }
+  const intervalS = normalizeWatchInterval(interval_s, 5);
+  const timeoutS = normalizeWatchTimeout(timeout_s, 3600);
+  const started = Date.now();
+  const deadline = started + timeoutS * 1000;
+  const intervalMs = intervalS * 1000;
+
+  let busHandle = null;
+  let db;
+  if (dbPath) {
+    if (!existsSync(dbPath)) {
+      throw Object.assign(new Error(`找不到总线数据库: ${dbPath}`), { code: 1 });
+    }
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    try { db.exec('PRAGMA busy_timeout = 5000;'); } catch {}
+  } else {
+    busHandle = openBusReadOnly({ rootOverride });
+    db = busHandle.db;
+  }
+
+  try {
+    const exact = db.prepare('SELECT id FROM tasks WHERE id = ?').get(id);
+    let resolvedId = exact?.id || null;
+    if (!resolvedId) {
+      const hits = db.prepare('SELECT id FROM tasks WHERE id LIKE ? LIMIT 5').all(`${id}%`);
+      if (hits.length === 1) resolvedId = hits[0].id;
+      else if (hits.length > 1) {
+        throw Object.assign(new Error(`task id 前缀不唯一: ${id} -> ${hits.map((h) => h.id).join(', ')}`), { code: 1 });
+      } else {
+        throw Object.assign(new Error(`找不到任务: ${id}`), { code: 1 });
+      }
+    }
+
+    const cols = new Set(db.prepare('PRAGMA table_info(tasks)').all().map((r) => r.name));
+    const wantedCols = ['id', 'state', 'attempt', 'lease_expires_at', 'blocked_at', 'finished_at', 'result_json', 'history_json']
+      .filter((c) => cols.has(c));
+    const rowStmt = db.prepare(`SELECT ${wantedCols.join(', ')} FROM tasks WHERE id = ?`);
+
+    const buildOut = (snap, timedOut = false) => ({
+      id: resolvedId,
+      state: snap.state,
+      ok: snap.ok,
+      blocked: snap.blocked,
+      blocked_at: snap.blocked_at,
+      finished_at: snap.finished_at,
+      result: snap.result,
+      stalled: snap.stalled,
+      timed_out: timedOut,
+      reason: timedOut ? 'timeout' : snap.reason,
+      waited_s: Math.round((Date.now() - started) / 100) / 10,
+    });
+
+    let row = rowStmt.get(resolvedId);
+    if (!row) {
+      throw Object.assign(new Error(`找不到任务: ${resolvedId}`), { code: 1 });
+    }
+    let snap = inspectWatchRow(row, new Date().toISOString());
+    if (snap.done) {
+      return buildOut(snap, false);
+    }
+
+    while (Date.now() < deadline) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await sleep(Math.min(intervalMs, Math.max(50, remaining)));
+      row = rowStmt.get(resolvedId);
+      if (!row) {
+        return {
+          id: resolvedId,
+          state: 'missing',
+          ok: false,
+          blocked: false,
+          blocked_at: null,
+          finished_at: null,
+          result: null,
+          stalled: false,
+          timed_out: false,
+          reason: 'missing',
+          waited_s: Math.round((Date.now() - started) / 100) / 10,
+        };
+      }
+      snap = inspectWatchRow(row, new Date().toISOString());
+      if (snap.done) {
+        return buildOut(snap, false);
+      }
+    }
+
+    return buildOut(snap, true);
+  } finally {
+    if (busHandle) busHandle.close();
+    else { try { db.close(); } catch {} }
+  }
 }
 
 function agentHealth(bus, agent) {
@@ -520,8 +721,21 @@ function shouldPersistThread({ latest, adapterResult, effectiveSession, steps, r
   return { action: 'save', lastOk: 1 };
 }
 
-export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, env = {}, thread = null, force = false }) {
+export async function dispatchTask(bus, {
+  id,
+  cwd,
+  wait_s = 600,
+  poll_ms = 150,
+  env = {},
+  thread = null,
+  force = false,
+  watch = false,
+  watch_interval_s = 5,
+  watch_timeout_s = 3600,
+}) {
   const t0 = Date.now();
+  const watchIntervalS = watch ? normalizeWatchInterval(watch_interval_s, 5) : 5;
+  const watchTimeoutS = watch ? normalizeWatchTimeout(watch_timeout_s, 3600) : 3600;
   const task = showTask(bus, id);
   if (!task) throw Object.assign(new Error(`找不到任务: ${id}`), { code: 1 });
   if (task.state === 'done' || task.state === 'failed') {
@@ -798,7 +1012,7 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, 
 
   const inbox = listTaskMessages(bus, { id: task.id, limit: 20 });
 
-  return {
+  const out = {
     id: task.id,
     to: task.to,
     state: latest.state,
@@ -833,4 +1047,38 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, 
     stderr_tail: stderrTail,
     error: lastRun && lastRun.ok === false ? lastRun.error || `adapter exit ${lastRun.exit}` : undefined,
   };
+
+  if (!watch) return out;
+
+  if ((out.state === 'open' || out.state === 'claimed') && !out.blocked && !isLeaseExpiredStalled(latest)) {
+    const w = await watchTask({
+      dbPath: bus.config.dbPath,
+      id: out.id,
+      interval_s: watchIntervalS,
+      timeout_s: watchTimeoutS,
+    });
+    out.state = w.state;
+    out.ok = w.ok;
+    out.blocked = w.blocked;
+    out.blocked_at = w.blocked_at;
+    out.finished_at = w.finished_at;
+    out.result = w.result;
+    out.stalled = w.stalled;
+    out.timed_out = w.timed_out;
+    out.waited_s = w.waited_s;
+    out.elapsed_s = Number(((Date.now() - t0) / 1000).toFixed(1));
+    out.watch = w;
+    if (w.state === 'done') {
+      markAgentHealth(bus, task.to, { ok: true });
+      delete out.health;
+    }
+    if (w.state === 'done' || w.state === 'failed' || w.blocked || w.stalled) {
+      delete out.hint;
+    }
+  } else {
+    out.finished_at = latest.finished_at || null;
+    out.stalled = isLeaseExpiredStalled(latest);
+    out.timed_out = false;
+  }
+  return out;
 }

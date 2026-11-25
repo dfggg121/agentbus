@@ -223,6 +223,29 @@ export function migrateTasksTable(db) {
   }
 }
 
+export function checkBusWritable(config) {
+  if (fs.existsSync(config.rootDir)) {
+    try {
+      fs.accessSync(config.rootDir, fs.constants.R_OK | fs.constants.W_OK);
+    } catch (err) {
+      throw Object.assign(
+        new Error(`权限不足，总线根目录不可写 ${config.rootDir} (${err.code || 'EACCES'})；请检查目录权限或运行 agentbus doctor --fix`),
+        { code: 1 }
+      );
+    }
+  }
+  if (fs.existsSync(config.dbPath)) {
+    try {
+      fs.accessSync(config.dbPath, fs.constants.R_OK | fs.constants.W_OK);
+    } catch (err) {
+      throw Object.assign(
+        new Error(`权限不足，总线数据库不可写 ${config.dbPath} (${err.code || 'EACCES'})；请检查文件权限或运行 agentbus doctor --fix`),
+        { code: 1 }
+      );
+    }
+  }
+}
+
 export function openBus(opts = {}) {
   const config = opts.config || loadConfig(opts);
   try {
@@ -234,6 +257,7 @@ export function openBus(opts = {}) {
     }
     throw err;
   }
+  checkBusWritable(config);
 
   let db;
   try {
@@ -271,6 +295,27 @@ export function openBus(opts = {}) {
     db,
     config,
     journalMode,
+    close() {
+      try { db.close(); } catch {}
+    },
+  };
+}
+
+export function openBusReadOnly(opts = {}) {
+  const config = opts.config || loadConfig(opts);
+  if (!fs.existsSync(config.dbPath)) {
+    throw Object.assign(new Error(`找不到总线数据库: ${config.dbPath}`), { code: 1 });
+  }
+  let db;
+  try {
+    db = new DatabaseSync(config.dbPath, { readOnly: true });
+    try { db.exec('PRAGMA busy_timeout = 5000;'); } catch {}
+  } catch (err) {
+    throw Object.assign(new Error(`无法只读打开数据库 ${config.dbPath}: ${err.message || err}`), { code: 1 });
+  }
+  return {
+    db,
+    config,
     close() {
       try { db.close(); } catch {}
     },

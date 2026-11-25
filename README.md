@@ -29,9 +29,23 @@ If you run more than one coding agent, you know the pattern: every handoff recre
 
 Requires **Node.js ≥ 22.5** (for `node:sqlite`).
 
+### Offline tarball (current supported path)
+
+The package is not published to npm yet. Build or receive `agentbus-mcp-<version>.tgz`, copy it to the target machine, then:
+
 ```bash
-npx agentbus-mcp setup --client codex
+npm install -g ./agentbus-mcp-0.2.0.tgz
+agentbus setup --client codex
 ```
+
+If you do not want a global install, install into a project-local prefix:
+
+```bash
+npm install --prefix ./agentbus-local ./agentbus-mcp-0.2.0.tgz
+./agentbus-local/node_modules/.bin/agentbus setup --client codex
+```
+
+`npx agentbus-mcp ...` only works after the package is published to npm; it is intentionally not the primary install path in this release.
 
 `setup` writes the MCP server entry into the client's config (with a timestamped backup) and prints what it touched. Supported ids (core + optional):
 
@@ -43,11 +57,11 @@ Optional: windsurf  kiro  lmstudio  cline  dsh  hermes
 Pick several at once, or set role & dispatch permissions:
 
 ```bash
-npx agentbus-mcp setup --client codex --client claude --client gemini
-npx agentbus-mcp setup --client codex --role conductor --allow-dispatch
-npx agentbus-mcp setup --list   # id, label, format, config, installed, optional (read-only)
-npx agentbus-mcp doctor         # show what is configured
-npx agentbus-mcp clients        # ids only
+agentbus setup --client codex --client claude --client gemini
+agentbus setup --client codex --role conductor --allow-dispatch
+agentbus setup --list   # id, label, format, config, installed, optional (read-only)
+agentbus doctor         # show what is configured
+agentbus clients        # ids only
 ```
 
 Optional clients are skipped by default if not installed (no directories created); pass `--client <id>` explicitly to initialize them. Full automatic & manual client matrix (including Trae, Qoder, CodeBuddy, VS Code, Zed, OpenClaw): [`docs/CLIENTS.md`](docs/CLIENTS.md).
@@ -55,7 +69,7 @@ Optional clients are skipped by default if not installed (no directories created
 By default the bus lives in `~/.agentbus` and only files inside it may be referenced. Pass `--allow` for the project you actually work in:
 
 ```bash
-npx agentbus-mcp setup --client codex --root ~/.agentbus --allow ~/projects/my-app
+agentbus setup --client codex --root ~/.agentbus --allow ~/projects/my-app
 ```
 
 Restart the client afterwards — MCP servers are loaded at startup.
@@ -163,6 +177,24 @@ Antigravity starts conversations asynchronously, so `dispatch` can return while 
 agentbus wait <task-id> --timeout 900
 ```
 
+For a host that should be woken after completion, use `watch` (one process, one task, read-only, default 5s interval):
+
+```bash
+agentbus watch <task-id> --interval 5 --timeout 3600
+# done -> 0, failed/blocked/lease-expired -> 1, timeout -> 3
+# dispatch --watch keeps the dispatcher alive until the same final state
+```
+
+`watch` always prints one JSON line and has no TTY/readline dependency. It does not start a daemon and only performs a primary-key task lookup. A host can run it as a supervised background process and notify on exit.
+
+Before wiring a new machine, run the read-only preflight:
+
+```bash
+agentbus doctor --bootstrap --root ~/.agentbus --json
+```
+
+It checks Node/sqlite, the bus root, allowed roots, `agents.json`, client binaries, optional Antigravity CDP, and stale MCP processes; it never edits configs or kills processes.
+
 ### Onboarding: detect agents, split roles
 
 ```bash
@@ -264,6 +296,7 @@ Any MCP client that speaks stdio JSON-RPC works; `setup` automates these 13 clie
 - **CLI messages are currently Chinese.** English/localized messages are on the roadmap; MCP results are JSON and language-neutral.
 - **No background daemon.** Lease expiry is reclaimed lazily on the next read/write.
 - **Node ≥ 22.5 required**, since SQLite comes from `node:sqlite`.
+- **Offline tarball first.** npm is not published yet; `npx agentbus-mcp` is not the supported install path. See [`docs/PORTABILITY.md`](docs/PORTABILITY.md) for the clean-machine checklist and per-layer limits.
 
 ---
 
@@ -283,7 +316,7 @@ Any MCP client that speaks stdio JSON-RPC works; `setup` automates these 13 clie
 ## Development
 
 ```bash
-git clone https://github.com/USERNAME/agentbus.git
+git clone https://github.com/dfggg121/agentbus.git
 cd agentbus
 node test/accept.mjs     # self-contained acceptance suite
 ```

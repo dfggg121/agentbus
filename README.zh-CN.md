@@ -29,9 +29,23 @@
 
 需要 **Node.js ≥ 22.5**（`node:sqlite`）。
 
+### 离线 tarball（当前支持方式）
+
+包暂未发布到 npm。先在源机器执行 `npm pack` 得到 `agentbus-mcp-<version>.tgz`，拷到目标机器后：
+
 ```bash
-npx agentbus-mcp setup --client codex
+npm install -g ./agentbus-mcp-0.2.0.tgz
+agentbus setup --client codex
 ```
+
+不想全局安装时，用项目内前缀：
+
+```bash
+npm install --prefix ./agentbus-local ./agentbus-mcp-0.2.0.tgz
+./agentbus-local/node_modules/.bin/agentbus setup --client codex
+```
+
+`npx agentbus-mcp ...` 只有在包正式发布到 npm 后才可用；本版本不把它作为主安装路径。
 
 `setup` 会把 MCP 配置写进对应客户端的配置文件（先做带时间戳的备份），并打印改了哪些文件。支持的 id（核心 + 可选）：
 
@@ -43,11 +57,11 @@ npx agentbus-mcp setup --client codex
 可以一次配多个，或指定角色与 dispatch 权限：
 
 ```bash
-npx agentbus-mcp setup --client codex --client claude --client gemini
-npx agentbus-mcp setup --client codex --role conductor --allow-dispatch
-npx agentbus-mcp setup --list   # 看 id、label、format、路径、installed、optional；只读不写盘
-npx agentbus-mcp doctor         # 看当前配置状态
-npx agentbus-mcp clients        # 只列 id
+agentbus setup --client codex --client claude --client gemini
+agentbus setup --client codex --role conductor --allow-dispatch
+agentbus setup --list   # 看 id、label、format、路径、installed、optional；只读不写盘
+agentbus doctor         # 看当前配置状态
+agentbus clients        # 只列 id
 ```
 
 可选客户端未安装时默认跳过（不建目录）；显式传 `--client <id>` 才初始化。完整自动/手动矩阵（含 Trae / Qoder / CodeBuddy / VS Code / Zed / OpenClaw 及 DSH/Hermes 验证与回滚）：[`docs/CLIENTS.md`](docs/CLIENTS.md)。
@@ -55,7 +69,7 @@ npx agentbus-mcp clients        # 只列 id
 默认总线目录是 `~/.agentbus`，只有该目录下的文件能作为引用。实际项目请显式放行：
 
 ```bash
-npx agentbus-mcp setup --client codex --root ~/.agentbus --allow ~/projects/my-app
+agentbus setup --client codex --root ~/.agentbus --allow ~/projects/my-app
 ```
 
 配完**重启客户端**才生效——MCP 服务是启动时加载的。
@@ -162,6 +176,24 @@ Antigravity 是异步起会话的，`dispatch` 可能在任务还 `open` 时就�
 ```bash
 agentbus wait <task-id> --timeout 900
 ```
+
+如果宿主需要在任务完成后被自动唤醒，用 `watch`（单进程、单任务、只读、默认 5 秒一次）：
+
+```bash
+agentbus watch <task-id> --interval 5 --timeout 3600
+# done -> 0；failed/blocked/租约过期 -> 1；超时 -> 3
+# dispatch --watch 让派发进程一直活到同样的终态
+```
+
+`watch` 只输出一行 JSON，不依赖 TTY/readline，不起 daemon，只做任务主键查询。宿主可以把它作为受监督的后台进程，退出时发通知。
+
+新机器接线前先跑只读预检：
+
+```bash
+agentbus doctor --bootstrap --root ~/.agentbus --json
+```
+
+它会检查 Node/sqlite、总线根、allowed roots、`agents.json`、客户端二进制、可选的反重力 CDP、旧 MCP 进程；不会改配置、不会杀进程。
 
 通过 MCP 调用时，`bus_task_dispatch` 最多阻塞 20 秒就返回（很多客户端对单次工具调用有超时），接着调 `bus_task_wait` 等总线即可——它只查状态、不起进程，可以放心长等。
 
@@ -276,6 +308,7 @@ AGENTBUS_ARCHIVE_ON_DONE=1                          # 单次运行临时开启
 - **CLI 提示目前是中文。** 英文/多语言在路线图上；MCP 返回是 JSON，与语言无关。
 - **没有后台守护进程。** 租约过期在下一次读/写时惰性回收。
 - **要求 Node ≥ 22.5**，因为 SQLite 来自 `node:sqlite`。
+- **当前先走离线 tarball。** npm 尚未发布，`npx agentbus-mcp` 不是本版本支持的安装方式。干净机器清单和分层边界见 [`docs/PORTABILITY.md`](docs/PORTABILITY.md)。
 
 ---
 
@@ -295,7 +328,7 @@ AGENTBUS_ARCHIVE_ON_DONE=1                          # 单次运行临时开启
 ## 开发
 
 ```bash
-git clone https://github.com/USERNAME/agentbus.git
+git clone https://github.com/dfggg121/agentbus.git
 cd agentbus
 node test/accept.mjs     # 自包含验收测试套件
 ```

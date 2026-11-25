@@ -14,13 +14,14 @@ import {
   readTaskRef,
   completeTask,
   failTask,
+  recoverTask,
   verifyTasks,
   addTaskMessage,
   listTaskMessages,
 } from '../src/tasks.js';
 import { startMcpStdio, startMcpHttp } from '../src/mcp.js';
-import { setupClients, doctor, listClients, describeClients, defaultRoot } from '../src/setup.js';
-import { dispatchTask, dispatchEnabled, waitForTask, maybeArchiveTask, checkArchiveGuard } from '../src/dispatch.js';
+import { setupClients, doctor, doctorFix, doctorBootstrap, listClients, describeClients, defaultRoot } from '../src/setup.js';
+import { dispatchTask, dispatchEnabled, waitForTask, watchTask, maybeArchiveTask, checkArchiveGuard } from '../src/dispatch.js';
 import { exportAgySession, defaultAgySessionPath, archiveConversation } from '../src/agy.js';
 import { loadContextLedger, confirmDecision } from '../src/context.js';
 import { detectAgents, readAgentConfig, writeAgentConfig } from '../src/agents.js';
@@ -91,13 +92,20 @@ function parseKvList(list, flagName) {
   return obj;
 }
 
+function resolveCliRole() {
+  const raw = String(process.env.AGENTBUS_ROLE || '').trim().toLowerCase();
+  if (!raw || raw === 'all') return 'all';
+  if (raw === 'conductor') return 'conductor';
+  return 'worker';
+}
+
 function printHelp() {
   const help = {
     name: 'agentbus',
     version: VERSION,
     commands: [
-      'setup [--client <id>]... [--root <dir>] [--allow <dir>]... [--bin node|npx] [--home <dir>] [--role conductor|worker] [--allow-dispatch] [--list] [--require-config-dir] [--dry-run]',
-      'doctor [--root <dir>] [--home <dir>]',
+      'setup [--client <id>]... [--root <dir>] [--allow <dir>]... [--bin node|npx] [--home <dir>] [--role conductor|worker] [--allow-dispatch] [--repair] [--list] [--require-config-dir] [--dry-run]',
+      'doctor [--root <dir>] [--home <dir>] [--fix] [--bootstrap [--check-archive] [--port <port>] [--cwd <dir>]] [--allow <dir>]... [--role conductor|worker] [--allow-dispatch] [--json]',
       'version',
       'init [--root <dir>]',
       'put <path> [--as <name>] [--by <agent>] [--root <dir>]',
@@ -108,19 +116,21 @@ function printHelp() {
       'ref <id> --name <name> [--max <bytes>] [--encoding utf8|base64] [--by <agent>]',
       'done <id> --by <agent> --lease <token> --result <path> [--field k=v]...',
       'fail <id> --by <agent> --lease <token> --reason "..."',
+      'recover <id> --by <agent> --action retry|release|fail|reassign|adopt [--reason "..."] [--to <agent>] [--result <path>] [--allow-drift] [--field k=v]...',
       'message <id> --by <agent> --body "..." [--kind note|progress|question|blocked|answer|error] [--to <agent>] [--lease <token>]',
       'inbox <id> [--for <agent>] [--since <seq>] [--mark-read] [--limit <n>]',
       'verify [--task <id>]',
       'list [--state <state>] [--to <agent>] [--limit <n>]',
-      'dispatch <id> [--cwd <dir>] [--wait <seconds>] [--thread <name>] [--allow-dispatch]',
+      'dispatch <id> [--cwd <dir>] [--wait <seconds>] [--thread <name>] [--allow-dispatch] [--watch [--interval <seconds>] [--timeout <seconds>]]',
       'wait <id> [--timeout <seconds>]   # 等异步 agent 把任务做完',
+      'watch <id> [--root <dir>] [--interval 5] [--timeout 3600] [--json]   # 只读低开销单任务监视（无 TTY 依赖）',
       'context <thread> | context confirm <thread> <decision-id> --by <agent> [--evidence <sha256>]',
       'archive [<conversation-id>] [--port <port>] [--title-prefix <prefix>] [--title-contains <text>] [--dry-run] [--force]',
       'onboard [--conductor <agent>] [--model <agent>=<id>]... [--archive-on-done] [--yes] [--dry-run] [--root <dir>] [--home <dir>] [--allow <dir>]...   # 探测本机 agent 并写好通信配置',
       'agy-session [--out <file>]   # 在 Antigravity 集成终端里运行，导出会话地址与令牌',
       'mcp [--root <dir>] [--http 127.0.0.1:<port>]',
     ],
-    exit_codes: { '0': 'success', '1': 'validation/arg/drift error', '2': 'state/lease disallowed' },
+    exit_codes: { '0': 'success', '1': 'validation/arg/drift or watch failed/blocked/stalled', '2': 'state/lease disallowed or bootstrap command error', '3': 'watch timeout' },
   };
   process.stdout.write(JSON.stringify(help, null, 2) + '\n');
 }
@@ -134,11 +144,12 @@ async function main() {
     process.exit(0);
   }
 
+  const isBootstrap = cmd === 'doctor' && args.bootstrap === true;
   if (args.root === true || (typeof args.root === 'string' && !args.root.trim())) {
-    throw Object.assign(new Error('缺少 --root <dir> 参数值'), { code: 1 });
+    throw Object.assign(new Error('缺少 --root <dir> 参数值'), { code: isBootstrap ? 2 : 1 });
   }
   if (args.home === true || (typeof args.home === 'string' && !args.home.trim())) {
-    throw Object.assign(new Error('缺少 --home <dir> 参数值'), { code: 1 });
+    throw Object.assign(new Error('缺少 --home <dir> 参数值'), { code: isBootstrap ? 2 : 1 });
   }
 
   const rootOverride = typeof args.root === 'string' ? args.root : null;
@@ -156,14 +167,88 @@ async function main() {
   }
 
   if (cmd === 'doctor') {
+    if (args.bootstrap === true) {
+      try {
+        if (args.port !== undefined && (args.port === true || !Number.isInteger(Number(args.port)) || Number(args.port) <= 0 || Number(args.port) > 65535)) {
+          throw Object.assign(new Error(`非法 --port 参数: ${args.port}`), { code: 2 });
+        }
+        if (args.cwd === true) {
+          throw Object.assign(new Error('缺少 --cwd <dir> 参数值'), { code: 2 });
+        }
+        const report = await doctorBootstrap({
+          root: rootOverride,
+          home: homeOverride,
+          cwd: typeof args.cwd === 'string' ? args.cwd : process.cwd(),
+          checkArchive: args['check-archive'] === true,
+          cdpPort: args.port !== undefined ? Number(args.port) : null,
+        });
+        process.stdout.write(JSON.stringify(report, null, 2) + '\n');
+        process.exit(report.ok ? 0 : 1);
+      } catch (err) {
+        process.stderr.write(JSON.stringify({ error: String(err?.message || err), code: 2 }) + '\n');
+        process.exit(2);
+      }
+    }
+    if (args.fix === true) {
+      const rawRole = typeof args.role === 'string' ? args.role.trim().toLowerCase() : null;
+      const role = rawRole ? (rawRole === 'conductor' ? 'conductor' : 'worker') : null;
+      const allowDispatch = args['allow-dispatch'] === true ? true : undefined;
+      const report = doctorFix({
+        root: rootOverride,
+        home: homeOverride,
+        allowed: args.allow,
+        bin: typeof args.bin === 'string' ? args.bin : 'node',
+        role,
+        allowDispatch,
+        clients: args.client,
+        dryRun: !!args['dry-run'],
+      });
+      process.stdout.write(JSON.stringify(report, null, 2) + '\n');
+      process.exit(0);
+    }
     const report = doctor({ root: rootOverride, home: homeOverride });
     process.stdout.write(JSON.stringify(report, null, 2) + '\n');
     process.exit(0);
   }
 
+  if (cmd === 'watch') {
+    if (args.interval === true) {
+      throw Object.assign(new Error('缺少 --interval <seconds> 参数值'), { code: 1 });
+    }
+    if (args.timeout === true) {
+      throw Object.assign(new Error('缺少 --timeout <seconds> 参数值'), { code: 1 });
+    }
+    const res = await watchTask({
+      rootOverride,
+      id: args._[1],
+      interval_s: args.interval !== undefined ? Number(args.interval) : 5,
+      timeout_s: args.timeout !== undefined ? Number(args.timeout) : 3600,
+    });
+    process.stdout.write(JSON.stringify(res) + '\n');
+    const code = res.state === 'done' ? 0 : (res.timed_out ? 3 : 1);
+    process.exit(code);
+  }
+
   if (cmd === 'setup') {
     if (args.list) {
       process.stdout.write(JSON.stringify({ ok: true, clients: describeClients({ home: homeOverride }) }, null, 2) + '\n');
+      process.exit(0);
+    }
+    if (args.repair === true) {
+      const rawRole = typeof args.role === 'string' ? args.role.trim().toLowerCase() : null;
+      const role = rawRole ? (rawRole === 'conductor' ? 'conductor' : 'worker') : null;
+      const allowDispatch = args['allow-dispatch'] === true ? true : undefined;
+      const report = doctorFix({
+        root: rootOverride,
+        home: homeOverride,
+        allowed: args.allow,
+        bin: typeof args.bin === 'string' ? args.bin : 'node',
+        role,
+        allowDispatch,
+        clients: args.client,
+        dryRun: !!args['dry-run'],
+      });
+      process.stdout.write(JSON.stringify(report, null, 2) + '\n');
       process.exit(0);
     }
     try {
@@ -333,8 +418,26 @@ async function main() {
         break;
       }
 
+      case 'recover': {
+        const extraFields = args.field.length > 0 ? parseKvList(args.field, '--field') : null;
+        result = recoverTask(bus, {
+          id: args._[1],
+          by: typeof args.by === 'string' ? args.by : '',
+          action: typeof args.action === 'string' ? args.action : '',
+          reason: typeof args.reason === 'string' ? args.reason : null,
+          to: typeof args.to === 'string' ? args.to : null,
+          result_path: typeof args.result === 'string' ? args.result : null,
+          allow_ref_drift: args['allow-drift'] === true || args['allow-drift'] === 'true',
+          role: resolveCliRole(),
+          fields: extraFields,
+        });
+        if (result.state === 'done') {
+          await maybeArchiveTask(bus, result.id);
+        }
+        break;
+      }
+
       case 'message': {
-        const envRole = String(process.env.AGENTBUS_ROLE || '').trim().toLowerCase();
         result = addTaskMessage(bus, {
           id: args._[1],
           from: typeof args.by === 'string' ? args.by : process.env.AGENTBUS_AGENT,
@@ -342,20 +445,19 @@ async function main() {
           kind: typeof args.kind === 'string' ? args.kind : 'note',
           body: typeof args.body === 'string' ? args.body : '',
           lease_token: typeof args.lease === 'string' ? args.lease : null,
-          role: envRole || 'all',
+          role: resolveCliRole(),
         });
         break;
       }
 
       case 'inbox': {
-        const envRole = String(process.env.AGENTBUS_ROLE || '').trim().toLowerCase();
         result = listTaskMessages(bus, {
           id: args._[1],
           for_agent: typeof args.for === 'string' ? args.for : null,
           since_id: args.since !== undefined && args.since !== true ? Number(args.since) : 0,
           mark_read: args['mark-read'] === true || args['mark-read'] === 'true',
           limit: args.limit !== undefined && args.limit !== true ? Number(args.limit) : 100,
-          role: envRole || 'all',
+          role: resolveCliRole(),
         });
         break;
       }
@@ -563,12 +665,24 @@ async function main() {
         if (!dispatchEnabled(args['allow-dispatch'] === true)) {
           throw Object.assign(new Error('dispatch 未启用：加 --allow-dispatch 或设置 AGENTBUS_ENABLE_DISPATCH=1'), { code: 1 });
         }
+        if (args.interval === true) {
+          throw Object.assign(new Error('缺少 --interval <seconds> 参数值'), { code: 1 });
+        }
+        if (args.timeout === true) {
+          throw Object.assign(new Error('缺少 --timeout <seconds> 参数值'), { code: 1 });
+        }
         const ids = args._.slice(1);
+        const watchMode = args.watch === true || args.watch === 'true';
         const opts = {
           cwd: typeof args.cwd === 'string' ? args.cwd : null,
           wait_s: args.wait !== undefined ? Number(args.wait) : 600,
           thread: typeof args.thread === 'string' ? args.thread : null,
           force: args.force === true,
+          ...(watchMode ? {
+            watch: true,
+            watch_interval_s: args.interval !== undefined ? Number(args.interval) : 5,
+            watch_timeout_s: args.timeout !== undefined ? Number(args.timeout) : 3600,
+          } : {}),
         };
         if (ids.length > 1) {
           // Fan-out: wall time is the slowest agent, not the sum.
@@ -578,11 +692,22 @@ async function main() {
             done: results.filter((r) => r.state === 'done').length,
             results,
           };
-          if (result.done !== results.length) exitCode = 1;
+          if (watchMode) {
+            if (result.done !== results.length) {
+              const onlyTimeouts = results.every((r) => r.state === 'done' || r.timed_out);
+              exitCode = onlyTimeouts ? 3 : 1;
+            }
+          } else if (result.done !== results.length) {
+            exitCode = 1;
+          }
           break;
         }
         result = await dispatchTask(bus, { id: ids[0], ...opts });
-        if (result.state !== 'done') exitCode = 1;
+        if (watchMode) {
+          exitCode = result.state === 'done' ? 0 : (result.timed_out ? 3 : 1);
+        } else if (result.state !== 'done') {
+          exitCode = 1;
+        }
         break;
       }
 
@@ -619,6 +744,7 @@ async function main() {
 }
 
 main().catch((err) => {
-  process.stderr.write(JSON.stringify({ error: String(err?.message || err), code: 1 }) + '\n');
-  process.exit(1);
+  const code = err?.code === 2 ? 2 : 1;
+  process.stderr.write(JSON.stringify({ error: String(err?.message || err), code }) + '\n');
+  process.exit(code);
 });
