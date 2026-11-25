@@ -249,6 +249,8 @@ Details and reporting: [`SECURITY.md`](SECURITY.md).
 | DeepSeek Harness (DSH) | `--client dsh` (optional) | Cordis YAML block + parser check |
 | Hermes Agent | `--client hermes` (optional) | `hermes mcp add` + `mcp list` |
 
+> **Hermes config path:** `%LOCALAPPDATA%\hermes\config.yaml` on Windows (falling back to `%USERPROFILE%\.hermes\config.yaml`), `~/.hermes/config.yaml` on macOS/Linux, or `$HERMES_HOME/config.yaml` when `HERMES_HOME` is set.
+
 Any MCP client that speaks stdio JSON-RPC works; `setup` automates these 13 clients, and [`docs/CLIENTS.md`](docs/CLIENTS.md) covers manual setup for Trae, Qoder, CodeBuddy, VS Code, Zed, and OpenClaw as well as DSH/Hermes verification and rollback.
 
 ---

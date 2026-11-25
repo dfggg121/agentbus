@@ -24,7 +24,7 @@ Core clients (`optional: false`) are always targeted when running `agentbus setu
 | `lmstudio` | LM Studio | `~/.lmstudio/mcp.json` | `json-mcpServers` | Yes | Yes | `agentbus setup --client lmstudio` |
 | `cline` | Cline | VS Code ext: `<Code>/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`<br>CLI fallback: `~/.cline/data/settings/cline_mcp_settings.json` | `json-mcpServers` | Yes | Yes (IDE reload) | `agentbus setup --client cline` |
 | `dsh` | DeepSeek Harness (DSH) | `~/.dsh/profiles/desktop/cordis.patch.yml` | `dsh-cordis` | Yes | **Yes** (`setup` never restarts DSH) | `agentbus setup --client dsh` |
-| `hermes` | Hermes Agent | `~/.hermes/config.yaml` (via `hermes mcp add`) | `hermes-cli` | Yes | No (next `hermes` run) | `agentbus setup --client hermes` |
+| `hermes` | Hermes Agent | Win: `%LOCALAPPDATA%\hermes\config.yaml` (fallback `%USERPROFILE%\.hermes\config.yaml`)<br>macOS/Linux: `~/.hermes/config.yaml`<br>Override: `$HERMES_HOME/config.yaml` (via `hermes mcp add`) | `hermes-cli` | Yes | No (next `hermes` run) | `agentbus setup --client hermes` |
 
 ### Role & Dispatch Flags
 
@@ -102,6 +102,12 @@ Then manually restart DSH so it reloads `cordis.patch.yml` (`setup` never restar
 
 `setup --client hermes` does **not** edit `config.yaml` directly; it invokes `hermes mcp add agentbus ...` with non-interactive confirmation (`y\n`), checks for an existing `agentbus` entry first to stay idempotent, isolates state with `HERMES_HOME` when `--home <dir>` is passed, and verifies registration via `hermes mcp list`.
 
+Default config path resolution (override with `HERMES_HOME`):
+
+- **Windows:** `%LOCALAPPDATA%\hermes\config.yaml` (falls back to `%USERPROFILE%\.hermes\config.yaml` if not present)
+- **macOS / Linux:** `~/.hermes/config.yaml`
+- **Override:** `$HERMES_HOME/config.yaml` (when `--home <dir>` is passed, `HERMES_HOME` is isolated inside `<dir>`)
+
 **Verify:**
 
 ```bash
@@ -122,5 +128,6 @@ HERMES_HOME=/tmp/fake-home/.hermes hermes mcp list
 hermes mcp remove agentbus
 
 # Or restore the timestamped backup if one was created:
-# ~/.hermes/config.yaml.bak-<timestamp> -> ~/.hermes/config.yaml
+# Win:   %LOCALAPPDATA%\hermes\config.yaml.bak-<timestamp> -> %LOCALAPPDATA%\hermes\config.yaml
+# Linux/macOS: ~/.hermes/config.yaml.bak-<timestamp> -> ~/.hermes/config.yaml
 ```

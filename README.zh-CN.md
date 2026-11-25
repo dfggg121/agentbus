@@ -261,6 +261,8 @@ AGENTBUS_ARCHIVE_ON_DONE=1                          # 单次运行临时开启
 | DeepSeek Harness (DSH) | `--client dsh`（可选） | Cordis YAML 块 + 解析校验 |
 | Hermes Agent | `--client hermes`（可选） | `hermes mcp add` + `mcp list` |
 
+> **Hermes 配置路径：** Windows 默认 `%LOCALAPPDATA%\hermes\config.yaml`（不存在时回退 `%USERPROFILE%\.hermes\config.yaml`），macOS/Linux 为 `~/.hermes/config.yaml`，设置 `HERMES_HOME` 时优先使用 `$HERMES_HOME/config.yaml`。
+
 任何说 stdio JSON-RPC 的 MCP 客户端都能用；`setup` 自动化以上 13 家，Trae / Qoder / CodeBuddy / VS Code / Zed / OpenClaw 的手动步骤以及 DSH / Hermes 验证与回滚见 [`docs/CLIENTS.md`](docs/CLIENTS.md)。
 
 ---

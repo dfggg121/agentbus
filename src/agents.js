@@ -66,7 +66,58 @@ const DEFS = [
   },
 ];
 
-export function clientConfigFile(id, home = os.homedir(), platform = process.platform) {
+export function hermesPaths(home = os.homedir(), opts = {}) {
+  const h = path.resolve(home || os.homedir());
+  const platform = opts.platform || process.platform;
+  const env = opts.env || process.env;
+  const explicitHome = opts.explicitHome !== undefined
+    ? Boolean(opts.explicitHome)
+    : (home !== undefined && home !== null && path.resolve(home) !== path.resolve(os.homedir()));
+
+  const dotHermes = path.join(h, '.hermes');
+  const dotCfg = path.join(dotHermes, 'config.yaml');
+
+  if (explicitHome) {
+    if (platform === 'win32') {
+      const localHermes = path.join(h, 'AppData', 'Local', 'hermes');
+      const localCfg = path.join(localHermes, 'config.yaml');
+      if (fs.existsSync(localCfg)) return { hermesHome: localHermes, file: localCfg };
+      if (fs.existsSync(dotCfg) || fs.existsSync(dotHermes)) return { hermesHome: dotHermes, file: dotCfg };
+      if (fs.existsSync(localHermes)) return { hermesHome: localHermes, file: localCfg };
+    } else if (fs.existsSync(dotHermes)) {
+      return { hermesHome: dotHermes, file: dotCfg };
+    }
+    const directCfg = path.join(h, 'config.yaml');
+    if (fs.existsSync(directCfg)) {
+      return { hermesHome: h, file: directCfg };
+    }
+    return { hermesHome: dotHermes, file: dotCfg };
+  }
+
+  const envHermesHome = env.HERMES_HOME && String(env.HERMES_HOME).trim();
+  if (envHermesHome) {
+    const dir = path.resolve(envHermesHome);
+    return { hermesHome: dir, file: path.join(dir, 'config.yaml') };
+  }
+
+  if (platform === 'win32') {
+    const localAppData = env.LOCALAPPDATA && String(env.LOCALAPPDATA).trim()
+      ? path.resolve(String(env.LOCALAPPDATA).trim())
+      : path.join(h, 'AppData', 'Local');
+    const localHermes = path.join(localAppData, 'hermes');
+    const localCfg = path.join(localHermes, 'config.yaml');
+    if (fs.existsSync(localCfg)) return { hermesHome: localHermes, file: localCfg };
+    if (fs.existsSync(dotCfg)) return { hermesHome: dotHermes, file: dotCfg };
+    if (fs.existsSync(localHermes) && !fs.existsSync(dotHermes)) {
+      return { hermesHome: localHermes, file: localCfg };
+    }
+    return { hermesHome: dotHermes, file: dotCfg };
+  }
+
+  return { hermesHome: dotHermes, file: dotCfg };
+}
+
+export function clientConfigFile(id, home = os.homedir(), platform = process.platform, opts = {}) {
   const h = path.resolve(home || os.homedir());
   switch (id) {
     case 'codex':
@@ -115,13 +166,8 @@ export function clientConfigFile(id, home = os.homedir(), platform = process.pla
     }
     case 'dsh':
       return path.join(h, '.dsh', 'profiles', 'desktop', 'cordis.patch.yml');
-    case 'hermes': {
-      const dotHermes = path.join(h, '.hermes');
-      if (fs.existsSync(dotHermes)) return path.join(dotHermes, 'config.yaml');
-      const directCfg = path.join(h, 'config.yaml');
-      if (fs.existsSync(directCfg)) return directCfg;
-      return path.join(dotHermes, 'config.yaml');
-    }
+    case 'hermes':
+      return hermesPaths(h, { platform, explicitHome: opts.explicitHome, env: opts.env }).file;
     default:
       return null;
   }
@@ -424,7 +470,7 @@ export function detectAgents(home = os.homedir(), opts = {}) {
 
   return DEFS.map((d) => {
     const binRes = resolveAgentBin(d.id, { home: resolvedHome, env, platform, explicitHome });
-    const cfg = clientConfigFile(d.id, resolvedHome, platform);
+    const cfg = clientConfigFile(d.id, resolvedHome, platform, { explicitHome, env });
     const cfgDir = path.dirname(cfg);
     const configExists = fs.existsSync(cfg);
     const configDirExists = fs.existsSync(cfgDir);

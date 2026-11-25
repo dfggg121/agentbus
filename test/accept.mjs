@@ -6,6 +6,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
@@ -2084,6 +2085,199 @@ async function main() {
       readmeZh79.includes('docs/CLIENTS.md') &&
       noPersonalPref79,
       `setupIds=${JSON.stringify(coreSetupIds79)} configured=${coreAllConfigured79} docs=${allDocsExist79} noPref=${noPersonalPref79}`);
+
+    // 80. Hermes 默认路径解析（Windows AppData/Local/hermes/config.yaml + 回退 .hermes + setup --list）
+    const { hermesPaths: resolveHermesPaths, clientConfigFile: resolveCfgFile } = await import('../src/agents.js');
+    const { describeClients: describeSetupClients } = await import('../src/setup.js');
+    const hermesWin80 = path.join(RUN_BASE, 'hermes_win_80');
+    const hermesWinCfg80 = path.join(hermesWin80, 'AppData', 'Local', 'hermes', 'config.yaml');
+    fs.mkdirSync(path.dirname(hermesWinCfg80), { recursive: true });
+    fs.writeFileSync(hermesWinCfg80, 'mcp_servers:\n  keep: {}\n', 'utf8');
+
+    const hermesEmpty80 = path.join(RUN_BASE, 'hermes_empty_80');
+    fs.mkdirSync(hermesEmpty80, { recursive: true });
+
+    const envNoHermes80 = { ...process.env };
+    delete envNoHermes80.HERMES_HOME;
+
+    // Direct cross-platform path resolution checks (unified src/agents.js + src/setup.js)
+    const winLocalRes80 = resolveHermesPaths(hermesWin80, {
+      platform: 'win32',
+      explicitHome: false,
+      env: { LOCALAPPDATA: path.join(hermesWin80, 'AppData', 'Local') },
+    });
+    const winCfgFile80 = resolveCfgFile('hermes', hermesWin80, 'win32', {
+      explicitHome: false,
+      env: { LOCALAPPDATA: path.join(hermesWin80, 'AppData', 'Local') },
+    });
+    const winFallbackRes80 = resolveHermesPaths(hermesEmpty80, {
+      platform: 'win32',
+      explicitHome: false,
+      env: { LOCALAPPDATA: path.join(hermesEmpty80, 'AppData', 'Local') },
+    });
+    const posixRes80 = resolveHermesPaths(hermesWin80, { platform: 'linux', explicitHome: false, env: {} });
+    const winDescribe80 = describeSetupClients({
+      home: hermesWin80,
+      platform: 'win32',
+      env: {},
+    }).find((c) => c.id === 'hermes');
+
+    // CLI setup --list without HERMES_HOME (using --home fake home with AppData/Local/hermes/config.yaml)
+    const cliListHome80 = spawnSync(process.execPath, [BUS_BIN, 'setup', '--list', '--home', hermesWin80], {
+      cwd: PKG_ROOT,
+      encoding: 'utf8',
+      env: envNoHermes80,
+    });
+    let listHomeJson80 = null;
+    try { listHomeJson80 = JSON.parse(cliListHome80.stdout); } catch {}
+    const listHermesHome80 = listHomeJson80?.clients?.find((c) => c.id === 'hermes');
+
+    let cliEnvDefaultOk80 = true;
+    let cliEnvDefaultDetail80 = 'skipped-non-win32';
+    if (process.platform === 'win32') {
+      const envWinDef80 = {
+        ...envNoHermes80,
+        HOME: hermesWin80,
+        USERPROFILE: hermesWin80,
+        LOCALAPPDATA: path.join(hermesWin80, 'AppData', 'Local'),
+      };
+      const cliListDef80 = spawnSync(process.execPath, [BUS_BIN, 'setup', '--list'], {
+        cwd: PKG_ROOT,
+        encoding: 'utf8',
+        env: envWinDef80,
+      });
+      let listDefJson80 = null;
+      try { listDefJson80 = JSON.parse(cliListDef80.stdout); } catch {}
+      const listDefHermes80 = listDefJson80?.clients?.find((c) => c.id === 'hermes');
+      cliEnvDefaultOk80 = cliListDef80.status === 0 &&
+        listDefHermes80?.installed === true &&
+        listDefHermes80?.config === hermesWinCfg80 &&
+        listHermesHome80?.installed === true &&
+        listHermesHome80?.config === hermesWinCfg80;
+      cliEnvDefaultDetail80 = `defInst=${listDefHermes80?.installed} defCfg=${listDefHermes80?.config} homeInst=${listHermesHome80?.installed} homeCfg=${listHermesHome80?.config}`;
+    }
+
+    assertCase(80, 'Hermes 默认路径（Windows AppData/Local/hermes/config.yaml + 回退 .hermes + 无 HERMES_HOME setup --list）',
+      winLocalRes80.file === hermesWinCfg80 &&
+      winCfgFile80 === hermesWinCfg80 &&
+      winFallbackRes80.file === path.join(hermesEmpty80, '.hermes', 'config.yaml') &&
+      posixRes80.file === path.join(hermesWin80, '.hermes', 'config.yaml') &&
+      winDescribe80?.installed === true &&
+      winDescribe80?.config === hermesWinCfg80 &&
+      cliListHome80.status === 0 &&
+      cliEnvDefaultOk80,
+      `winFile=${winLocalRes80.file} fallback=${winFallbackRes80.file} desc=${winDescribe80?.installed}:${winDescribe80?.config} ${cliEnvDefaultDetail80}`);
+
+    // 81. Hermes --home 隔离不变（不读写真实配置 sha256，覆盖 HERMES_HOME）且默认不强行注入 HERMES_HOME
+    const realHermesCandidates81 = [
+      process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'hermes', 'config.yaml') : null,
+      path.join(os.homedir(), '.hermes', 'config.yaml'),
+      process.env.HERMES_HOME ? path.join(process.env.HERMES_HOME, 'config.yaml') : null,
+    ].filter(Boolean);
+    const realHashesBefore81 = realHermesCandidates81.map((p) => [p, fs.existsSync(p) ? sha256(p) : null]);
+
+    const hermesTrap81 = path.join(RUN_BASE, 'hermes_trap_81');
+    const hermesTrapCfg81 = path.join(hermesTrap81, 'config.yaml');
+    fs.mkdirSync(hermesTrap81, { recursive: true });
+    const trapOrig81 = 'mcp_servers:\n  trap_only:\n    command: echo\n';
+    fs.writeFileSync(hermesTrapCfg81, trapOrig81, 'utf8');
+
+    const hermesIso81 = path.join(RUN_BASE, 'hermes_iso_81');
+    const hermesIsoRoot81 = path.join(RUN_BASE, 'hermes_iso_root_81');
+    const hermesIsoAllow81 = path.join(RUN_BASE, 'hermes_iso_allow_81');
+    fs.mkdirSync(hermesIsoAllow81, { recursive: true });
+    if (process.platform === 'win32') {
+      const isoLocalCfg81 = path.join(hermesIso81, 'AppData', 'Local', 'hermes', 'config.yaml');
+      fs.mkdirSync(path.dirname(isoLocalCfg81), { recursive: true });
+      fs.writeFileSync(isoLocalCfg81, 'mcp_servers:\n  keep: {}\n', 'utf8');
+    }
+
+    // --home must override HERMES_HOME trap and leave real configs untouched
+    const isoList81 = runCli(['setup', '--list', '--home', hermesIso81], {
+      root: hermesIsoRoot81,
+      allowed: hermesIsoAllow81,
+      envExtra: { HERMES_HOME: hermesTrap81 },
+    });
+    const isoSetup81 = runCli(['setup', '--client', 'hermes', '--home', hermesIso81, '--allow', hermesIsoAllow81], {
+      root: hermesIsoRoot81,
+      allowed: hermesIsoAllow81,
+      envExtra: { HERMES_HOME: hermesTrap81, AGENTBUS_HERMES_BIN: fakeHermesBin, FAKE_HERMES_LOG: hermesCallLog },
+    });
+    const isoListHermes81 = isoList81.json?.clients?.find((c) => c.id === 'hermes');
+    const isoSetupRes81 = isoSetup81.json?.results?.[0];
+    const expectedIsoCfg81 = process.platform === 'win32'
+      ? path.join(hermesIso81, 'AppData', 'Local', 'hermes', 'config.yaml')
+      : path.join(hermesIso81, '.hermes', 'config.yaml');
+
+    // Non---home applyHermes must NOT inject HERMES_HOME into child process env
+    const hermesNoHomeBase81 = path.join(RUN_BASE, 'hermes_no_home_81');
+    const hermesNoHomeCfg81 = process.platform === 'win32'
+      ? path.join(hermesNoHomeBase81, 'AppData', 'Local', 'hermes', 'config.yaml')
+      : path.join(hermesNoHomeBase81, '.hermes', 'config.yaml');
+    fs.mkdirSync(path.dirname(hermesNoHomeCfg81), { recursive: true });
+    fs.writeFileSync(hermesNoHomeCfg81, 'mcp_servers:\n  existing:\n    command: echo\n', 'utf8');
+    const noHomeProbeLog81 = path.join(RUN_BASE, 'hermes_no_home_probe_81.jsonl');
+    const fakeHermesNoHomeJs81 = path.join(RUN_BASE, 'fake_hermes_nohome_81.mjs');
+    fs.writeFileSync(fakeHermesNoHomeJs81, [
+      "import fs from 'node:fs';",
+      "import path from 'node:path';",
+      "const argv = process.argv.slice(2);",
+      "const hasHermesHome = Object.prototype.hasOwnProperty.call(process.env, 'HERMES_HOME');",
+      "fs.appendFileSync(process.env.NOHOME_LOG, JSON.stringify({ argv, hasHermesHome }) + '\\n', 'utf8');",
+      "const cfg = process.env.TARGET_CFG_81;",
+      "if (argv[0] === 'mcp' && argv[1] === 'add') {",
+      "  const prev = fs.existsSync(cfg) ? fs.readFileSync(cfg, 'utf8') : '';",
+      "  fs.writeFileSync(cfg, prev.trimEnd() + '\\n  agentbus:\\n    command: node\\n', 'utf8');",
+      "  process.exit(0);",
+      "}",
+      "if (argv[0] === 'mcp' && argv[1] === 'list') {",
+      "  const txt = fs.existsSync(cfg) ? fs.readFileSync(cfg, 'utf8') : '';",
+      "  console.log(/\\bagentbus\\s*:/.test(txt) ? 'agentbus (stdio)' : 'No MCP servers');",
+      "  process.exit(0);",
+      "}",
+      "process.exit(1);",
+    ].join('\n'), 'utf8');
+    const fakeHermesNoHomeBin81 = path.join(RUN_BASE, process.platform === 'win32' ? 'hermes_nohome_81.cmd' : 'hermes_nohome_81');
+    if (process.platform === 'win32') {
+      fs.writeFileSync(fakeHermesNoHomeBin81, `@echo off\r\n"${process.execPath}" "%~dp0fake_hermes_nohome_81.mjs" %*\r\n`, 'utf8');
+    } else {
+      fs.writeFileSync(fakeHermesNoHomeBin81, `#!/bin/sh\nexec "${process.execPath}" "${fakeHermesNoHomeJs81}" "$@"\n`, { mode: 0o755 });
+    }
+    const envNoHome81 = {
+      ...process.env,
+      HOME: hermesNoHomeBase81,
+      USERPROFILE: hermesNoHomeBase81,
+      LOCALAPPDATA: path.join(hermesNoHomeBase81, 'AppData', 'Local'),
+      AGENTBUS_ALLOWED_ROOTS: hermesIsoAllow81,
+      AGENTBUS_HERMES_BIN: fakeHermesNoHomeBin81,
+      NOHOME_LOG: noHomeProbeLog81,
+      TARGET_CFG_81: hermesNoHomeCfg81,
+    };
+    delete envNoHome81.HERMES_HOME;
+    const noHomeSetup81 = spawnSync(process.execPath, [
+      BUS_BIN, 'setup', '--client', 'hermes', '--root', hermesIsoRoot81, '--allow', hermesIsoAllow81,
+    ], { cwd: PKG_ROOT, encoding: 'utf8', env: envNoHome81 });
+    let noHomeJson81 = null;
+    try { noHomeJson81 = JSON.parse(noHomeSetup81.stdout); } catch {}
+    const noHomeCalls81 = fs.existsSync(noHomeProbeLog81)
+      ? fs.readFileSync(noHomeProbeLog81, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l))
+      : [];
+    const realHashesUnchanged81 = realHashesBefore81.every(([p, h]) => (fs.existsSync(p) ? sha256(p) : null) === h);
+
+    assertCase(81, 'Hermes --home 隔离（真实配置 sha256 不变且覆盖 HERMES_HOME）与非 --home 不强行注入 HERMES_HOME',
+      isoList81.rc === 0 &&
+      isoListHermes81?.config === expectedIsoCfg81 &&
+      isoSetup81.rc === 0 &&
+      isoSetupRes81?.ok === true &&
+      isoSetupRes81?.file === expectedIsoCfg81 &&
+      fs.readFileSync(hermesTrapCfg81, 'utf8') === trapOrig81 &&
+      noHomeSetup81.status === 0 &&
+      noHomeJson81?.results?.[0]?.file === hermesNoHomeCfg81 &&
+      noHomeJson81?.results?.[0]?.backup && fs.existsSync(noHomeJson81.results[0].backup) &&
+      noHomeCalls81.length >= 2 &&
+      noHomeCalls81.every((c) => c.hasHermesHome === false) &&
+      realHashesUnchanged81,
+      `isoCfg=${isoSetupRes81?.file} noHomeRc=${noHomeSetup81.status} noHomeCalls=${JSON.stringify(noHomeCalls81)} realUnchanged=${realHashesUnchanged81}`);
   } finally {
     try { fs.rmSync(RUN_BASE, { recursive: true, force: true }); } catch {}
   }

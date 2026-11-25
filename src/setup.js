@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { clientConfigFile, resolveAgentBin } from './agents.js';
+import { clientConfigFile, hermesPaths, resolveAgentBin } from './agents.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BUS_BIN = path.resolve(HERE, '..', 'bin', 'bus.js');
@@ -354,30 +354,8 @@ function clineExtensionDir(home, platform) {
   return path.join(home, '.config', 'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev');
 }
 
-function hermesPaths(home, explicitHome, env = process.env) {
-  const h = path.resolve(home || os.homedir());
-  if (explicitHome) {
-    const dotHermes = path.join(h, '.hermes');
-    if (fs.existsSync(dotHermes)) {
-      return { hermesHome: dotHermes, file: path.join(dotHermes, 'config.yaml') };
-    }
-    const directCfg = path.join(h, 'config.yaml');
-    if (fs.existsSync(directCfg)) {
-      return { hermesHome: h, file: directCfg };
-    }
-    return { hermesHome: dotHermes, file: path.join(dotHermes, 'config.yaml') };
-  }
-  if (env.HERMES_HOME) {
-    const dir = path.resolve(env.HERMES_HOME);
-    return { hermesHome: dir, file: path.join(dir, 'config.yaml') };
-  }
-  const dotHermes = path.join(h, '.hermes');
-  return { hermesHome: dotHermes, file: path.join(dotHermes, 'config.yaml') };
-}
-
 function resolveClientConfigPath(id, home, platform, explicitHome, env) {
-  if (id === 'hermes') return hermesPaths(home, explicitHome, env).file;
-  return clientConfigFile(id, home, platform);
+  return clientConfigFile(id, home, platform, { explicitHome, env });
 }
 
 function clientInstalled(client, home, { platform = process.platform, explicitHome = false, env = process.env } = {}) {
@@ -396,8 +374,10 @@ function clientInstalled(client, home, { platform = process.platform, explicitHo
       case 'dsh':
         return fs.existsSync(path.join(h, '.dsh')) || fs.existsSync(cfg);
       case 'hermes': {
-        const hp = hermesPaths(h, explicitHome, env);
-        return fs.existsSync(hp.hermesHome) || fs.existsSync(hp.file);
+        const hp = hermesPaths(h, { platform, explicitHome, env });
+        return fs.existsSync(hp.hermesHome) ||
+          fs.existsSync(hp.file) ||
+          Boolean(findHermesExecutable(h, { platform, explicitHome, env }));
       }
       default:
         return fs.existsSync(cfg);
@@ -497,7 +477,8 @@ function mergeDshPatch(file, prev, spec) {
 function findExecutable(name, env, platform = process.platform) {
   const pathVar = env.PATH || env.Path || '';
   const exts = platform === 'win32' ? ['.exe', '.cmd', '.bat', ''] : [''];
-  for (const dir of pathVar.split(platform === 'win32' ? ';' : path.delimiter)) {
+  for (const rawDir of pathVar.split(platform === 'win32' ? ';' : path.delimiter)) {
+    const dir = rawDir.trim().replace(/^"(.*)"$/, '$1');
     if (!dir) continue;
     for (const ext of exts) {
       const candidate = path.join(dir, name + ext);
@@ -507,6 +488,38 @@ function findExecutable(name, env, platform = process.platform) {
     }
   }
   return null;
+}
+
+function findHermesExecutable(home, { platform = process.platform, explicitHome = false, env = process.env } = {}) {
+  const override = env.AGENTBUS_HERMES_BIN && String(env.AGENTBUS_HERMES_BIN).trim();
+  if (override) {
+    try {
+      if (fs.existsSync(override) && fs.statSync(override).isFile()) return override;
+    } catch {}
+    return null;
+  }
+  const h = path.resolve(home || os.homedir());
+  if (explicitHome) {
+    const fakeLocalBin = platform === 'win32'
+      ? path.join(h, 'AppData', 'Local', 'hermes', 'bin')
+      : path.join(h, '.local', 'bin');
+    return findExecutable('hermes', { PATH: fakeLocalBin }, platform);
+  }
+  const onPath = findExecutable('hermes', env, platform);
+  if (onPath) return onPath;
+  const commonBins = platform === 'win32'
+    ? [
+        path.join(
+          env.LOCALAPPDATA && String(env.LOCALAPPDATA).trim()
+            ? path.resolve(String(env.LOCALAPPDATA).trim())
+            : path.join(h, 'AppData', 'Local'),
+          'hermes',
+          'bin',
+        ),
+        path.join(h, '.local', 'bin'),
+      ]
+    : [path.join(h, '.local', 'bin'), '/usr/local/bin', '/opt/homebrew/bin'];
+  return findExecutable('hermes', { PATH: commonBins.join(platform === 'win32' ? ';' : path.delimiter) }, platform);
 }
 
 function hasHermesAgentbus(raw) {
@@ -562,8 +575,16 @@ function formatCmdPreview(bin, args) {
 }
 
 function applyHermes(spec, opts) {
-  const { hermesHome, file } = hermesPaths(opts.home, opts.explicitHome, opts.processEnv);
-  const bin = opts.processEnv.AGENTBUS_HERMES_BIN || findExecutable('hermes', opts.processEnv, opts.platform);
+  const { hermesHome, file } = hermesPaths(opts.home, {
+    platform: opts.platform,
+    explicitHome: opts.explicitHome,
+    env: opts.processEnv,
+  });
+  const bin = findHermesExecutable(opts.home, {
+    platform: opts.platform,
+    explicitHome: opts.explicitHome,
+    env: opts.processEnv,
+  });
   if (!bin) {
     throw makeDiagError(
       'missing_binary',
@@ -622,6 +643,10 @@ function applyHermes(spec, opts) {
     childEnv.HERMES_HOME = hermesHome;
     childEnv.HOME = opts.home;
     childEnv.USERPROFILE = opts.home;
+    if (opts.platform === 'win32') {
+      childEnv.LOCALAPPDATA = path.join(opts.home, 'AppData', 'Local');
+      childEnv.APPDATA = path.join(opts.home, 'AppData', 'Roaming');
+    }
   }
 
   if (fs.existsSync(hermesHome)) {
