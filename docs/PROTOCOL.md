@@ -133,19 +133,33 @@ Transport: newline-delimited JSON-RPC 2.0 over stdio (no `Content-Length` framin
 | Tool | Required | Optional |
 |---|---|---|
 | `bus_register` | `path` | `name`, `by` |
-| `bus_task_create` | `to`, `goal`, `refs` | `constraints`, `acceptance`, `from`, `idempotency_key` |
+| `bus_task_create` | `to`, `goal`, `refs` | `constraints`, `acceptance`, `from`, `idempotency_key`, `thread` |
 | `bus_task_claim` | `id`, `by` | `ttl_s` |
 | `bus_task_heartbeat` | `id`, `by`, `lease_token` | `ttl_s` |
-| `bus_ref_read` | `id`, `name` | `max_bytes`, `encoding` |
+| `bus_ref_read` | `id`, `name` | `max_bytes`, `encoding`, `by` |
 | `bus_task_complete` | `id`, `by`, `lease_token`, `result_path` | `fields` |
 | `bus_task_fail` | `id`, `by`, `lease_token`, `reason` | — |
 | `bus_task_list` | — | `state`, `to`, `limit` |
 | `bus_verify` | — | `id` |
 | `bus_task_dispatch` | starts the target agent CLI, then waits | `id`, `ids`, `cwd`, `wait_s` (default 3 over MCP), `thread`, `force` |
-| `bus_task_wait` | waits on bus state only (no process start) | `id`, `timeout_s` |
+| `bus_task_wait` | waits on bus state or new attention messages | `id`, `timeout_s`, `since_id` |
 | `bus_task_run` | create + dispatch in one call | `to`, `goal`, `refs`, `acceptance`, `cwd`, `wait_s`, `thread` |
+| `bus_task_message` | `id`, `by`, `body` | `kind`, `to`, `lease_token` |
+| `bus_task_inbox` | `id` | `for_agent`, `since_id`, `mark_read`, `limit` |
 
 `refs` accepts `["<sha256>", …]` or `[{"sha256": "...", "note": "..."}, …]`.
+
+`bus_task_claim` returns the full task envelope (`goal`, `constraints`, `refs`, `acceptance`, `from`, `created_at`, `attempt`, `blocked_at`, and `thread` when set) alongside `lease_token` and `lease_expires_at`, so `dispatch` prompts only pass a short pointer (`id=...`, `by=...`) and never inline `goal` text or shell-quoted payloads.
+
+### Bidirectional task messages
+
+`bus_task_message` (CLI: `agentbus message`) and `bus_task_inbox` (CLI: `agentbus inbox`) provide an in-task feedback channel stored in SQLite (`task_messages` table, never written into `tasks/<id>.json` envelopes):
+
+- `kind`: `note`, `progress`, `question`, `blocked`, `answer`, `error`.
+- **Lease guard**: when the current claimant (`claimed_by`) sends a message as a worker, a valid `lease_token` is required. The conductor/initiator may reply (`answer`) without a lease token.
+- **Attention & unblock**: `question`, `blocked`, or `error` sets `tasks.blocked_at` (and `bus_task_fail` / non-zero `dispatch` exit automatically record an `error` message). A conductor `answer` clears `blocked_at`.
+- **Early wakeup**: `bus_task_wait` returns early with `needs_attention: true` as soon as a new `question`, `blocked`, or `error` message (`seq > since_id`) arrives.
+- **Cursor & read tracking**: `bus_task_inbox` supports `for_agent`, `since_id`, `mark_read`, and returns `last_seq`, `blocked`, `blocked_at`, and `messages`.
 
 ### Threads
 
@@ -190,10 +204,10 @@ Write points: `done` (artifacts + proposals), `failed` (avoid only), and rotatio
 
 ### Roles
 
-`AGENTBUS_ROLE` (set by `agentbus onboard`, or by hand) trims the surface:
+`AGENTBUS_ROLE` (set by `agentbus setup --role` or `agentbus onboard`, or by hand) trims the surface:
 
-- `conductor` / unset: all eleven tools.
-- `worker`: `bus_register`, `bus_task_claim`, `bus_task_heartbeat`, `bus_ref_read`, `bus_task_complete`, `bus_task_fail`. Calls to `bus_task_create`, `bus_task_list`, `bus_verify` or `bus_task_dispatch` are rejected with `isError: true`, so a dispatched agent cannot spawn its own fan-out.
+- `conductor` / `all` / unset: all 14 tools.
+- `worker` (or any unrecognized role, falling back to least privilege): 8 tools — `bus_register`, `bus_task_claim`, `bus_task_heartbeat`, `bus_ref_read`, `bus_task_complete`, `bus_task_fail`, `bus_task_message`, `bus_task_inbox`. Calls to `bus_task_create`, `bus_task_list`, `bus_verify`, `bus_task_dispatch`, `bus_task_wait`, or `bus_task_run` are rejected with `isError: true`, so a dispatched agent cannot spawn its own fan-out.
 
 Per-agent model choices live in `<bus root>/agents.json` (`{ "conductor": "codex", "models": { "antigravity": "gemini-4-neon" } }`), written by onboarding and read at dispatch time. The file is git-ignored; the protocol never carries preferences.
 

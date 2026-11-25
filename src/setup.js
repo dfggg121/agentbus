@@ -3,6 +3,7 @@
 // Rules: idempotent, always backs up the target file before modification, never touches unrelated keys.
 
 import { randomBytes } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -157,7 +158,7 @@ function writeAtomic(file, text, platform = process.platform) {
 
 // ---------- server spec ----------
 
-function serverSpec({ root, allowed, bin = 'node', env: extraEnv }) {
+function serverSpec({ root, allowed, bin = 'node', env: extraEnv, role, allowDispatch }) {
   const rawList = allowed && allowed.length ? allowed : [root];
   const seen = new Set();
   const roots = [];
@@ -172,13 +173,24 @@ function serverSpec({ root, allowed, bin = 'node', env: extraEnv }) {
   }
   if (!roots.length) roots.push(path.resolve(root));
 
-  const env = { AGENTBUS_ALLOWED_ROOTS: roots.join(path.delimiter), ...(extraEnv || {}) };
+  const resolvedRoot = path.resolve(root);
+  const candidateRole = String((extraEnv && extraEnv.AGENTBUS_ROLE) ?? role ?? 'worker').trim().toLowerCase();
+  const normalizedRole = candidateRole === 'conductor' ? 'conductor' : 'worker';
+  const enableDispatch = Boolean(allowDispatch) || String(extraEnv?.AGENTBUS_ENABLE_DISPATCH || '') === '1';
+
+  const env = {
+    AGENTBUS_ROOT: resolvedRoot,
+    AGENTBUS_ALLOWED_ROOTS: roots.join(path.delimiter),
+    ...(extraEnv || {}),
+    AGENTBUS_ROLE: normalizedRole,
+    AGENTBUS_ENABLE_DISPATCH: enableDispatch ? '1' : '0',
+  };
   if (bin === 'npx') {
-    return { command: 'npx', args: ['-y', 'agentbus-mcp', 'mcp', '--root', path.resolve(root)], env };
+    return { command: 'npx', args: ['-y', 'agentbus-mcp', 'mcp', '--root', resolvedRoot], env };
   }
   return {
     command: process.env.AGENTBUS_MCP_COMMAND || process.execPath,
-    args: [BUS_BIN, 'mcp', '--root', path.resolve(root)],
+    args: [BUS_BIN, 'mcp', '--root', resolvedRoot],
     env,
   };
 }
@@ -317,33 +329,379 @@ function mergeJson(file, prev, targetKey, mutate) {
 // ---------- client adapters ----------
 
 const CLIENTS = [
-  { id: 'codex', label: 'OpenAI Codex CLI', format: 'toml', hasBinary: true },
-  { id: 'claude', label: 'Claude Code', format: 'json-mcpServers', hasBinary: true },
-  { id: 'gemini', label: 'Gemini CLI', format: 'json-mcpServers', hasBinary: true },
-  { id: 'antigravity', label: 'Google Antigravity', format: 'json-mcpServers', hasBinary: true },
-  { id: 'cursor', label: 'Cursor', format: 'json-mcpServers', hasBinary: false },
-  { id: 'opencode', label: 'OpenCode', format: 'json-opencode', hasBinary: true },
-  { id: 'claude-desktop', label: 'Claude Desktop', format: 'json-mcpServers', hasBinary: false },
+  { id: 'codex', label: 'OpenAI Codex CLI', format: 'toml', hasBinary: true, optional: false },
+  { id: 'claude', label: 'Claude Code', format: 'json-mcpServers', hasBinary: true, optional: false },
+  { id: 'gemini', label: 'Gemini CLI', format: 'json-mcpServers', hasBinary: true, optional: false },
+  { id: 'antigravity', label: 'Google Antigravity', format: 'json-mcpServers', hasBinary: true, optional: false },
+  { id: 'cursor', label: 'Cursor', format: 'json-mcpServers', hasBinary: false, optional: false },
+  { id: 'opencode', label: 'OpenCode', format: 'json-opencode', hasBinary: true, optional: false },
+  { id: 'claude-desktop', label: 'Claude Desktop', format: 'json-mcpServers', hasBinary: false, optional: false },
+  { id: 'windsurf', label: 'Windsurf', format: 'json-mcpServers', hasBinary: false, optional: true },
+  { id: 'kiro', label: 'Kiro', format: 'json-mcpServers', hasBinary: false, optional: true },
+  { id: 'lmstudio', label: 'LM Studio', format: 'json-mcpServers', hasBinary: false, optional: true },
+  { id: 'cline', label: 'Cline', format: 'json-mcpServers', hasBinary: false, optional: true },
+  { id: 'dsh', label: 'DeepSeek Harness', format: 'dsh-cordis', hasBinary: false, optional: true },
+  { id: 'hermes', label: 'Hermes Agent', format: 'hermes-cli', hasBinary: false, optional: true },
 ];
+
+function clineExtensionDir(home, platform) {
+  if (platform === 'win32') {
+    return path.join(home, 'AppData', 'Roaming', 'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev');
+  }
+  if (platform === 'darwin') {
+    return path.join(home, 'Library', 'Application Support', 'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev');
+  }
+  return path.join(home, '.config', 'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev');
+}
+
+function hermesPaths(home, explicitHome, env = process.env) {
+  const h = path.resolve(home || os.homedir());
+  if (explicitHome) {
+    const dotHermes = path.join(h, '.hermes');
+    if (fs.existsSync(dotHermes)) {
+      return { hermesHome: dotHermes, file: path.join(dotHermes, 'config.yaml') };
+    }
+    const directCfg = path.join(h, 'config.yaml');
+    if (fs.existsSync(directCfg)) {
+      return { hermesHome: h, file: directCfg };
+    }
+    return { hermesHome: dotHermes, file: path.join(dotHermes, 'config.yaml') };
+  }
+  if (env.HERMES_HOME) {
+    const dir = path.resolve(env.HERMES_HOME);
+    return { hermesHome: dir, file: path.join(dir, 'config.yaml') };
+  }
+  const dotHermes = path.join(h, '.hermes');
+  return { hermesHome: dotHermes, file: path.join(dotHermes, 'config.yaml') };
+}
+
+function resolveClientConfigPath(id, home, platform, explicitHome, env) {
+  if (id === 'hermes') return hermesPaths(home, explicitHome, env).file;
+  return clientConfigFile(id, home, platform);
+}
+
+function clientInstalled(client, home, { platform = process.platform, explicitHome = false, env = process.env } = {}) {
+  const h = path.resolve(home || os.homedir());
+  const cfg = resolveClientConfigPath(client.id, h, platform, explicitHome, env);
+  if (client.optional) {
+    switch (client.id) {
+      case 'windsurf':
+        return fs.existsSync(path.join(h, '.codeium', 'windsurf')) || fs.existsSync(cfg);
+      case 'kiro':
+        return fs.existsSync(path.join(h, '.kiro')) || fs.existsSync(cfg);
+      case 'lmstudio':
+        return fs.existsSync(path.join(h, '.lmstudio')) || fs.existsSync(cfg);
+      case 'cline':
+        return fs.existsSync(path.join(h, '.cline')) || fs.existsSync(clineExtensionDir(h, platform)) || fs.existsSync(cfg);
+      case 'dsh':
+        return fs.existsSync(path.join(h, '.dsh')) || fs.existsSync(cfg);
+      case 'hermes': {
+        const hp = hermesPaths(h, explicitHome, env);
+        return fs.existsSync(hp.hermesHome) || fs.existsSync(hp.file);
+      }
+      default:
+        return fs.existsSync(cfg);
+    }
+  }
+  if (client.hasBinary) {
+    const binInfo = resolveAgentBin(client.id, { home: h, env, platform, explicitHome });
+    if (binInfo?.bin) return true;
+  }
+  if (fs.existsSync(cfg)) return true;
+  if (client.id !== 'claude' && fs.existsSync(path.dirname(cfg))) return true;
+  return false;
+}
 
 export function listClients() {
   return CLIENTS.map((c) => c.id);
 }
 
-export function describeClients({ home = os.homedir(), platform = process.platform } = {}) {
+export function describeClients({ home = os.homedir(), platform = process.platform, env = process.env } = {}) {
+  const explicitHome = home !== undefined && home !== null && path.resolve(home) !== path.resolve(os.homedir());
+  const h = path.resolve(home || os.homedir());
   return CLIENTS.map((c) => ({
     id: c.id,
     label: c.label,
     format: c.format,
-    config: clientConfigFile(c.id, home, platform),
+    config: resolveClientConfigPath(c.id, h, platform, explicitHome, env),
+    optional: Boolean(c.optional),
+    installed: clientInstalled(c, h, { platform, explicitHome, env }),
   }));
 }
 
+// ---------- DSH (Cordis plugin tree) ----------
+
+function yamlQuote(v) {
+  return JSON.stringify(String(v));
+}
+
+function dshBlock(spec) {
+  const envLines = Object.entries(spec.env)
+    .map(([k, v]) => `          ${k}: ${yamlQuote(v)}`)
+    .join('\n');
+  return [
+    '# BEGIN agentbus-managed',
+    '- insert:',
+    '    - id: agentbus-mcp',
+    "      name: '@deepseek-ai/dsh-mcp-client'",
+    '      config:',
+    '        transport: stdio',
+    '        serverName: agentbus',
+    `        command: ${yamlQuote(spec.command)}`,
+    `        args: [${spec.args.map(yamlQuote).join(', ')}]`,
+    '        env:',
+    envLines,
+    '        failOnStartupError: false',
+    '# END agentbus-managed',
+  ].join('\n');
+}
+
+function mergeDshPatch(file, prev, spec) {
+  const norm = String(prev || '').replace(/\r\n/g, '\n');
+  const hasBegin = /# BEGIN agentbus-managed/.test(norm);
+  const hasEnd = /# END agentbus-managed/.test(norm);
+  if (hasBegin !== hasEnd) {
+    throw makeDiagError(
+      'corrupted_config',
+      `${file} 中的 agentbus-managed 标记不成对，已停止（未写入且未覆盖）`,
+      `请修复或移除 "${file}" 中不完整的 # BEGIN/END agentbus-managed 块`,
+    );
+  }
+  const block = dshBlock(spec);
+  const marker = /# BEGIN agentbus-managed[\s\S]*?# END agentbus-managed/;
+  if (marker.test(norm)) {
+    const replaced = norm.replace(marker, block);
+    return replaced.endsWith('\n') ? replaced : `${replaced}\n`;
+  }
+  const trimmed = norm.trim();
+  if (!trimmed || trimmed === '[]') {
+    return `${block}\n`;
+  }
+  const firstMeaningful = norm
+    .split('\n')
+    .map((l) => l.trim())
+    .find((l) => l && !l.startsWith('#') && l !== '---');
+  if (firstMeaningful && !firstMeaningful.startsWith('-')) {
+    throw makeDiagError(
+      'corrupted_config',
+      `${file} 顶层不是 YAML 列表（- ...），无法安全合并 agentbus 插件块`,
+      `请确认 "${file}" 为 Cordis patch YAML 列表格式，或手动添加 @deepseek-ai/dsh-mcp-client 节点`,
+    );
+  }
+  const base = norm.replace(/\s+$/, '');
+  return `${base}\n\n${block}\n`;
+}
+
+// ---------- Hermes (native MCP CLI) ----------
+
+function findExecutable(name, env, platform = process.platform) {
+  const pathVar = env.PATH || env.Path || '';
+  const exts = platform === 'win32' ? ['.exe', '.cmd', '.bat', ''] : [''];
+  for (const dir of pathVar.split(platform === 'win32' ? ';' : path.delimiter)) {
+    if (!dir) continue;
+    for (const ext of exts) {
+      const candidate = path.join(dir, name + ext);
+      try {
+        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+      } catch {}
+    }
+  }
+  return null;
+}
+
+function hasHermesAgentbus(raw) {
+  const lines = String(raw || '').replace(/\r\n/g, '\n').split('\n');
+  let inMcpServers = false;
+  let childIndent = null;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const indent = line.length - line.trimStart().length;
+    if (indent === 0) {
+      inMcpServers = /^mcp_servers\s*:/.test(trimmed);
+      childIndent = null;
+      continue;
+    }
+    if (!inMcpServers) continue;
+    if (childIndent === null) childIndent = indent;
+    if (indent === childIndent && /^(['"]?)agentbus\1\s*:/.test(trimmed)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function winQuoteArg(s) {
+  return `"${String(s).replace(/"/g, '""')}"`;
+}
+
+function spawnHermes(bin, args, { env, input, platform = process.platform }) {
+  if (platform === 'win32' && /\.(cmd|bat)$/i.test(bin)) {
+    const exe = String(bin).replace(/\//g, '\\');
+    const inner = [exe, ...args].map(winQuoteArg).join(' ');
+    return spawnSync(env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `"${inner}"`], {
+      encoding: 'utf8',
+      timeout: 30000,
+      env,
+      input,
+      windowsHide: true,
+      windowsVerbatimArguments: true,
+    });
+  }
+  return spawnSync(bin, args, {
+    encoding: 'utf8',
+    timeout: 30000,
+    env,
+    input,
+    windowsHide: true,
+  });
+}
+
+function formatCmdPreview(bin, args) {
+  return [bin, ...args].map((s) => (/\s/.test(String(s)) ? JSON.stringify(String(s)) : String(s))).join(' ');
+}
+
+function applyHermes(spec, opts) {
+  const { hermesHome, file } = hermesPaths(opts.home, opts.explicitHome, opts.processEnv);
+  const bin = opts.processEnv.AGENTBUS_HERMES_BIN || findExecutable('hermes', opts.processEnv, opts.platform);
+  if (!bin) {
+    throw makeDiagError(
+      'missing_binary',
+      '未找到 hermes 可执行文件，无法写入 Hermes MCP 配置',
+      '先安装 Hermes CLI，或设置 AGENTBUS_HERMES_BIN 指向 hermes 可执行文件后重试',
+    );
+  }
+
+  const envPairs = Object.entries(spec.env).map(([k, v]) => `${k}=${v}`);
+  const addArgs = ['mcp', 'add', 'agentbus'];
+  if (envPairs.length) addArgs.push('--env', ...envPairs);
+  addArgs.push('--command', spec.command, '--args', ...spec.args);
+
+  let alreadyInYaml = false;
+  if (fs.existsSync(file)) {
+    try {
+      alreadyInYaml = hasHermesAgentbus(fs.readFileSync(file, 'utf8'));
+    } catch {}
+  }
+
+  if (opts.dryRun) {
+    return {
+      client: 'hermes',
+      file,
+      config_dir: hermesHome,
+      hermes_home: hermesHome,
+      backup: null,
+      changed: !alreadyInYaml,
+      dry_run: true,
+      command: formatCmdPreview(bin, addArgs),
+    };
+  }
+
+  if (opts.requireConfigDir && !fs.existsSync(hermesHome)) {
+    throw makeDiagError(
+      'missing_config_dir',
+      `缺少配置目录: ${hermesHome}`,
+      `先运行一次 Hermes 或创建目录后重试（或去掉 --require-config-dir 让 setup 自动创建）`,
+    );
+  }
+
+  if (alreadyInYaml) {
+    return {
+      client: 'hermes',
+      file,
+      config_dir: hermesHome,
+      hermes_home: hermesHome,
+      backup: null,
+      changed: false,
+      note: 'agentbus 已在 Hermes 配置中，跳过重复添加',
+    };
+  }
+
+  const childEnv = { ...opts.processEnv };
+  if (opts.explicitHome) {
+    childEnv.HERMES_HOME = hermesHome;
+    childEnv.HOME = opts.home;
+    childEnv.USERPROFILE = opts.home;
+  }
+
+  if (fs.existsSync(hermesHome)) {
+    const preList = spawnHermes(bin, ['mcp', 'list'], { env: childEnv, platform: opts.platform });
+    if (!preList.error && preList.status === 0 && /^\s*(?:[-*]\s*)?agentbus(?:\s|:|$)/m.test(preList.stdout || '')) {
+      return {
+        client: 'hermes',
+        file,
+        config_dir: hermesHome,
+        hermes_home: hermesHome,
+        backup: null,
+        changed: false,
+        note: 'hermes mcp list 已包含 agentbus，跳过重复添加',
+      };
+    }
+  }
+
+  checkTargetWritable(file, opts.platform);
+  const existedBefore = fs.existsSync(file);
+  const backup = existedBefore ? backupIfExists(file) : null;
+  fs.mkdirSync(hermesHome, { recursive: true });
+
+  const rollback = () => {
+    if (backup && fs.existsSync(backup)) {
+      try { fs.copyFileSync(backup, file); } catch {}
+    } else if (!existedBefore && fs.existsSync(file)) {
+      try { fs.unlinkSync(file); } catch {}
+    }
+  };
+
+  const r = spawnHermes(bin, addArgs, { env: childEnv, input: 'y\n', platform: opts.platform });
+  if (r.error || r.status !== 0) {
+    rollback();
+    const detail = (r.stderr || r.stdout || r.error?.message || '').trim().split('\n').slice(-4).join(' | ');
+    throw makeDiagError(
+      'hermes_cli_failed',
+      `hermes mcp add 失败 (exit ${r.status ?? 'error'}): ${detail || '无输出'}`,
+      `手动运行: hermes mcp add agentbus --command "${spec.command}" --args ${spec.args.join(' ')}`,
+    );
+  }
+  const combined = `${r.stdout || ''}\n${r.stderr || ''}`;
+  if (/Cancelled/i.test(combined)) {
+    rollback();
+    throw makeDiagError(
+      'hermes_cli_cancelled',
+      'hermes mcp add 在非交互环境被取消（需要确认启用工具）',
+      `在终端手动运行: hermes mcp add agentbus --command "${spec.command}" --args ${spec.args.join(' ')}，按提示输入 y`,
+    );
+  }
+
+  const verifyList = spawnHermes(bin, ['mcp', 'list'], { env: childEnv, platform: opts.platform });
+  const verifyOut = `${verifyList.stdout || ''}\n${verifyList.stderr || ''}`;
+  if (verifyList.error || verifyList.status !== 0 || !/\bagentbus\b/.test(verifyList.stdout || '')) {
+    rollback();
+    throw makeDiagError(
+      'hermes_verify_failed',
+      `hermes mcp list 未确认到 agentbus（已回滚，exit ${verifyList.status ?? 'error'}）: ${verifyOut.trim().slice(0, 200)}`,
+      '运行 hermes mcp list 检查 HERMES_HOME 与配置状态，或手动执行 hermes mcp add agentbus',
+    );
+  }
+
+  return {
+    client: 'hermes',
+    file,
+    config_dir: hermesHome,
+    hermes_home: hermesHome,
+    backup,
+    changed: true,
+    verified_by: 'hermes mcp list',
+    ...(r.stdout?.trim() ? { stdout: r.stdout.trim().split('\n').slice(-6).join('\n') } : {}),
+  };
+}
+
 function applyClient(client, opts) {
+  const spec = serverSpec(opts);
+  if (client.format === 'hermes-cli') return applyHermes(spec, opts);
+
   const file = clientConfigFile(client.id, opts.home, opts.platform);
   const dir = path.dirname(file);
   const exists = fs.existsSync(file);
-  const spec = serverSpec(opts);
 
   let prev = '';
   if (exists) {
@@ -382,6 +740,8 @@ function applyClient(client, opts) {
       data.mcp = data.mcp || {};
       data.mcp.agentbus = { type: 'local', command: [spec.command, ...spec.args], enabled: true, environment: spec.env };
     });
+  } else if (client.format === 'dsh-cordis') {
+    text = mergeDshPatch(file, prev, spec);
   } else {
     throw new Error(`unknown client format: ${client.format}`);
   }
@@ -394,6 +754,7 @@ function applyClient(client, opts) {
       config_dir: dir,
       backup: null,
       changed: false,
+      ...(client.id === 'dsh' ? { restart_required: true } : {}),
       ...(opts.dryRun ? { dry_run: true, preview: text.slice(0, 400) } : {}),
     };
   }
@@ -420,7 +781,17 @@ function applyClient(client, opts) {
     }
     throw e;
   }
-  return { client: client.id, file, config_dir: dir, backup: bak, changed: true };
+  return {
+    client: client.id,
+    file,
+    config_dir: dir,
+    backup: bak,
+    changed: true,
+    ...(client.id === 'dsh' ? {
+      restart_required: true,
+      note: '已写入 DSH 配置，请重启 DeepSeek Harness (DSH) 使配置生效（不会自动重启）',
+    } : {}),
+  };
 }
 
 export function setupClients({
@@ -431,17 +802,30 @@ export function setupClients({
   home,
   dryRun,
   env,
+  role,
+  allowDispatch = false,
   requireConfigDir = false,
   platform = process.platform,
   processEnv = process.env,
 }) {
-  const ids = clients && clients.length ? clients : CLIENTS.map((c) => c.id);
+  const explicitHome = home !== undefined && home !== null && path.resolve(home) !== path.resolve(os.homedir());
+  const resolvedHome = path.resolve(home || os.homedir());
+  const explicitClients = Boolean(clients && clients.length);
+  const skippedOptional = [];
+  const ids = explicitClients
+    ? clients
+    : CLIENTS.filter((c) => {
+      if (!c.optional) return true;
+      const inst = clientInstalled(c, resolvedHome, { platform, explicitHome, env: processEnv });
+      if (!inst) skippedOptional.push(c.id);
+      return inst;
+    }).map((c) => c.id);
+
   const unknown = ids.filter((id) => !CLIENTS.some((c) => c.id === id));
   if (unknown.length) {
     throw Object.assign(new Error(`未知客户端: ${unknown.join(', ')}；可选: ${listClients().join(', ')}`), { code: 1 });
   }
-  const explicitHome = home !== undefined && home !== null && path.resolve(home) !== path.resolve(os.homedir());
-  const resolvedHome = path.resolve(home || os.homedir());
+
   const opts = {
     root: root || defaultRoot(),
     allowed,
@@ -450,6 +834,8 @@ export function setupClients({
     explicitHome,
     dryRun: !!dryRun,
     env,
+    role,
+    allowDispatch: !!allowDispatch,
     requireConfigDir: !!requireConfigDir,
     platform,
     processEnv,
@@ -475,7 +861,7 @@ export function setupClients({
       results.push({
         ok: false,
         client: id,
-        file: clientConfigFile(id, resolvedHome, platform),
+        file: resolveClientConfigPath(id, resolvedHome, platform, explicitHome, processEnv),
         error_code: e?.errorCode || 'setup_failed',
         error: String(e?.message || e),
         ...(e?.next ? { next: e.next } : {}),
@@ -490,6 +876,7 @@ export function setupClients({
     allowed_roots: serverSpec(opts).env.AGENTBUS_ALLOWED_ROOTS.split(path.delimiter),
     server: serverSpec(opts),
     results,
+    ...(skippedOptional.length ? { skipped_optional: skippedOptional } : {}),
   };
 }
 
@@ -506,6 +893,18 @@ function inspectConfigEntry(file, format) {
   if (format === 'toml') {
     const has = /^\s*\[\s*mcp_servers\.(?:agentbus|"agentbus"|'agentbus')\s*\]/m.test(raw);
     return { configured: has, error: null };
+  }
+  if (format === 'dsh-cordis') {
+    const hasBegin = /# BEGIN agentbus-managed/.test(raw);
+    const hasEnd = /# END agentbus-managed/.test(raw);
+    if (hasBegin !== hasEnd) {
+      return { configured: null, error: 'agentbus-managed 标记不成对' };
+    }
+    const has = /# BEGIN agentbus-managed[\s\S]*?id:\s*agentbus-mcp[\s\S]*?# END agentbus-managed/.test(raw);
+    return { configured: has, error: null };
+  }
+  if (format === 'hermes-cli') {
+    return { configured: hasHermesAgentbus(raw), error: null };
   }
   const trimmed = raw.replace(/^\uFEFF/, '').trim();
   if (!trimmed) return { configured: false, error: null };
@@ -571,11 +970,31 @@ export function doctor({ home, root, env = process.env, platform = process.platf
     binMap.set(c.id, resolveAgentBin(c.id, { home: h, env, platform, explicitHome }));
   }
 
+  const optionalHints = [];
   const clients = CLIENTS.map((c) => {
-    const file = clientConfigFile(c.id, h, platform);
+    const file = resolveClientConfigPath(c.id, h, platform, explicitHome, env);
     const dir = path.dirname(file);
     const dirExists = fs.existsSync(dir);
     const exists = fs.existsSync(file);
+    if (c.optional && !clientInstalled(c, h, { platform, explicitHome, env })) {
+      optionalHints.push(`可选客户端 ${c.label} 未安装；如需接入可运行: node "${BUS_BIN}" setup --client ${c.id} --home "${h}" --root "${r}"`);
+      return {
+        id: c.id,
+        label: c.label,
+        optional: true,
+        installed: false,
+        skipped: true,
+        config: file,
+        config_dir: dir,
+        config_dir_exists: dirExists,
+        exists,
+        configured: null,
+        config_error: null,
+        writable: null,
+        issues: [],
+      };
+    }
+
     const entry = inspectConfigEntry(file, c.format);
     const writeState = checkClientWritableState(file, platform);
     const binInfo = binMap.get(c.id) || null;
@@ -621,6 +1040,7 @@ export function doctor({ home, root, env = process.env, platform = process.platf
     return {
       id: c.id,
       label: c.label,
+      optional: Boolean(c.optional),
       config: file,
       config_dir: dir,
       config_dir_exists: dirExists,
@@ -632,7 +1052,9 @@ export function doctor({ home, root, env = process.env, platform = process.platf
         bin: binInfo?.bin || null,
         bin_source: binInfo?.source || null,
         installed: Boolean(binInfo?.bin || exists),
-      } : {}),
+      } : {
+        installed: clientInstalled(c, h, { platform, explicitHome, env }),
+      }),
       issues,
     };
   });
@@ -643,6 +1065,12 @@ export function doctor({ home, root, env = process.env, platform = process.platf
     if (d.next && !seenNext.has(d.next)) {
       seenNext.add(d.next);
       nextSteps.push(d.next);
+    }
+  }
+  for (const hStep of optionalHints) {
+    if (!seenNext.has(hStep)) {
+      seenNext.add(hStep);
+      nextSteps.push(hStep);
     }
   }
 

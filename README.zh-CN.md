@@ -5,7 +5,7 @@
 `agentbus` 是一个本机多代理任务总线。任务信封里有目标、验收条款，以及指向所需资料的**指针**（`uri` + `sha256`）——没有正文。领取方自己按地址读盘，交回的成果在任务关闭前会重新核对哈希。
 
 - 零第三方依赖；SQLite 用 Node 内置的 `node:sqlite`。
-- 一个 MCP stdio 服务端，Codex / Claude Code / Gemini CLI / Antigravity / Cursor / OpenCode / Claude Desktop 都能接。
+- 一个 MCP stdio 服务端，支持 Codex / Claude Code / Gemini CLI / Antigravity / Cursor / OpenCode / Claude Desktop，以及 Windsurf / Kiro / LM Studio / Cline / DeepSeek Harness (DSH) / Hermes Agent。
 - 同样的能力有 CLI，cron、批处理、不支持 MCP 的 agent 也能用。
 - 从不复制资料：登记一个 4MB 文件，数据库只增约 **48KB**。
 
@@ -33,20 +33,24 @@
 npx agentbus-mcp setup --client codex
 ```
 
-`setup` 会把 MCP 配置写进对应客户端的配置文件（先做带时间戳的备份），并打印改了哪些文件。支持的 id：
+`setup` 会把 MCP 配置写进对应客户端的配置文件（先做带时间戳的备份），并打印改了哪些文件。支持的 id（核心 + 可选）：
 
 ```
-codex  claude  gemini  antigravity  cursor  opencode  claude-desktop
+核心: codex  claude  gemini  antigravity  cursor  opencode  claude-desktop
+可选: windsurf  kiro  lmstudio  cline  dsh  hermes
 ```
 
-可以一次配多个：
+可以一次配多个，或指定角色与 dispatch 权限：
 
 ```bash
 npx agentbus-mcp setup --client codex --client claude --client gemini
-npx agentbus-mcp setup --list   # 看 id、配置文件路径；只读，不写盘
-npx agentbus-mcp doctor      # 看当前配置状态
-npx agentbus-mcp clients     # 只列 id
+npx agentbus-mcp setup --client codex --role conductor --allow-dispatch
+npx agentbus-mcp setup --list   # 看 id、label、format、路径、installed、optional；只读不写盘
+npx agentbus-mcp doctor         # 看当前配置状态
+npx agentbus-mcp clients        # 只列 id
 ```
+
+可选客户端未安装时默认跳过（不建目录）；显式传 `--client <id>` 才初始化。完整自动/手动矩阵（含 Trae / Qoder / CodeBuddy / VS Code / Zed / OpenClaw 及 DSH/Hermes 验证与回滚）：[`docs/CLIENTS.md`](docs/CLIENTS.md)。
 
 默认总线目录是 `~/.agentbus`，只有该目录下的文件能作为引用。实际项目请显式放行：
 
@@ -118,14 +122,18 @@ planner ──put──▶ artifacts(sha256, uri, bytes)        ← 只有元数
 |---|---|
 | `bus_register` | 按路径登记文件，返回 `sha256`/`uri`/`bytes` |
 | `bus_task_create` | 用 refs + 验收条款建任务（可带幂等键） |
-| `bus_task_claim` | 领取任务，拿到租约 token |
+| `bus_task_claim` | 领取任务，拿到租约 token 与完整 goal / refs / acceptance 信封 |
 | `bus_task_heartbeat` | 续租 |
 | `bus_ref_read` | 读引用（正文 / base64 / 大文件只给 `resource_link`） |
 | `bus_task_complete` | 校验引用与验收、记录结果哈希、关闭任务 |
-| `bus_task_fail` | 以失败关闭并写明原因 |
+| `bus_task_fail` | 以失败关闭并写明原因（同步写入 `error` 消息） |
+| `bus_task_message` | 任务内发送 `note` / `progress` / `question` / `blocked` / `answer` / `error` 消息 |
+| `bus_task_inbox` | 拉取任务消息收件箱（`for_agent` / `since_id` / `mark_read`） |
 | `bus_task_list` | 列任务（`state`/`to`/`limit`） |
 | `bus_verify` | 全量重算引用与结果哈希，报告漂移 |
 | `bus_task_dispatch` | **默认关闭**：主动唤起目标 agent 的 CLI 并等结果 |
+| `bus_task_wait` | 等总线进入终态或收到新的 `question`/`blocked`/`error` 消息 |
+| `bus_task_run` | 建任务并立刻派发 |
 
 ### 主动唤起（dispatch）
 
@@ -172,7 +180,7 @@ agentbus onboard --conductor codex --allow /path/to/workspace
 3. 交互式询问每个 agent 主要用哪个模型（回车=默认），答案存进总线根目录的 `agents.json`（已在 .gitignore，不进仓库）
 4. 改写各家的 MCP 配置，注入 `AGENTBUS_ROLE`
 
-角色不是摆设：worker 的 `tools/list` 只返回 6 个工具（register / claim / heartbeat / ref_read / complete / fail），调用 `bus_task_create` 或 `bus_task_dispatch` 会被直接拒绝。这样被派的 agent 没法自己再派活，避免回路。
+角色不是摆设：worker 的 `tools/list` 只返回 8 个工具（`register` / `claim` / `heartbeat` / `ref_read` / `complete` / `fail` / `message` / `inbox`），调用 `bus_task_create` 或 `bus_task_dispatch` 会被直接拒绝；未知 `AGENTBUS_ROLE` 也回落为 `worker`。这样被派的 agent 没法自己再派活，避免回路。
 
 模型只存本机：仓库里没有任何人的偏好值，只有"询问 + 存储 + 生效"这套机制。
 
@@ -242,12 +250,18 @@ AGENTBUS_ARCHIVE_ON_DONE=1                          # 单次运行临时开启
 | OpenAI Codex CLI | `--client codex` | ✅ 2026-11，跑通完整 claim → complete |
 | Claude Code | `--client claude` | 仅验证配置写入 |
 | Gemini CLI | `--client gemini` | 仅验证配置写入 |
-| Google Antigravity | `--client antigravity` | 仅验证配置写入 |
+| Google Antigravity | `--client antigravity` | ✅ 2026-11，跑通完整 claim → complete |
 | Cursor | `--client cursor` | 仅验证配置写入 |
 | OpenCode | `--client opencode` | 仅验证配置写入 |
 | Claude Desktop | `--client claude-desktop` | 仅验证配置写入 |
+| Windsurf | `--client windsurf`（可选） | 仅验证配置写入 |
+| Kiro | `--client kiro`（可选） | 仅验证配置写入 |
+| LM Studio | `--client lmstudio`（可选） | 仅验证配置写入 |
+| Cline (VS Code / CLI) | `--client cline`（可选） | 仅验证配置写入 |
+| DeepSeek Harness (DSH) | `--client dsh`（可选） | Cordis YAML 块 + 解析校验 |
+| Hermes Agent | `--client hermes`（可选） | `hermes mcp add` + `mcp list` |
 
-任何说 stdio JSON-RPC 的 MCP 客户端都能用，`setup` 只是把常见几家自动化了。
+任何说 stdio JSON-RPC 的 MCP 客户端都能用；`setup` 自动化以上 13 家，Trae / Qoder / CodeBuddy / VS Code / Zed / OpenClaw 的手动步骤以及 DSH / Hermes 验证与回滚见 [`docs/CLIENTS.md`](docs/CLIENTS.md)。
 
 ---
 
@@ -278,7 +292,7 @@ AGENTBUS_ARCHIVE_ON_DONE=1                          # 单次运行临时开启
 ```bash
 git clone https://github.com/USERNAME/agentbus.git
 cd agentbus
-node test/accept.mjs     # 31 条断言，自包含
+node test/accept.mjs     # 自包含验收测试套件
 ```
 
 自验套件自己生成测试资料、起真实 CLI 进程、打开真实 SQLite、用真实 MCP stdio 通信。不用测试框架，也不用 shell 管道（管道会把退出码吞掉，等于自欺）。

@@ -96,6 +96,32 @@ export function clientConfigFile(id, home = os.homedir(), platform = process.pla
         return path.join(h, 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json');
       }
       return path.join(h, '.config', 'Claude', 'claude_desktop_config.json');
+    case 'windsurf':
+      return path.join(h, '.codeium', 'windsurf', 'mcp_config.json');
+    case 'kiro':
+      return path.join(h, '.kiro', 'settings', 'mcp.json');
+    case 'lmstudio':
+      return path.join(h, '.lmstudio', 'mcp.json');
+    case 'cline': {
+      const extDir = platform === 'win32'
+        ? path.join(h, 'AppData', 'Roaming', 'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev')
+        : platform === 'darwin'
+          ? path.join(h, 'Library', 'Application Support', 'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev')
+          : path.join(h, '.config', 'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev');
+      if (fs.existsSync(extDir)) {
+        return path.join(extDir, 'settings', 'cline_mcp_settings.json');
+      }
+      return path.join(h, '.cline', 'data', 'settings', 'cline_mcp_settings.json');
+    }
+    case 'dsh':
+      return path.join(h, '.dsh', 'profiles', 'desktop', 'cordis.patch.yml');
+    case 'hermes': {
+      const dotHermes = path.join(h, '.hermes');
+      if (fs.existsSync(dotHermes)) return path.join(dotHermes, 'config.yaml');
+      const directCfg = path.join(h, 'config.yaml');
+      if (fs.existsSync(directCfg)) return directCfg;
+      return path.join(dotHermes, 'config.yaml');
+    }
     default:
       return null;
   }

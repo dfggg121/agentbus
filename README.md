@@ -5,7 +5,7 @@
 `agentbus` is a local task bus for multi-agent workflows. A task envelope contains a goal, acceptance criteria, and **pointers** (`uri` + `sha256`) to the files the receiving agent needs — never the file contents. Agents claim tasks, read references from disk themselves, and hand back a result whose hash is verified before the task is marked done.
 
 - Zero dependencies. SQLite through Node's built-in `node:sqlite`.
-- One MCP stdio server — works with Codex, Claude Code, Gemini CLI, Antigravity, Cursor, OpenCode, Claude Desktop.
+- One MCP stdio server — works with Codex, Claude Code, Gemini CLI, Antigravity, Cursor, OpenCode, Claude Desktop, Windsurf, Kiro, LM Studio, Cline, DeepSeek Harness (DSH), and Hermes Agent.
 - The same operations are available as a CLI, so cron jobs, batch files, and non-MCP agents can use it.
 - Never copies payloads. Registering a 4 MB artifact costs about **48 KB** of database.
 
@@ -33,20 +33,24 @@ Requires **Node.js ≥ 22.5** (for `node:sqlite`).
 npx agentbus-mcp setup --client codex
 ```
 
-`setup` writes the MCP server entry into the client's config (with a timestamped backup) and prints what it touched. Supported ids:
+`setup` writes the MCP server entry into the client's config (with a timestamped backup) and prints what it touched. Supported ids (core + optional):
 
 ```
-codex  claude  gemini  antigravity  cursor  opencode  claude-desktop
+Core:     codex  claude  gemini  antigravity  cursor  opencode  claude-desktop
+Optional: windsurf  kiro  lmstudio  cline  dsh  hermes
 ```
 
-Pick several at once:
+Pick several at once, or set role & dispatch permissions:
 
 ```bash
 npx agentbus-mcp setup --client codex --client claude --client gemini
-npx agentbus-mcp setup --list   # ids + config paths, read-only
-npx agentbus-mcp doctor      # show what is configured
-npx agentbus-mcp clients     # ids only
+npx agentbus-mcp setup --client codex --role conductor --allow-dispatch
+npx agentbus-mcp setup --list   # id, label, format, config, installed, optional (read-only)
+npx agentbus-mcp doctor         # show what is configured
+npx agentbus-mcp clients        # ids only
 ```
+
+Optional clients are skipped by default if not installed (no directories created); pass `--client <id>` explicitly to initialize them. Full automatic & manual client matrix (including Trae, Qoder, CodeBuddy, VS Code, Zed, OpenClaw): [`docs/CLIENTS.md`](docs/CLIENTS.md).
 
 By default the bus lives in `~/.agentbus` and only files inside it may be referenced. Pass `--allow` for the project you actually work in:
 
@@ -118,14 +122,18 @@ Protocol details: [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 |---|---|
 | `bus_register` | Register a file by path; returns `sha256`, `uri`, `bytes` |
 | `bus_task_create` | Create a task from refs + acceptance (optional idempotency key) |
-| `bus_task_claim` | Claim a task and receive a lease token |
+| `bus_task_claim` | Claim a task, receive a lease token and the full goal/refs/acceptance envelope |
 | `bus_task_heartbeat` | Extend a lease |
 | `bus_ref_read` | Read a reference (text, base64, or `resource_link` when large) |
 | `bus_task_complete` | Validate refs + acceptance, store the result hash, close the task |
-| `bus_task_fail` | Close a task as failed with a reason |
+| `bus_task_fail` | Close a task as failed with a reason (and emit an `error` message) |
+| `bus_task_message` | Send in-task `note`/`progress`/`question`/`blocked`/`answer`/`error` messages |
+| `bus_task_inbox` | Read task messages (`for_agent`, `since_id`, `mark_read`) |
 | `bus_task_list` | List tasks (`state`, `to`, `limit`) |
 | `bus_verify` | Re-hash every ref and result; report drift |
 | `bus_task_dispatch` | **Opt-in**: start the target agent CLI for a task and wait for its result |
+| `bus_task_wait` | Wait for `done`/`failed` or a new `question`/`blocked`/`error` message |
+| `bus_task_run` | Create and dispatch in one call |
 
 ### Active dispatch
 
@@ -163,7 +171,7 @@ agentbus onboard --conductor codex --allow /path/to/workspace
 
 It scans PATH and known install locations for Codex, Claude Code, Gemini CLI, Antigravity and OpenCode, picks one **conductor** (can create/dispatch/verify) and writes the rest as **worker**. It then asks which model each agent should default to and stores the answers in `agents.json` in the bus root (git-ignored), and rewrites each client's MCP config with `AGENTBUS_ROLE`.
 
-Roles are enforced, not cosmetic: a worker's `tools/list` returns only six tools (register / claim / heartbeat / ref_read / complete / fail), and calling `bus_task_create` or `bus_task_dispatch` is rejected — a dispatched agent cannot dispatch further.
+Roles are enforced, not cosmetic: a worker's `tools/list` returns only 8 tools (`register` / `claim` / `heartbeat` / `ref_read` / `complete` / `fail` / `message` / `inbox`), and calling `bus_task_create` or `bus_task_dispatch` is rejected — a dispatched agent cannot dispatch further. Unknown `AGENTBUS_ROLE` values also fall back to `worker`.
 
 Model choices stay local: the repo ships the ask/store/apply mechanism, never anybody's preferences.
 
@@ -230,12 +238,18 @@ Details and reporting: [`SECURITY.md`](SECURITY.md).
 | OpenAI Codex CLI | `--client codex` | ✅ 2026-11 — full claim → complete loop |
 | Claude Code | `--client claude` | config only |
 | Gemini CLI | `--client gemini` | config only |
-| Google Antigravity | `--client antigravity` | config only |
+| Google Antigravity | `--client antigravity` | ✅ 2026-11 — full claim → complete loop |
 | Cursor | `--client cursor` | config only |
 | OpenCode | `--client opencode` | config only |
 | Claude Desktop | `--client claude-desktop` | config only |
+| Windsurf | `--client windsurf` (optional) | config only |
+| Kiro | `--client kiro` (optional) | config only |
+| LM Studio | `--client lmstudio` (optional) | config only |
+| Cline (VS Code / CLI) | `--client cline` (optional) | config only |
+| DeepSeek Harness (DSH) | `--client dsh` (optional) | Cordis YAML block + parser check |
+| Hermes Agent | `--client hermes` (optional) | `hermes mcp add` + `mcp list` |
 
-Any MCP client that speaks stdio JSON-RPC works; `setup` just automates the common ones.
+Any MCP client that speaks stdio JSON-RPC works; `setup` automates these 13 clients, and [`docs/CLIENTS.md`](docs/CLIENTS.md) covers manual setup for Trae, Qoder, CodeBuddy, VS Code, Zed, and OpenClaw as well as DSH/Hermes verification and rollback.
 
 ---
 
@@ -266,7 +280,7 @@ Any MCP client that speaks stdio JSON-RPC works; `setup` just automates the comm
 ```bash
 git clone https://github.com/USERNAME/agentbus.git
 cd agentbus
-node test/accept.mjs     # 31 assertions, self-contained
+node test/accept.mjs     # self-contained acceptance suite
 ```
 
 The suite generates its own fixtures, spawns real CLI processes, opens the real SQLite database, and speaks real MCP over stdio. No test framework, no shell pipes (a piped exit code is a lie).

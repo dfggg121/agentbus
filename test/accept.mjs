@@ -1674,6 +1674,416 @@ async function main() {
       migClaim.rc === 0 && migClaim.json?.goal === 'legacy goal "quoted"' &&
       migMsg.rc === 0 && (migInbox.json?.messages || []).length === 1,
       `listRc=${migList.rc} claimRc=${migClaim.rc} msgRc=${migMsg.rc} inbox=${migInbox.json?.messages?.length}`);
+
+    // 74. DSH YAML 块插入/幂等/保留其他内容/结构解析通过 + --role/--allow-dispatch
+    const dshHome74 = path.join(RUN_BASE, 'dsh_home_74');
+    const dshAllow74 = path.join(RUN_BASE, 'dsh allow 74');
+    const dshRoot74 = path.join(RUN_BASE, 'dsh root 74');
+    fs.mkdirSync(dshAllow74, { recursive: true });
+    const dshCfg74 = path.join(dshHome74, '.dsh', 'profiles', 'desktop', 'cordis.patch.yml');
+    fs.mkdirSync(path.dirname(dshCfg74), { recursive: true });
+    const dshSeed74 = [
+      '# user custom comment',
+      '- insert:',
+      '    - id: keep-plugin',
+      "      name: '@example/keep-plugin'",
+      '      config:',
+      '        enabled: true',
+      '',
+    ].join('\n');
+    fs.writeFileSync(dshCfg74, dshSeed74, 'utf8');
+
+    const dshRun1 = runCli([
+      'setup', '--client', 'dsh', '--home', dshHome74, '--allow', dshAllow74,
+      '--role', 'conductor', '--allow-dispatch',
+    ], { root: dshRoot74, allowed: dshAllow74 });
+    const dshRun2 = runCli([
+      'setup', '--client', 'dsh', '--home', dshHome74, '--allow', dshAllow74,
+      '--role', 'conductor', '--allow-dispatch',
+    ], { root: dshRoot74, allowed: dshAllow74 });
+    const dshText74 = fs.readFileSync(dshCfg74, 'utf8');
+
+    // Strict self-contained YAML validator for Cordis patch sequence
+    function parseCordisPatchYaml(yamlText) {
+      const lines = yamlText.replace(/\r\n/g, '\n').split('\n');
+      const items = [];
+      let curInsert = null;
+      let curNode = null;
+      let inConfig = false;
+      let inEnv = false;
+      const parseScalar = (raw) => {
+        const s = raw.trim();
+        if (s === 'true') return true;
+        if (s === 'false') return false;
+        if (s.startsWith('"')) return JSON.parse(s);
+        if (s.startsWith("'") && s.endsWith("'") && s.length >= 2) return s.slice(1, -1);
+        if (s.startsWith('[') && s.endsWith(']')) return JSON.parse(s);
+        return s;
+      };
+      for (let idx = 0; idx < lines.length; idx++) {
+        const raw = lines[idx];
+        if (!raw.trim() || raw.trim().startsWith('#')) continue;
+        if (raw.includes('\t')) throw new Error(`Tab indent on line ${idx + 1}`);
+        const indent = raw.length - raw.trimStart().length;
+        const t = raw.trim();
+        if (indent === 0 && t === '- insert:') {
+          curInsert = [];
+          items.push({ insert: curInsert });
+          curNode = null;
+          inConfig = false;
+          inEnv = false;
+          continue;
+        }
+        if (indent === 4 && t.startsWith('- id:') && curInsert) {
+          curNode = { id: parseScalar(t.slice(5)), config: {} };
+          curInsert.push(curNode);
+          inConfig = false;
+          inEnv = false;
+          continue;
+        }
+        if (indent === 6 && curNode) {
+          const ci = t.indexOf(':');
+          if (ci < 1) throw new Error(`Invalid line ${idx + 1}: ${raw}`);
+          const k = t.slice(0, ci).trim();
+          const v = t.slice(ci + 1).trim();
+          if (k === 'config' && !v) { inConfig = true; inEnv = false; }
+          else { curNode[k] = parseScalar(v); inConfig = false; inEnv = false; }
+          continue;
+        }
+        if (indent === 8 && curNode && inConfig) {
+          const ci = t.indexOf(':');
+          if (ci < 1) throw new Error(`Invalid config line ${idx + 1}: ${raw}`);
+          const k = t.slice(0, ci).trim();
+          const v = t.slice(ci + 1).trim();
+          if (k === 'env' && !v) { curNode.config.env = {}; inEnv = true; }
+          else { curNode.config[k] = parseScalar(v); inEnv = false; }
+          continue;
+        }
+        if (indent === 10 && curNode && inConfig && inEnv) {
+          const ci = t.indexOf(':');
+          if (ci < 1) throw new Error(`Invalid env line ${idx + 1}: ${raw}`);
+          const k = t.slice(0, ci).trim();
+          const v = t.slice(ci + 1).trim();
+          curNode.config.env[k] = parseScalar(v);
+          continue;
+        }
+        throw new Error(`Unexpected YAML structure at line ${idx + 1} (indent=${indent}): ${raw}`);
+      }
+      return items;
+    }
+
+    let dshParsed74 = [];
+    let dshYamlOk = false;
+    try {
+      dshParsed74 = parseCordisPatchYaml(dshText74);
+      dshYamlOk = true;
+    } catch { dshYamlOk = false; }
+    const dshAllNodes = dshParsed74.flatMap((x) => x.insert || []);
+    const dshKeepNode = dshAllNodes.find((n) => n.id === 'keep-plugin');
+    const dshBusNode = dshAllNodes.find((n) => n.id === 'agentbus-mcp');
+
+    // Also test unknown role falls back to worker & dispatch=0
+    const dshUnknownRole = runCli([
+      'setup', '--client', 'dsh', '--home', dshHome74, '--allow', dshAllow74, '--role', 'superadmin',
+    ], { root: dshRoot74, allowed: dshAllow74 });
+    const dshParsedFallback = parseCordisPatchYaml(fs.readFileSync(dshCfg74, 'utf8'));
+    const dshFallbackBus = dshParsedFallback.flatMap((x) => x.insert || []).find((n) => n.id === 'agentbus-mcp');
+
+    assertCase(74, 'DSH YAML 块插入/幂等/保留已有插件/结构解析通过 + --role/--allow-dispatch 回落校验',
+      dshRun1.rc === 0 &&
+      dshRun1.json?.results?.[0]?.changed === true &&
+      dshRun1.json?.results?.[0]?.restart_required === true &&
+      Boolean(dshRun1.json?.results?.[0]?.backup && fs.existsSync(dshRun1.json.results[0].backup)) &&
+      dshRun2.rc === 0 &&
+      dshRun2.json?.results?.[0]?.changed === false &&
+      dshRun2.json?.results?.[0]?.backup === null &&
+      dshYamlOk &&
+      dshText74.includes('# user custom comment') &&
+      dshText74.includes('# BEGIN agentbus-managed') &&
+      dshText74.includes('# END agentbus-managed') &&
+      dshKeepNode?.name === '@example/keep-plugin' &&
+      dshKeepNode?.config?.enabled === true &&
+      dshBusNode?.name === '@deepseek-ai/dsh-mcp-client' &&
+      dshBusNode?.config?.transport === 'stdio' &&
+      dshBusNode?.config?.serverName === 'agentbus' &&
+      Array.isArray(dshBusNode?.config?.args) &&
+      dshBusNode?.config?.env?.AGENTBUS_ROOT === path.resolve(dshRoot74) &&
+      dshBusNode?.config?.env?.AGENTBUS_ALLOWED_ROOTS === path.resolve(dshAllow74) &&
+      dshBusNode?.config?.env?.AGENTBUS_ROLE === 'conductor' &&
+      dshBusNode?.config?.env?.AGENTBUS_ENABLE_DISPATCH === '1' &&
+      dshUnknownRole.rc === 0 &&
+      dshFallbackBus?.config?.env?.AGENTBUS_ROLE === 'worker' &&
+      dshFallbackBus?.config?.env?.AGENTBUS_ENABLE_DISPATCH === '0',
+      `r1=${dshRun1.rc}/${dshRun1.json?.results?.[0]?.changed} r2=${dshRun2.rc}/${dshRun2.json?.results?.[0]?.changed} yamlOk=${dshYamlOk}`);
+
+    // 75. Hermes mock CLI：参数顺序/stdin y\n/HERMES_HOME 隔离/mcp list 校验/已存在跳过/失败回滚
+    const hermesBase75 = path.join(RUN_BASE, 'hermes_test_75');
+    fs.mkdirSync(hermesBase75, { recursive: true });
+    const fakeHermesJs = path.join(hermesBase75, 'fake_hermes.mjs');
+    const hermesCallLog = path.join(hermesBase75, 'calls.jsonl');
+    fs.writeFileSync(fakeHermesJs, [
+      "import fs from 'node:fs';",
+      "import path from 'node:path';",
+      "const argv = process.argv.slice(2);",
+      "const stdinData = fs.readFileSync(0, 'utf8');",
+      "const hHome = process.env.HERMES_HOME || '';",
+      "const logPath = process.env.FAKE_HERMES_LOG;",
+      "fs.appendFileSync(logPath, JSON.stringify({ argv, hermesHome: hHome, stdin: stdinData }) + '\\n', 'utf8');",
+      "const mode = process.env.FAKE_HERMES_MODE || 'ok';",
+      "const cfgPath = path.join(hHome, 'config.yaml');",
+      "if (argv[0] === 'mcp' && argv[1] === 'add') {",
+      "  if (mode === 'fail') {",
+      "    fs.mkdirSync(hHome, { recursive: true });",
+      "    fs.writeFileSync(cfgPath, 'corrupted_partial: true\\n', 'utf8');",
+      "    console.error('simulated hermes add failure');",
+      "    process.exit(1);",
+      "  }",
+      "  if (mode === 'cancel') {",
+      "    console.log('Cancelled.');",
+      "    process.exit(0);",
+      "  }",
+      "  if (!stdinData.includes('y')) {",
+      "    console.log('Cancelled.');",
+      "    process.exit(0);",
+      "  }",
+      "  fs.mkdirSync(hHome, { recursive: true });",
+      "  const prev = fs.existsSync(cfgPath) ? fs.readFileSync(cfgPath, 'utf8') : '';",
+      "  const next = (prev ? prev.trimEnd() + '\\n' : '') + 'mcp_servers:\\n  agentbus:\\n    command: node\\n';",
+      "  fs.writeFileSync(cfgPath, next, 'utf8');",
+      "  console.log('Added agentbus');",
+      "  process.exit(0);",
+      "}",
+      "if (argv[0] === 'mcp' && argv[1] === 'list') {",
+      "  if (mode === 'miss_list') {",
+      "    console.log('No MCP servers');",
+      "    process.exit(0);",
+      "  }",
+      "  const txt = fs.existsSync(cfgPath) ? fs.readFileSync(cfgPath, 'utf8') : '';",
+      "  if (/\\bagentbus\\s*:/.test(txt)) console.log('agentbus (stdio)');",
+      "  else console.log('No MCP servers');",
+      "  process.exit(0);",
+      "}",
+      "process.exit(1);",
+    ].join('\n'), 'utf8');
+    const fakeHermesBin = path.join(hermesBase75, process.platform === 'win32' ? 'hermes.cmd' : 'hermes');
+    if (process.platform === 'win32') {
+      fs.writeFileSync(fakeHermesBin, `@echo off\r\n"${process.execPath}" "%~dp0fake_hermes.mjs" %*\r\n`, 'utf8');
+    } else {
+      fs.writeFileSync(fakeHermesBin, `#!/bin/sh\nexec "${process.execPath}" "${fakeHermesJs}" "$@"\n`, { mode: 0o755 });
+    }
+    const hermesHome75a = path.join(hermesBase75, 'fake home 75a');
+    const hermesHome75b = path.join(hermesBase75, 'fake home 75b');
+    const hermesRoot75 = path.join(hermesBase75, 'root75');
+    const hermesAllow75 = path.join(hermesBase75, 'allow75');
+    fs.mkdirSync(hermesAllow75, { recursive: true });
+
+    const hermesAddRes = runCli([
+      'setup', '--client', 'hermes', '--home', hermesHome75a, '--allow', hermesAllow75,
+    ], {
+      root: hermesRoot75,
+      allowed: hermesAllow75,
+      envExtra: { AGENTBUS_HERMES_BIN: fakeHermesBin, FAKE_HERMES_LOG: hermesCallLog },
+    });
+    const hermesSkipRes = runCli([
+      'setup', '--client', 'hermes', '--home', hermesHome75a, '--allow', hermesAllow75,
+    ], {
+      root: hermesRoot75,
+      allowed: hermesAllow75,
+      envExtra: { AGENTBUS_HERMES_BIN: fakeHermesBin, FAKE_HERMES_LOG: hermesCallLog },
+    });
+
+    // Rollback test on pre-existing config.yaml
+    const hermesSeedDir75b = path.join(hermesHome75b, '.hermes');
+    fs.mkdirSync(hermesSeedDir75b, { recursive: true });
+    const hermesCfg75b = path.join(hermesSeedDir75b, 'config.yaml');
+    const hermesOrig75b = 'mcp_servers:\n  keep_other:\n    command: echo\n';
+    fs.writeFileSync(hermesCfg75b, hermesOrig75b, 'utf8');
+    const hermesFailRes = runCli([
+      'setup', '--client', 'hermes', '--home', hermesHome75b, '--allow', hermesAllow75,
+    ], {
+      root: hermesRoot75,
+      allowed: hermesAllow75,
+      envExtra: { AGENTBUS_HERMES_BIN: fakeHermesBin, FAKE_HERMES_LOG: hermesCallLog, FAKE_HERMES_MODE: 'fail' },
+    });
+
+    const hermesCalls = fs.existsSync(hermesCallLog)
+      ? fs.readFileSync(hermesCallLog, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l))
+      : [];
+    const addCalls75a = hermesCalls.filter((c) => c.argv[0] === 'mcp' && c.argv[1] === 'add' && c.hermesHome === path.join(hermesHome75a, '.hermes'));
+    const listCalls75a = hermesCalls.filter((c) => c.argv[0] === 'mcp' && c.argv[1] === 'list' && c.hermesHome === path.join(hermesHome75a, '.hermes'));
+    const firstAddArgv = addCalls75a[0]?.argv || [];
+    const argsFlagIdx = firstAddArgv.indexOf('--args');
+    const cmdFlagIdx = firstAddArgv.indexOf('--command');
+    const envFlagIdx = firstAddArgv.indexOf('--env');
+
+    assertCase(75, 'Hermes mock CLI：参数/--args 末位/stdin y\\n/HERMES_HOME 隔离/mcp list 校验/已存在跳过/失败回滚',
+      hermesAddRes.rc === 0 &&
+      hermesAddRes.json?.results?.[0]?.changed === true &&
+      hermesAddRes.json?.results?.[0]?.verified_by === 'hermes mcp list' &&
+      addCalls75a.length === 1 &&
+      listCalls75a.length >= 1 &&
+      firstAddArgv[2] === 'agentbus' &&
+      envFlagIdx >= 0 && cmdFlagIdx > envFlagIdx && argsFlagIdx > cmdFlagIdx &&
+      firstAddArgv.slice(argsFlagIdx + 1).includes('mcp') &&
+      addCalls75a[0]?.stdin === 'y\n' &&
+      hermesSkipRes.rc === 0 &&
+      hermesSkipRes.json?.results?.[0]?.changed === false &&
+      hermesFailRes.rc === 1 &&
+      hermesFailRes.json?.results?.[0]?.error_code === 'hermes_cli_failed' &&
+      fs.readFileSync(hermesCfg75b, 'utf8') === hermesOrig75b,
+      `addRc=${hermesAddRes.rc} addCnt=${addCalls75a.length} listCnt=${listCalls75a.length} skipChg=${hermesSkipRes.json?.results?.[0]?.changed} failCode=${hermesFailRes.json?.results?.[0]?.error_code}`);
+
+    // 76. 至少 4 个 JSON 客户端（windsurf/kiro/lmstudio/cline）路径与合并幂等 + Cline VS Code globalStorage
+    const jsonHome76 = path.join(RUN_BASE, 'json_clients_76');
+    const jsonRoot76 = path.join(RUN_BASE, 'json_root_76');
+    const jsonAllow76 = path.join(RUN_BASE, 'json_allow_76');
+    fs.mkdirSync(jsonAllow76, { recursive: true });
+    const jsonSeeds76 = [
+      ['windsurf', path.join(jsonHome76, '.codeium', 'windsurf', 'mcp_config.json')],
+      ['kiro', path.join(jsonHome76, '.kiro', 'settings', 'mcp.json')],
+      ['lmstudio', path.join(jsonHome76, '.lmstudio', 'mcp.json')],
+      ['cline', path.join(jsonHome76, '.cline', 'data', 'settings', 'cline_mcp_settings.json')],
+    ];
+    for (const [cid, fp] of jsonSeeds76) {
+      fs.mkdirSync(path.dirname(fp), { recursive: true });
+      fs.writeFileSync(fp, JSON.stringify({
+        keepFlag: cid,
+        mcpServers: { existingServer: { command: 'echo', args: [cid] } },
+      }, null, 2) + '\n', 'utf8');
+    }
+    const jsonRun1 = runCli([
+      'setup', '--client', 'windsurf', '--client', 'kiro', '--client', 'lmstudio', '--client', 'cline',
+      '--home', jsonHome76, '--allow', jsonAllow76,
+    ], { root: jsonRoot76, allowed: jsonAllow76 });
+    const jsonRun2 = runCli([
+      'setup', '--client', 'windsurf', '--client', 'kiro', '--client', 'lmstudio', '--client', 'cline',
+      '--home', jsonHome76, '--allow', jsonAllow76,
+    ], { root: jsonRoot76, allowed: jsonAllow76 });
+    const jsonMergedOk = jsonSeeds76.every(([cid, fp]) => {
+      const d = JSON.parse(fs.readFileSync(fp, 'utf8'));
+      const ab = d.mcpServers?.agentbus;
+      return d.keepFlag === cid &&
+        d.mcpServers?.existingServer?.command === 'echo' &&
+        Boolean(ab?.command) &&
+        Array.isArray(ab?.args) &&
+        ab?.env?.AGENTBUS_ROOT === path.resolve(jsonRoot76) &&
+        ab?.env?.AGENTBUS_ROLE === 'worker' &&
+        ab?.env?.AGENTBUS_ENABLE_DISPATCH === '0';
+    });
+    const clineVscHome = path.join(RUN_BASE, 'cline_vsc_76');
+    const clineVscExtDir = process.platform === 'win32'
+      ? path.join(clineVscHome, 'AppData', 'Roaming', 'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev')
+      : process.platform === 'darwin'
+        ? path.join(clineVscHome, 'Library', 'Application Support', 'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev')
+        : path.join(clineVscHome, '.config', 'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev');
+    fs.mkdirSync(clineVscExtDir, { recursive: true });
+    const clineVscDesc = runCli(['setup', '--list', '--home', clineVscHome]).json?.clients?.find((c) => c.id === 'cline');
+    assertCase(76, '4 个 JSON 客户端(windsurf/kiro/lmstudio/cline)路径、合并幂等与 Cline VS Code globalStorage 探测',
+      jsonRun1.rc === 0 &&
+      (jsonRun1.json?.results || []).length === 4 &&
+      (jsonRun1.json?.results || []).every((r) => r.ok && r.changed === true && r.backup && fs.existsSync(r.backup)) &&
+      jsonRun2.rc === 0 &&
+      (jsonRun2.json?.results || []).every((r) => r.ok && r.changed === false && r.backup === null) &&
+      jsonMergedOk &&
+      clineVscDesc?.installed === true &&
+      clineVscDesc?.config === path.join(clineVscExtDir, 'settings', 'cline_mcp_settings.json'),
+      `r1=${jsonRun1.rc} r2=${jsonRun2.rc} merged=${jsonMergedOk} clineCfg=${clineVscDesc?.config}`);
+
+    // 77. 未安装可选客户端不创建目录 + doctor 不报致命错误只给 next_steps
+    const emptyHome77 = path.join(RUN_BASE, 'empty_optional_77');
+    const root77 = path.join(RUN_BASE, 'root_77');
+    const allow77 = path.join(RUN_BASE, 'allow_77');
+    fs.mkdirSync(emptyHome77, { recursive: true });
+    fs.mkdirSync(allow77, { recursive: true });
+    const setupEmpty77 = runCli(['setup', '--home', emptyHome77, '--allow', allow77], { root: root77, allowed: allow77 });
+    const docEmpty77 = runCli(['doctor', '--home', emptyHome77], { root: root77, allowed: allow77 });
+    const optDirs = ['.codeium', '.kiro', '.lmstudio', '.cline', '.dsh', '.hermes'];
+    const noOptDirsCreated = optDirs.every((d) => !fs.existsSync(path.join(emptyHome77, d)));
+    const optIds77 = ['windsurf', 'kiro', 'lmstudio', 'cline', 'dsh', 'hermes'];
+    const docOptOk = optIds77.every((id) => {
+      const c = (docEmpty77.json?.clients || []).find((x) => x.id === id);
+      const hasDiag = (docEmpty77.json?.diagnostics || []).some((d) => d.target === id);
+      const hasNext = (docEmpty77.json?.next_steps || []).some((s) => s.includes(`--client ${id}`));
+      return c?.skipped === true && c?.installed === false && (c?.issues || []).length === 0 && !hasDiag && hasNext;
+    });
+    assertCase(77, '未安装可选客户端 setup 不建目录且跳过，doctor 不报致命错误只给 next_steps',
+      setupEmpty77.rc === 0 &&
+      noOptDirsCreated &&
+      optIds77.every((id) => (setupEmpty77.json?.skipped_optional || []).includes(id)) &&
+      docEmpty77.rc === 0 &&
+      docOptOk,
+      `noDirs=${noOptDirsCreated} skipped=${JSON.stringify(setupEmpty77.json?.skipped_optional)} docOpt=${docOptOk}`);
+
+    // 78. setup --list 只读（目录树与文件 sha256 前后一致）且包含全部 13 个客户端与完整字段
+    const listHome78 = path.join(RUN_BASE, 'list_readonly_78');
+    fs.mkdirSync(path.join(listHome78, '.kiro', 'settings'), { recursive: true });
+    fs.writeFileSync(path.join(listHome78, '.kiro', 'settings', 'mcp.json'), '{"mcpServers":{}}\n', 'utf8');
+    const snapTree = (dir) => {
+      const out = [];
+      const walk = (cur) => {
+        for (const ent of fs.readdirSync(cur, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+          const full = path.join(cur, ent.name);
+          if (ent.isDirectory()) { out.push(`D:${path.relative(dir, full)}`); walk(full); }
+          else { out.push(`F:${path.relative(dir, full)}:${createHash('sha256').update(fs.readFileSync(full)).digest('hex')}`); }
+        }
+      };
+      walk(dir);
+      return out.join('\n');
+    };
+    const snapBefore78 = snapTree(listHome78);
+    const listRes78 = runCli(['setup', '--list', '--home', listHome78]);
+    const snapAfter78 = snapTree(listHome78);
+    const listedClients = listRes78.json?.clients || [];
+    const expectedIds78 = ['codex', 'claude', 'gemini', 'antigravity', 'cursor', 'opencode', 'claude-desktop', 'windsurf', 'kiro', 'lmstudio', 'cline', 'dsh', 'hermes'];
+    const allFields78 = listedClients.every((c) =>
+      typeof c.id === 'string' && typeof c.label === 'string' && typeof c.format === 'string' &&
+      typeof c.config === 'string' && typeof c.installed === 'boolean' && typeof c.optional === 'boolean'
+    );
+    const kiroEntry78 = listedClients.find((c) => c.id === 'kiro');
+    const dshEntry78 = listedClients.find((c) => c.id === 'dsh');
+    assertCase(78, 'setup --list 严格只读（树与 sha256 前后完全一致）且包含 dsh/hermes/windsurf/kiro/lmstudio/cline',
+      listRes78.rc === 0 &&
+      snapBefore78 === snapAfter78 &&
+      expectedIds78.every((id) => listedClients.some((c) => c.id === id)) &&
+      allFields78 &&
+      kiroEntry78?.optional === true && kiroEntry78?.installed === true &&
+      dshEntry78?.optional === true && dshEntry78?.installed === false,
+      `rc=${listRes78.rc} same=${snapBefore78 === snapAfter78} count=${listedClients.length}`);
+
+    // 79. 旧 7 客户端不回归 + 文档完整性校验
+    const coreIds79 = ['codex', 'claude', 'gemini', 'antigravity', 'cursor', 'opencode', 'claude-desktop'];
+    const coreSetupIds79 = (setupEmpty77.json?.results || []).map((r) => r.client);
+    const coreAllConfigured79 = coreIds79.every((id) => {
+      const c = (docEmpty77.json?.clients || []).find((x) => x.id === id);
+      return c?.configured === true && !c?.config_error;
+    });
+    const docFiles79 = [
+      path.join(PKG_ROOT, 'docs', 'CLIENTS.md'),
+      path.join(PKG_ROOT, 'docs', 'PROTOCOL.md'),
+      path.join(PKG_ROOT, 'README.md'),
+      path.join(PKG_ROOT, 'README.zh-CN.md'),
+    ];
+    const allDocsExist79 = docFiles79.every((f) => fs.existsSync(f));
+    const docContents79 = allDocsExist79 ? docFiles79.map((f) => fs.readFileSync(f, 'utf8')) : [];
+    const clientsDoc79 = docContents79[0] || '';
+    const protoDoc79 = docContents79[1] || '';
+    const readmeEn79 = docContents79[2] || '';
+    const readmeZh79 = docContents79[3] || '';
+    const noPersonalPref79 = docContents79.every((t) => !/gpt6\.2sol|极高|sk-[A-Za-z0-9]{20,}/.test(t));
+    assertCase(79, '旧 7 客户端不回归 + 文档完整性（docs/CLIENTS.md、PROTOCOL.md、README 中英无偏好/密钥泄漏）',
+      coreIds79.every((id) => coreSetupIds79.includes(id)) &&
+      coreSetupIds79.length === 7 &&
+      coreAllConfigured79 &&
+      allDocsExist79 &&
+      ['dsh', 'hermes', 'windsurf', 'kiro', 'lmstudio', 'cline', 'Trae', 'Qoder', 'CodeBuddy', 'VS Code', 'Zed', 'OpenClaw'].every((k) => clientsDoc79.includes(k)) &&
+      clientsDoc79.includes('hermes mcp list') &&
+      clientsDoc79.includes('cordis.patch.yml') &&
+      protoDoc79.includes('bus_task_message') &&
+      protoDoc79.includes('bus_task_inbox') &&
+      readmeEn79.includes('docs/CLIENTS.md') &&
+      readmeZh79.includes('docs/CLIENTS.md') &&
+      noPersonalPref79,
+      `setupIds=${JSON.stringify(coreSetupIds79)} configured=${coreAllConfigured79} docs=${allDocsExist79} noPref=${noPersonalPref79}`);
   } finally {
     try { fs.rmSync(RUN_BASE, { recursive: true, force: true }); } catch {}
   }

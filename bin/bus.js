@@ -96,7 +96,7 @@ function printHelp() {
     name: 'agentbus',
     version: VERSION,
     commands: [
-      'setup [--client <id>]... [--root <dir>] [--allow <dir>]... [--bin node|npx] [--home <dir>] [--require-config-dir] [--dry-run]',
+      'setup [--client <id>]... [--root <dir>] [--allow <dir>]... [--bin node|npx] [--home <dir>] [--role conductor|worker] [--allow-dispatch] [--list] [--require-config-dir] [--dry-run]',
       'doctor [--root <dir>] [--home <dir>]',
       'version',
       'init [--root <dir>]',
@@ -167,12 +167,17 @@ async function main() {
       process.exit(0);
     }
     try {
+      const rawRole = typeof args.role === 'string' ? args.role.trim().toLowerCase() : 'worker';
+      const role = rawRole === 'conductor' ? 'conductor' : 'worker';
+      const allowDispatch = args['allow-dispatch'] === true;
       const result = setupClients({
         clients: args.client,
         root: rootOverride,
         allowed: args.allow,
         bin: typeof args.bin === 'string' ? args.bin : 'node',
         home: homeOverride,
+        role,
+        allowDispatch,
         requireConfigDir: !!args['require-config-dir'],
         dryRun: !!args['dry-run'],
       });
