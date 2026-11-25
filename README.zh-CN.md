@@ -43,8 +43,9 @@ codex  claude  gemini  antigravity  cursor  opencode  claude-desktop
 
 ```bash
 npx agentbus-mcp setup --client codex --client claude --client gemini
+npx agentbus-mcp setup --list   # 看 id、配置文件路径；只读，不写盘
 npx agentbus-mcp doctor      # 看当前配置状态
-npx agentbus-mcp clients     # 列出支持的客户端 id
+npx agentbus-mcp clients     # 只列 id
 ```
 
 默认总线目录是 `~/.agentbus`，只有该目录下的文件能作为引用。实际项目请显式放行：

@@ -330,6 +330,15 @@ export function listClients() {
   return CLIENTS.map((c) => c.id);
 }
 
+export function describeClients({ home = os.homedir(), platform = process.platform } = {}) {
+  return CLIENTS.map((c) => ({
+    id: c.id,
+    label: c.label,
+    format: c.format,
+    config: clientConfigFile(c.id, home, platform),
+  }));
+}
+
 function applyClient(client, opts) {
   const file = clientConfigFile(client.id, opts.home, opts.platform);
   const dir = path.dirname(file);

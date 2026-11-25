@@ -17,7 +17,7 @@ import {
   verifyTasks,
 } from '../src/tasks.js';
 import { startMcpStdio, startMcpHttp } from '../src/mcp.js';
-import { setupClients, doctor, listClients, defaultRoot } from '../src/setup.js';
+import { setupClients, doctor, listClients, describeClients, defaultRoot } from '../src/setup.js';
 import { dispatchTask, dispatchEnabled, waitForTask, maybeArchiveTask } from '../src/dispatch.js';
 import { exportAgySession, defaultAgySessionPath, archiveConversation } from '../src/agy.js';
 import { loadContextLedger, confirmDecision } from '../src/context.js';
@@ -158,6 +158,10 @@ async function main() {
   }
 
   if (cmd === 'setup') {
+    if (args.list) {
+      process.stdout.write(JSON.stringify({ ok: true, clients: describeClients({ home: homeOverride }) }, null, 2) + '\n');
+      process.exit(0);
+    }
     try {
       const result = setupClients({
         clients: args.client,

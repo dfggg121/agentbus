@@ -43,8 +43,9 @@ Pick several at once:
 
 ```bash
 npx agentbus-mcp setup --client codex --client claude --client gemini
+npx agentbus-mcp setup --list   # ids + config paths, read-only
 npx agentbus-mcp doctor      # show what is configured
-npx agentbus-mcp clients     # list supported ids
+npx agentbus-mcp clients     # ids only
 ```
 
 By default the bus lives in `~/.agentbus` and only files inside it may be referenced. Pass `--allow` for the project you actually work in:
