@@ -27,7 +27,7 @@
 
 ## 安装
 
-需要 **Node.js ≥ 22.5**（`node:sqlite`）。
+需要 **Node.js ≥ 22.13**（`node:sqlite` 无需实验 flag；Node 23.4+ 也可）。
 
 ### 离线 tarball（当前支持方式）
 
@@ -307,7 +307,7 @@ AGENTBUS_ARCHIVE_ON_DONE=1                          # 单次运行临时开启
 - **仅限本机。** 引用是 `file://` 地址。跨机需要一层 HTTP 资料库，信封结构不用改。
 - **CLI 提示目前是中文。** 英文/多语言在路线图上；MCP 返回是 JSON，与语言无关。
 - **没有后台守护进程。** 租约过期在下一次读/写时惰性回收。
-- **要求 Node ≥ 22.5**，因为 SQLite 来自 `node:sqlite`。
+- **要求 Node ≥ 22.13**（Node 23.4+ 也可），因为 SQLite 来自 `node:sqlite`。
 - **当前先走离线 tarball。** npm 尚未发布，`npx agentbus-mcp` 不是本版本支持的安装方式。干净机器清单和分层边界见 [`docs/PORTABILITY.md`](docs/PORTABILITY.md)。
 
 ---

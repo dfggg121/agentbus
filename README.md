@@ -27,7 +27,7 @@ If you run more than one coding agent, you know the pattern: every handoff recre
 
 ## Install
 
-Requires **Node.js ≥ 22.5** (for `node:sqlite`).
+Requires **Node.js ≥ 22.13** (for `node:sqlite` without an experimental flag; Node 23.4+ also works).
 
 ### Offline tarball (current supported path)
 
@@ -295,7 +295,7 @@ Any MCP client that speaks stdio JSON-RPC works; `setup` automates these 13 clie
 - **Same machine only.** References are `file://` URIs. Cross-machine handoff needs an HTTP-backed artifact store; the envelope shape would not change.
 - **CLI messages are currently Chinese.** English/localized messages are on the roadmap; MCP results are JSON and language-neutral.
 - **No background daemon.** Lease expiry is reclaimed lazily on the next read/write.
-- **Node ≥ 22.5 required**, since SQLite comes from `node:sqlite`.
+- **Node ≥ 22.13 required** (Node 23.4+ also works), since SQLite comes from `node:sqlite`.
 - **Offline tarball first.** npm is not published yet; `npx agentbus-mcp` is not the supported install path. See [`docs/PORTABILITY.md`](docs/PORTABILITY.md) for the clean-machine checklist and per-layer limits.
 
 ---

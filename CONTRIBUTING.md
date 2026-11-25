@@ -15,7 +15,7 @@ Thanks for taking a look. This project is intentionally small; the bar for new s
 ```bash
 git clone https://github.com/dfggg121/agentbus.git
 cd agentbus
-node --version          # must be >= 22.5
+node --version          # must be >= 22.13 (or >= 23.4)
 node test/accept.mjs    # self-contained; 104 cases currently
 ```
 

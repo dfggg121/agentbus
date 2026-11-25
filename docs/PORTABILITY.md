@@ -4,7 +4,7 @@
 
 | Layer | Portable? | What it needs |
 |---|---|---|
-| Core CLI + MCP stdio server | Yes | Node.js >= 22.5, a writable bus root |
+| Core CLI + MCP stdio server | Yes | Node.js >= 22.13 (or >= 23.4), a writable bus root |
 | Artifact pointers | Local only | `file://` refs; bus and files stay on one machine |
 | Client auto-config (`setup`) | Mostly | The target client binary and its config directory |
 | Agent dispatch | Per agent | Codex/Claude/Gemini/Antigravity/OpenCode installed and authenticated |
@@ -25,7 +25,7 @@ sha256sum /tmp/agentbus-mcp-*.tgz
 Copy the `.tgz` and its checksum to the target machine. On the target:
 
 ```bash
-node --version          # must be >= 22.5
+node --version          # must be >= 22.13 (or >= 23.4)
 npm install -g ./agentbus-mcp-0.2.0.tgz
 agentbus version
 agentbus setup --list
@@ -70,7 +70,7 @@ application.
 | Symptom | Cause | Fix |
 |---|---|---|
 | `Cannot find module ...bus.js` | tarball not installed / wrong prefix | run the installed `.bin/agentbus` |
-| `node:sqlite` missing | Node < 22.5 | install Node 22.5+ |
+| `node:sqlite` missing | Node < 22.13 or Node 23 < 23.4 | install Node 22.13+ / 23.4+ |
 | `find ref failed` / path outside allowed roots | project not allowed | `setup --allow <project>` |
 | dispatch skipped | no conductor role or dispatch disabled | `setup --role conductor --allow-dispatch` |
 | `dial tcp ... connection refused` | stale Antigravity session | re-export session / restart app |

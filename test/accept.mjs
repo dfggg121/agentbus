@@ -3391,9 +3391,10 @@ async function main() {
       evaluateStaleMcp,
     } = await import('../src/setup.js');
 
-    const nsOk102 = await checkNodeSqlite({ nodeVersion: 'v22.5.0', sqliteAvailable: true });
+    const nsOk102 = await checkNodeSqlite({ nodeVersion: 'v22.13.0', sqliteAvailable: true });
+    const ns23Ok102 = await checkNodeSqlite({ nodeVersion: 'v23.4.0', sqliteAvailable: true });
     const nsLowVer102 = await checkNodeSqlite({ nodeVersion: 'v20.18.0', sqliteAvailable: true });
-    const nsNoSqlite102 = await checkNodeSqlite({ nodeVersion: 'v22.10.0', sqliteAvailable: false });
+    const nsNoSqlite102 = await checkNodeSqlite({ nodeVersion: 'v22.12.0', sqliteAvailable: false });
 
     const arBase102 = path.join(RUN_BASE, 'ar_102');
     const arSub102 = path.join(arBase102, 'proj');
@@ -3419,6 +3420,7 @@ async function main() {
 
     assertCase(102, 'doctorBootstrap 纯函数：node_sqlite 版本/sqlite、allowed_roots、agents_json(缺/空模型/损坏/正常)',
       nsOk102.status === 'pass' &&
+      ns23Ok102.status === 'pass' &&
       nsLowVer102.status === 'fail' &&
       nsNoSqlite102.status === 'fail' &&
       arPass102.status === 'pass' &&

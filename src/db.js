@@ -7,14 +7,14 @@ import { fileURLToPath } from 'node:url';
 
 let DatabaseSync;
 if (process.env.AGENTBUS_DISABLE_SQLITE === '1') {
-  console.error('需要 Node >= 22.5（node:sqlite）');
+  console.error('需要 Node >= 22.13（node:sqlite 已不再需要 --experimental-sqlite）');
   process.exit(1);
 }
 try {
   ({ DatabaseSync } = await import('node:sqlite'));
   if (typeof DatabaseSync !== 'function') throw new Error('DatabaseSync missing');
 } catch {
-  console.error('需要 Node >= 22.5（node:sqlite）');
+  console.error('需要 Node >= 22.13（node:sqlite 已不再需要 --experimental-sqlite）');
   process.exit(1);
 }
 

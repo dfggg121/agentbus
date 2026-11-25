@@ -1648,7 +1648,11 @@ export function parseNodeSemver(versionStr = process.version) {
 
 export async function checkNodeSqlite({ nodeVersion = process.version, sqliteAvailable = null } = {}) {
   const ver = parseNodeSemver(nodeVersion);
-  const verOk = Boolean(ver && (ver.major > 22 || (ver.major === 22 && ver.minor >= 5)));
+  const verOk = Boolean(ver && (
+    ver.major > 23
+    || (ver.major === 23 && ver.minor >= 4)
+    || (ver.major === 22 && ver.minor >= 13)
+  ));
   let hasSqlite = sqliteAvailable;
   let sqliteErr = null;
   if (typeof hasSqlite !== 'boolean') {
@@ -1664,18 +1668,18 @@ export async function checkNodeSqlite({ nodeVersion = process.version, sqliteAva
     return {
       id: 'node_sqlite',
       status: 'pass',
-      detail: `Node ${nodeVersion} >= 22.5 且 node:sqlite 可用`,
+      detail: `Node ${nodeVersion} >= 22.13 且 node:sqlite 可用`,
       fix: null,
     };
   }
   const reasons = [];
-  if (!verOk) reasons.push(`Node ${nodeVersion} 低于 22.5`);
+  if (!verOk) reasons.push(`Node ${nodeVersion} 低于 22.13（或 Node 23 低于 23.4）`);
   if (!hasSqlite) reasons.push(`node:sqlite 不可用${sqliteErr ? ` (${sqliteErr})` : ''}`);
   return {
     id: 'node_sqlite',
     status: 'fail',
     detail: reasons.join('；'),
-    fix: '安装或切换到 Node.js >= 22.5.0（需内置 node:sqlite）',
+    fix: '安装或切换到 Node.js >= 22.13.0（或 >= 23.4.0；需内置 node:sqlite，无需实验 flag）',
   };
 }
 
