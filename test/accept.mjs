@@ -3596,7 +3596,7 @@ async function main() {
       noCdnInHtml105 &&
       catEmpty105.modules.every((m) => m.owner_model === '未配置') &&
       catCfg105.modules.find((m) => m.id === 'ui')?.owner_model === 'gemini-4-neon' &&
-      catCfg105.modules.find((m) => m.id === 'db')?.owner_model === 'gpt-5-codex',
+      catCfg105.modules.find((m) => m.id === 'db')?.owner_model === 'gemini-4-neon',
       `fields=${modFieldsOk105} leak=${!noPersonalLeak105} cdn=${!noCdnInHtml105} uiModel=${catCfg105.modules.find((m) => m.id === 'ui')?.owner_model}`);
 
     // 106. agentbus ui CLI 真实进程在临时端口启动、GET 严格只读、拒绝非 loopback 绑定
