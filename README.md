@@ -201,7 +201,7 @@ agentbus onboard --archive-on-done        # persistent, stored in agents.json
 AGENTBUS_ARCHIVE_ON_DONE=1                # one-off, for this process only
 ```
 
-Drives the sidebar `归档对话` button over CDP. The app must be started with `--remote-debugging-port=<n>`; otherwise the command fails loudly instead of pretending. Auto-archive runs once on final `done`, matches every conversation titled `agentbus MM-DD <taskid>` (retries can leave duplicates), and retries up to 6 times because the sidebar may not have rendered the new row yet. A miss only appends `row_not_found`; other conversations are never touched.
+Drives the sidebar `归档对话` button over CDP. The app must be started with `--remote-debugging-port=<n>`; otherwise the command fails loudly instead of pretending. Auto-archive runs once on final `done` inside the process that completes the task (CLI `done` or MCP `bus_task_complete`), so it still fires after the dispatcher has exited. It matches every conversation titled `agentbus MM-DD <taskid>`, retries up to 6 times while the sidebar renders, and correlates portalled buttons by row center. A miss only appends `row_not_found`; other conversations are never touched.
 
 ### Model fallback
 

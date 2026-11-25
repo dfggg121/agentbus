@@ -14,8 +14,12 @@ All notable changes to this project are documented here. Format follows [Keep a 
 - Acceptance suite extended to 59 assertions (threads scope, per-client limits, ledger, audit, archive dry-run/mock CDP).
 
 ### Fixed
-- Auto-archive clicked the wrong row: the archive button is a sibling of the title node, so searching downward from the title always hit the first row's button in the list. Matching now starts from each button and compares its own short row title, and archives every duplicate conversation for that task.
+- Auto-archive clicked the wrong row: the archive button is a sibling of the title node, so searching downward from the title always hit the first row's button in the list. Matching now associates each button with the sidebar title at the same vertical center (buttons are portalled), and archives every duplicate conversation for that task.
 - Auto-archive missed freshly created conversations because the sidebar had not rendered them yet; it now retries up to 6 times before recording `row_not_found`.
+- Auto-archive never fired for long async tasks: it only ran in the dispatcher, which had already exited. It now runs in the process that completes the task (CLI `done` / MCP `bus_task_complete`).
+- Active conversation rows hide their action button until hovered; archiving now moves a real mouse over the title and retries once.
+- Unknown `AGENTBUS_ROLE` values exposed every tool, including dispatch. Any unrecognized role is now clamped to `worker` (least privilege) with one stderr warning.
+- MCP `serverInfo.version` and `agentbus version` were hardcoded (`1.0.0` / `0.1.0`); both now read `package.json`.
 
 ### Changed
 - `--thread` on Antigravity no longer reuses the conversation by default: it opens a fresh conversation and hands over via the ledger.

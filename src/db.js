@@ -139,12 +139,13 @@ export function loadConfig({ rootOverride = null, configPath = null } = {}) {
   if (process.env.AGENTBUS_ALLOWED_ROOTS) {
     rawAllowed = process.env.AGENTBUS_ALLOWED_ROOTS
       .split(path.delimiter)
-      .map((s) => s.trim())
+      .map((s) => s.trim().replace(/^"(.*)"$/, '$1').trim())
       .filter(Boolean);
   }
 
   const allowedRoots = rawAllowed.map((r) => (path.isAbsolute(r) ? path.resolve(r) : path.resolve(PKG_ROOT, r)));
-  if (!allowedRoots.some((r) => r.toLowerCase() === rootDir.toLowerCase())) {
+  const sameRoot = (a, b) => (process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b);
+  if (!allowedRoots.some((r) => sameRoot(r, rootDir))) {
     allowedRoots.push(rootDir);
   }
 
@@ -201,10 +202,25 @@ export function migrateTasksTable(db) {
 
 export function openBus(opts = {}) {
   const config = opts.config || loadConfig(opts);
-  fs.mkdirSync(config.rootDir, { recursive: true });
-  fs.mkdirSync(config.tasksDir, { recursive: true });
+  try {
+    fs.mkdirSync(config.rootDir, { recursive: true });
+    fs.mkdirSync(config.tasksDir, { recursive: true });
+  } catch (err) {
+    if (err && (err.code === 'EACCES' || err.code === 'EPERM' || err.code === 'EROFS')) {
+      throw Object.assign(new Error(`权限不足，无法创建总线目录 ${config.rootDir} (${err.code})；请检查目录权限或改用 --root <可写目录>`), { code: 1 });
+    }
+    throw err;
+  }
 
-  const db = new DatabaseSync(config.dbPath);
+  let db;
+  try {
+    db = new DatabaseSync(config.dbPath);
+  } catch (err) {
+    if (err && (err.code === 'EACCES' || err.code === 'EPERM' || /unable to open|readonly/i.test(String(err.message || err)))) {
+      throw Object.assign(new Error(`无法打开或写入数据库 ${config.dbPath} (${err.message || err})；请检查 --root 目录写权限或改用 --root <可写目录>`), { code: 1 });
+    }
+    throw err;
+  }
   // Configure WAL & busy timeout with retry in case concurrent processes initialize simultaneously
   for (let i = 0; i < 20; i++) {
     try {

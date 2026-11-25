@@ -8,6 +8,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
+import { resolveAgentBin } from './agents.js';
 
 // How many steps a conversation has accumulated. Used by thread limits: a
 // long-lived conversation re-reads its whole history on every turn, so past
@@ -99,10 +100,8 @@ export function readAgySession(file) {
   return data;
 }
 
-export function detectAgentApi() {
-  if (process.env.AGENTBUS_ANTIGRAVITY_BIN) return process.env.AGENTBUS_ANTIGRAVITY_BIN;
-  const wrapper = path.join(os.homedir(), '.gemini', 'antigravity', 'bin', 'agentapi.bat');
-  return fs.existsSync(wrapper) ? wrapper : null;
+export function detectAgentApi(home = os.homedir(), opts = {}) {
+  return resolveAgentBin('antigravity', { home, ...opts }).bin;
 }
 
 // Antigravity keeps its live coordinates in a daemon hub file. Reading it beats
@@ -186,6 +185,35 @@ function httpGetJson(url, timeoutMs = 5000) {
       req.destroy(new Error(`timeout after ${timeoutMs}ms`));
     });
     req.on('error', reject);
+  });
+}
+
+function cdpSend(wsUrl, method, params = {}, timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    if (typeof globalThis.WebSocket !== 'function') {
+      reject(new Error('当前 Node 版本缺少内置 WebSocket 客户端'));
+      return;
+    }
+    const ws = new globalThis.WebSocket(wsUrl);
+    let settled = false;
+    const done = (err, val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { ws.close(); } catch {}
+      if (err) reject(err);
+      else resolve(val);
+    };
+    const timer = setTimeout(() => done(new Error(`CDP ${method} timeout after ${timeoutMs}ms`)), timeoutMs);
+    ws.addEventListener('open', () => ws.send(JSON.stringify({ id: 1, method, params })));
+    ws.addEventListener('message', (ev) => {
+      let msg;
+      try { msg = JSON.parse(String(ev.data || '')); } catch { return; }
+      if (msg.id !== 1) return;
+      if (msg.error) done(new Error(`CDP ${method} error: ${JSON.stringify(msg.error)}`));
+      else done(null, msg.result || {});
+    });
+    ws.addEventListener('error', (ev) => done(new Error(ev?.message || 'CDP WebSocket error')));
   });
 }
 
@@ -277,6 +305,25 @@ function buildArchiveEvalJs({ conversationId, titlePrefix, titleContains, dryRun
       if (matches(t)) { btn = b; rowText = t; break; }
     }
 
+    // In current builds the action button is portalled outside the row, so the
+    // ancestor-text lookup above finds only a time label ("2d") or nothing.
+    // Associate each button with the sidebar title that shares its vertical center.
+    if (!btn) {
+      const leaves = Array.from(document.querySelectorAll('*'))
+        .filter((n) => n.children.length === 0)
+        .map((n) => {
+          const r = n.getBoundingClientRect();
+          return { text: (n.textContent || '').trim(), y: r.top + r.height / 2, left: r.left, width: r.width, height: r.height };
+        })
+        .filter((x) => x.text && x.width > 20 && x.height > 0 && x.left < 320);
+      for (const b of Array.from(document.querySelectorAll(selector))) {
+        const br = b.getBoundingClientRect();
+        const cy = br.top + br.height / 2;
+        const hit = leaves.find((x) => Math.abs(x.y - cy) <= 14 && matches(x.text));
+        if (hit) { btn = b; rowText = hit.text; break; }
+      }
+    }
+
     // Fallback: locate by data attribute, then map that row's title to its button.
     if (!btn && convId) {
       const attrNodes = Array.from(document.querySelectorAll('[data-conversation-id], [data-id], [href]'));
@@ -289,18 +336,19 @@ function buildArchiveEvalJs({ conversationId, titlePrefix, titleContains, dryRun
         return vals.some((v) => v === convId || v.includes(convId));
       });
       if (hit) {
+        const hr = hit.getBoundingClientRect();
+        const cy = hr.top + hr.height / 2;
         let row = hit;
         for (let i = 0; i < 8 && row; i++) {
           const t = (row.innerText || '').trim();
           if (t && t.length <= 250) { rowText = t; break; }
           row = row.parentElement;
         }
-        if (rowText) {
-          for (const b of Array.from(document.querySelectorAll(selector))) {
-            const t = rowTextOf(b);
-            if (t && t.startsWith(rowText.slice(0, 20))) { btn = b; break; }
-          }
-        }
+        const byY = Array.from(document.querySelectorAll(selector)).find((b) => {
+          const br = b.getBoundingClientRect();
+          return Math.abs((br.top + br.height / 2) - cy) <= 14;
+        });
+        if (byY) btn = byY;
       }
     }
 
@@ -313,6 +361,31 @@ function buildArchiveEvalJs({ conversationId, titlePrefix, titleContains, dryRun
     if (typeof btn.scrollIntoView === 'function') btn.scrollIntoView({ block: 'center' });
     btn.click();
     return { ok: true, archived: true, conversation_id: convId || null, row_text: rowText.slice(0, 120) };
+  })()`;
+}
+
+function buildTitleRectJs({ conversationId, titlePrefix, titleContains }) {
+  return `(() => {
+    const convId = ${JSON.stringify(conversationId || '')};
+    const titlePrefix = ${JSON.stringify(titlePrefix || '')};
+    const titleContains = ${JSON.stringify(titleContains || '')};
+    const leaves = Array.from(document.querySelectorAll('*')).filter((n) => n.children.length === 0);
+    const matches = leaves.filter((n) => {
+      const t = (n.textContent || '').trim();
+      if (!t) return false;
+      if (convId) return t.includes(convId);
+      if (titlePrefix) return t.startsWith(titlePrefix);
+      if (titleContains) return t.includes(titleContains);
+      return false;
+    });
+    if (!matches.length) return null;
+    // Prefer the sidebar copy (left edge); the open conversation header repeats the title.
+    const leaf = matches
+      .map((n) => ({ n, r: n.getBoundingClientRect() }))
+      .sort((a, b) => (a.r.left < 320 ? 0 : 1) - (b.r.left < 320 ? 0 : 1) || a.r.left - b.r.left)[0].n;
+    leaf.scrollIntoView({ block: 'center' });
+    const r = leaf.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
   })()`;
 }
 
@@ -343,7 +416,17 @@ export async function archiveConversation({ conversationId = null, port = null, 
 
   const expr = buildArchiveEvalJs({ conversationId, titlePrefix, titleContains, dryRun });
   try {
-    const result = await cdpEvaluate(page.webSocketDebuggerUrl, expr, 10000);
+    let result = await cdpEvaluate(page.webSocketDebuggerUrl, expr, 10000);
+    // The active row hides its action buttons until hovered. Move a real mouse
+    // over the title, then re-run the matcher so that row can still be archived.
+    if (result?.reason === 'row_not_found') {
+      const rect = await cdpEvaluate(page.webSocketDebuggerUrl, buildTitleRectJs({ conversationId, titlePrefix, titleContains }), 5000).catch(() => null);
+      if (rect && Number.isFinite(rect.x) && Number.isFinite(rect.y)) {
+        await cdpSend(page.webSocketDebuggerUrl, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: rect.x, y: rect.y }, 5000).catch(() => {});
+        await sleep(450);
+        result = await cdpEvaluate(page.webSocketDebuggerUrl, expr, 10000);
+      }
+    }
     if (!result || typeof result !== 'object') {
       return { ok: false, archived: false, conversation_id: conversationId || null, reason: 'unexpected_cdp_result' };
     }

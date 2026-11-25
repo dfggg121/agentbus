@@ -10,9 +10,11 @@
 
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { showTask } from './tasks.js';
 import { defaultAgySessionPath, readAgySession, detectAgentApi, discoverAgySession, archiveTaskConversations } from './agy.js';
-import { modelFor, KNOWN_MODELS, readAgentConfig } from './agents.js';
+import { modelFor, KNOWN_MODELS, readAgentConfig, resolveAgentBin } from './agents.js';
 import { appendEvent, withImmediateTx } from './db.js';
 import {
   threadUsable,
@@ -45,9 +47,16 @@ function extractSession(stdout) {
   return m ? m[1] : null;
 }
 
+function requireResolvedBin(agentId) {
+  const res = resolveAgentBin(agentId, { home: os.homedir(), env: process.env, platform: process.platform });
+  if (res.bin) return res.bin;
+  const detail = res.next ? `${res.message}。下一步：${res.next}` : res.message;
+  throw Object.assign(new Error(detail), { code: 1 });
+}
+
 const BUILTIN = {
   codex: ({ prompt, cwd, session, model }) => {
-    const bin = process.env.AGENTBUS_CODEX_BIN || (process.platform === 'win32' ? 'codex.cmd' : 'codex');
+    const bin = requireResolvedBin('codex');
     const modelArgs = model ? ['-m', model] : [];
     const base = ['exec'];
     if (session) {
@@ -70,19 +79,18 @@ const BUILTIN = {
     };
   },
   claude: ({ prompt, model }) => ({
-    command: 'claude',
+    command: requireResolvedBin('claude'),
     args: [...(model ? ['--model', model] : []), '-p', prompt, '--permission-mode', 'acceptEdits'],
   }),
   gemini: ({ prompt, model }) => ({
-    command: 'gemini',
+    command: requireResolvedBin('gemini'),
     args: [...(model ? ['-m', model] : []), '-p', prompt, '--yolo'],
   }),
   antigravity: ({ prompt, busRoot, id, model, session }) => {
     const bin = detectAgentApi();
     if (!bin) {
-      throw Object.assign(new Error(
-        '找不到 Antigravity 的 agentapi（预期 ~/.gemini/antigravity/bin/agentapi.bat）；可用 AGENTBUS_ANTIGRAVITY_BIN 指定',
-      ), { code: 1 });
+      const res = resolveAgentBin('antigravity', { home: os.homedir(), env: process.env, platform: process.platform });
+      throw Object.assign(new Error(res.next ? `${res.message}。下一步：${res.next}` : res.message), { code: 1 });
     }
     const sessionFile = defaultAgySessionPath(busRoot);
     let sess;
@@ -98,8 +106,8 @@ const BUILTIN = {
     // agentapi takes the prompt as one positional argument; newlines would break
     // the Windows command line, so collapse them into separators.
     const oneLine = String(prompt).replace(/\s*\n+\s*/g, '；');
-    const isWrapper = /\.(bat|cmd)$/i.test(bin);
-    const base = isWrapper ? [] : ['agentapi'];
+    const baseName = path.basename(bin).replace(/\.(bat|cmd|exe)$/i, '').toLowerCase();
+    const base = baseName === 'antigravity' ? ['agentapi'] : [];
     const env = {
       ANTIGRAVITY_LS_ADDRESS: sess.ls_address,
       ANTIGRAVITY_CSRF_TOKEN: sess.csrf_token,
@@ -273,6 +281,30 @@ function runAdapter(spec, { cwd, timeout_s }) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Auto-archive must run in the process that actually completes the task:
+// long async agents (Antigravity) often outlive the dispatcher that spawned them.
+export async function maybeArchiveTask(bus, taskId) {
+  const row = bus.db.prepare('SELECT id, to_agent, state FROM tasks WHERE id = ?').get(taskId);
+  if (!row || row.state !== 'done' || row.to_agent !== 'antigravity') return null;
+  const cfg = readAgentConfig(bus.config.rootDir);
+  const enabled = process.env.AGENTBUS_ARCHIVE_ON_DONE === '1' || cfg.archive_on_done === true;
+  if (!enabled) return null;
+
+  let payload;
+  try {
+    const res = await archiveTaskConversations({ taskId: row.id });
+    payload = {
+      archived_count: res?.archived_count ?? 0,
+      ok: Boolean(res?.ok && res?.archived_count > 0),
+      reason: res?.ok ? (res?.archived_count > 0 ? null : 'row_not_found') : (res?.attempts?.[0]?.error || 'archive_failed'),
+    };
+  } catch (err) {
+    payload = { archived_count: 0, ok: false, error: String(err?.message || err) };
+  }
+  withImmediateTx(bus.db, () => appendEvent(bus.db, row.id, 'archive_on_done', payload));
+  return payload;
+}
 
 // Async agents (Antigravity) may start the conversation minutes after the CLI
 // returns. This lets the caller wait on the bus instead of on the child process.
@@ -577,31 +609,6 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, 
         });
       }
     } catch {}
-  }
-
-  const agentCfg = readAgentConfig(bus.config.rootDir);
-  const archiveOnDone = process.env.AGENTBUS_ARCHIVE_ON_DONE === '1' || agentCfg.archive_on_done === true;
-  if (archiveOnDone && task.to === 'antigravity' && latest.state === 'done') {
-    try {
-      const archRes = await archiveTaskConversations({ taskId: task.id });
-      withImmediateTx(bus.db, () => {
-        appendEvent(bus.db, task.id, 'archive_on_done', {
-          conversation_id: effectiveSession,
-          archived_count: archRes?.archived_count ?? 0,
-          ok: Boolean(archRes?.ok && archRes?.archived_count > 0),
-          reason: archRes?.ok ? null : (archRes?.attempts?.[0]?.error || 'archive_failed'),
-        });
-      });
-    } catch (archErr) {
-      withImmediateTx(bus.db, () => {
-        appendEvent(bus.db, task.id, 'archive_on_done', {
-          conversation_id: effectiveSession,
-          archived_count: 0,
-          ok: false,
-          error: String(archErr?.message || archErr),
-        });
-      });
-    }
   }
 
   const healthAfter = markAgentHealth(bus, task.to, {

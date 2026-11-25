@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// agentbus self-acceptance suite: 39 assertions (§7)
+// agentbus self-acceptance suite: 65 assertions (§7)
 // Pure Node built-ins, zero frameworks, zero shell pipes.
 // Output: PASS n: <desc> / FAIL n: <desc> :: <actual>, ending with SUMMARY passed=x failed=y
 
@@ -517,6 +517,11 @@ async function main() {
       Boolean(initResp?.capabilities?.tools),
       JSON.stringify(initResp));
 
+    const pkgVersion = JSON.parse(fs.readFileSync(path.join(PKG_ROOT, 'package.json'), 'utf8')).version;
+    assertCase(66, 'MCP serverInfo.version 与 package.json 一致',
+      initResp?.serverInfo?.version === pkgVersion,
+      `server=${initResp?.serverInfo?.version} pkg=${pkgVersion}`);
+
     const toolsResp = mcpSession.responses.find((r) => r.id === 2)?.result?.tools || [];
     const expectedTools = [
       'bus_register',
@@ -623,6 +628,15 @@ async function main() {
       !workerTools.some((t) => t.name === 'bus_task_create') &&
       blockedCall?.isError === true,
       `count=${workerTools.length} names=[${workerTools.map((t) => t.name).join(',')}] isError=${blockedCall?.isError}`);
+
+    const unknownRoleSession = await runMcpSession(ROOT_MAIN, ALLOWED_MAIN, [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'accept-role-typo', version: '1.0' } } },
+      { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
+    ], { AGENTBUS_ROLE: 'boss' });
+    const unknownTools = unknownRoleSession.responses.find((r) => r.id === 2)?.result?.tools || [];
+    assertCase(67, '未知 AGENTBUS_ROLE 按 worker 最小权限处理（不泄漏 dispatch/create）',
+      unknownTools.length === 6 && !unknownTools.some((t) => t.name === 'bus_task_dispatch'),
+      `count=${unknownTools.length} names=[${unknownTools.map((t) => t.name).join(',')}]`);
 
     // 35. bus_task_wait 必须返回真实结果（异步处理器没 await 时这里会是空对象）
     const waitSession = await runMcpSession(ROOT_MAIN, ALLOWED_MAIN, [
@@ -1142,6 +1156,284 @@ async function main() {
     assertCase(59, '降级循环 i>0 不串号：i=1 未输出新 session 时不继承 i=0 失败会话 ID',
       dFb.json?.state === 'done' && dFb.json?.thread?.resumed === false && dFb.json?.thread?.session === null,
       `state=${dFb.json?.state} session=${dFb.json?.thread?.session} attempts=${JSON.stringify(dFb.json?.attempts)}`);
+
+    // 60. detectAgents 发现顺序（env 覆盖 > PATH > 常见安装目录）+ 含空格与中文路径 + .cmd/.bat/.exe
+    const { detectAgents, resolveAgentBin } = await import('../src/agents.js');
+    const { setupClients, doctor: runDoctor } = await import('../src/setup.js');
+    const discBase = path.join(RUN_BASE, '探测 测试');
+    const envDir60 = path.join(discBase, 'env 覆盖');
+    const pathDir60 = path.join(discBase, 'path 目录');
+    const homeWin60 = path.join(discBase, 'win home 中文');
+    const scoopDir60 = path.join(homeWin60, 'scoop', 'shims');
+    const localBin60 = path.join(homeWin60, '.local', 'bin');
+    const npmDir60 = path.join(homeWin60, 'AppData', 'Roaming', 'npm');
+    const agyBinDir60 = path.join(homeWin60, '.gemini', 'antigravity', 'bin');
+    for (const d of [envDir60, pathDir60, scoopDir60, localBin60, npmDir60, agyBinDir60]) {
+      fs.mkdirSync(d, { recursive: true });
+    }
+    const envCodexBin = path.join(envDir60, 'codex.exe');
+    fs.writeFileSync(envCodexBin, 'dummy-exe', 'utf8');
+    fs.writeFileSync(path.join(pathDir60, 'codex.cmd'), '@echo off\n', 'utf8');
+    fs.writeFileSync(path.join(scoopDir60, 'codex.bat'), '@echo off\n', 'utf8');
+    // Put extensionless POSIX shim in pathDir60 to ensure Windows prefers .cmd over extensionless shim
+    fs.writeFileSync(path.join(pathDir60, 'claude'), '#!/bin/sh\n', 'utf8');
+    fs.writeFileSync(path.join(pathDir60, 'claude.cmd'), '@echo off\n', 'utf8');
+    fs.writeFileSync(path.join(localBin60, 'claude.exe'), 'dummy-exe', 'utf8');
+    fs.writeFileSync(path.join(npmDir60, 'gemini.cmd'), '@echo off\n', 'utf8');
+    fs.writeFileSync(path.join(agyBinDir60, 'agentapi.bat'), '@echo off\n', 'utf8');
+
+    const det60 = detectAgents(homeWin60, {
+      platform: 'win32',
+      explicitHome: true,
+      env: {
+        AGENTBUS_CODEX_BIN: envCodexBin,
+        PATH: pathDir60,
+      },
+    });
+    const map60 = Object.fromEntries(det60.map((a) => [a.id, a]));
+    assertCase(60, 'detectAgents 发现顺序(env > PATH > 常见目录) + 空格中文路径 + .cmd/.bat/.exe',
+      map60.codex?.bin === path.resolve(envCodexBin) && map60.codex?.bin_source === 'env' &&
+      map60.claude?.bin === path.join(pathDir60, 'claude.cmd') && map60.claude?.bin_source === 'path' &&
+      map60.gemini?.bin === path.join(npmDir60, 'gemini.cmd') && map60.gemini?.bin_source === 'common_dir' &&
+      map60.antigravity?.bin === path.join(agyBinDir60, 'agentapi.bat') && map60.antigravity?.bin_source === 'common_dir',
+      JSON.stringify({ codex: map60.codex?.bin, claude: map60.claude?.bin, gemini: map60.gemini?.bin, agy: map60.antigravity?.bin }));
+
+    // 61. nvm / scoop / volta 布局在 Windows / macOS / Linux 下发现正确
+    const layoutBase = path.join(RUN_BASE, '布局 测试');
+    const winHome61 = path.join(layoutBase, 'win 用户');
+    const macHome61 = path.join(layoutBase, 'mac 用户');
+    const linHome61 = path.join(layoutBase, 'lin 用户');
+    // Windows: scoop + volta + nvm-windows (v22 > v20)
+    fs.mkdirSync(path.join(winHome61, 'scoop', 'shims'), { recursive: true });
+    fs.mkdirSync(path.join(winHome61, '.volta', 'bin'), { recursive: true });
+    fs.mkdirSync(path.join(winHome61, 'AppData', 'Roaming', 'nvm', 'v20.10.0'), { recursive: true });
+    fs.mkdirSync(path.join(winHome61, 'AppData', 'Roaming', 'nvm', 'v22.14.0'), { recursive: true });
+    fs.writeFileSync(path.join(winHome61, 'scoop', 'shims', 'codex.cmd'), '@echo off\n', 'utf8');
+    fs.writeFileSync(path.join(winHome61, '.volta', 'bin', 'claude.exe'), 'exe', 'utf8');
+    fs.writeFileSync(path.join(winHome61, 'AppData', 'Roaming', 'nvm', 'v20.10.0', 'gemini.cmd'), '@echo off\n', 'utf8');
+    fs.writeFileSync(path.join(winHome61, 'AppData', 'Roaming', 'nvm', 'v22.14.0', 'gemini.cmd'), '@echo off\n', 'utf8');
+    // macOS: nvm + volta + npm-global + Antigravity.app
+    fs.mkdirSync(path.join(macHome61, '.nvm', 'versions', 'node', 'v18.19.0', 'bin'), { recursive: true });
+    fs.mkdirSync(path.join(macHome61, '.nvm', 'versions', 'node', 'v22.14.0', 'bin'), { recursive: true });
+    fs.mkdirSync(path.join(macHome61, '.volta', 'bin'), { recursive: true });
+    fs.mkdirSync(path.join(macHome61, '.npm-global', 'bin'), { recursive: true });
+    fs.mkdirSync(path.join(macHome61, 'Applications', 'Antigravity.app', 'Contents', 'Resources', 'app', 'bin'), { recursive: true });
+    for (const f of [
+      path.join(macHome61, '.nvm', 'versions', 'node', 'v18.19.0', 'bin', 'codex'),
+      path.join(macHome61, '.nvm', 'versions', 'node', 'v22.14.0', 'bin', 'codex'),
+      path.join(macHome61, '.volta', 'bin', 'claude'),
+      path.join(macHome61, '.npm-global', 'bin', 'gemini'),
+      path.join(macHome61, 'Applications', 'Antigravity.app', 'Contents', 'Resources', 'app', 'bin', 'agentapi'),
+    ]) { fs.writeFileSync(f, '#!/bin/sh\n', { mode: 0o755 }); }
+    // Linux: nvm + .local/bin + pnpm + .local/share/Antigravity/bin
+    fs.mkdirSync(path.join(linHome61, '.nvm', 'versions', 'node', 'v22.14.0', 'bin'), { recursive: true });
+    fs.mkdirSync(path.join(linHome61, '.local', 'bin'), { recursive: true });
+    fs.mkdirSync(path.join(linHome61, '.local', 'share', 'pnpm'), { recursive: true });
+    fs.mkdirSync(path.join(linHome61, '.local', 'share', 'Antigravity', 'bin'), { recursive: true });
+    for (const f of [
+      path.join(linHome61, '.nvm', 'versions', 'node', 'v22.14.0', 'bin', 'codex'),
+      path.join(linHome61, '.local', 'bin', 'claude'),
+      path.join(linHome61, '.local', 'share', 'pnpm', 'gemini'),
+      path.join(linHome61, '.local', 'share', 'Antigravity', 'bin', 'agentapi'),
+    ]) { fs.writeFileSync(f, '#!/bin/sh\n', { mode: 0o755 }); }
+
+    const win61 = Object.fromEntries(detectAgents(winHome61, { platform: 'win32', explicitHome: true, env: { PATH: '' } }).map((a) => [a.id, a.bin]));
+    const mac61 = Object.fromEntries(detectAgents(macHome61, { platform: 'darwin', explicitHome: true, env: { PATH: '' } }).map((a) => [a.id, a.bin]));
+    const lin61 = Object.fromEntries(detectAgents(linHome61, { platform: 'linux', explicitHome: true, env: { PATH: '' } }).map((a) => [a.id, a.bin]));
+    assertCase(61, 'nvm / scoop / volta 布局在 Windows / macOS / Linux 下探测正确',
+      win61.codex === path.join(winHome61, 'scoop', 'shims', 'codex.cmd') &&
+      win61.claude === path.join(winHome61, '.volta', 'bin', 'claude.exe') &&
+      win61.gemini === path.join(winHome61, 'AppData', 'Roaming', 'nvm', 'v22.14.0', 'gemini.cmd') &&
+      mac61.codex === path.join(macHome61, '.nvm', 'versions', 'node', 'v22.14.0', 'bin', 'codex') &&
+      mac61.claude === path.join(macHome61, '.volta', 'bin', 'claude') &&
+      mac61.gemini === path.join(macHome61, '.npm-global', 'bin', 'gemini') &&
+      mac61.antigravity === path.join(macHome61, 'Applications', 'Antigravity.app', 'Contents', 'Resources', 'app', 'bin', 'agentapi') &&
+      lin61.codex === path.join(linHome61, '.nvm', 'versions', 'node', 'v22.14.0', 'bin', 'codex') &&
+      lin61.claude === path.join(linHome61, '.local', 'bin', 'claude') &&
+      lin61.gemini === path.join(linHome61, '.local', 'share', 'pnpm', 'gemini') &&
+      lin61.antigravity === path.join(linHome61, '.local', 'share', 'Antigravity', 'bin', 'agentapi'),
+      JSON.stringify({ win61, mac61, lin61 }));
+
+    // 62. setup 保留已有其他 server 与字段 + 写前备份 + 重复执行幂等（仅用临时 HOME）
+    const home62 = path.join(RUN_BASE, 'setup home 测试');
+    const root62 = path.join(RUN_BASE, 'setup root 测试');
+    const allow62 = path.join(RUN_BASE, 'setup allow 测试');
+    fs.mkdirSync(allow62, { recursive: true });
+    // Seed existing configs for codex, claude, gemini, antigravity, cursor, opencode, claude-desktop
+    const codexCfg62 = path.join(home62, '.codex', 'config.toml');
+    fs.mkdirSync(path.dirname(codexCfg62), { recursive: true });
+    const origCodexToml = [
+      'model = "gpt-5"',
+      '',
+      '[mcp_servers.other]',
+      'command = "npx"',
+      'args = ["-y", "other-mcp"]',
+      '',
+      '[mcp_servers.agentbus]',
+      'command = "old"',
+      '',
+      '[[projects]]',
+      'path = "C:\\\\keep-me"',
+      '',
+    ].join('\n');
+    fs.writeFileSync(codexCfg62, origCodexToml, 'utf8');
+
+    const jsonSeedFiles = [
+      [path.join(home62, '.claude.json'), { theme: 'dark', mcpServers: { keepMe: { command: 'echo', args: ['1'] } } }],
+      [path.join(home62, '.gemini', 'settings.json'), { selectedAuthType: 'oauth', mcpServers: { keepMe: { command: 'echo', args: ['2'] } } }],
+      [path.join(home62, '.gemini', 'config', 'mcp_config.json'), { custom: 1, mcpServers: { keepMe: { command: 'echo', args: ['3'] } } }],
+      [path.join(home62, '.cursor', 'mcp.json'), { mcpServers: { keepMe: { command: 'echo', args: ['4'] } } }],
+      [path.join(home62, '.config', 'opencode', 'opencode.json'), { model: 'x', mcp: { keepMe: { type: 'local', command: ['echo'] } } }],
+      [
+        process.platform === 'win32'
+          ? path.join(home62, 'AppData', 'Roaming', 'Claude', 'claude_desktop_config.json')
+          : process.platform === 'darwin'
+            ? path.join(home62, 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json')
+            : path.join(home62, '.config', 'Claude', 'claude_desktop_config.json'),
+        { globalShortcut: 'Ctrl+K', mcpServers: { keepMe: { command: 'echo', args: ['5'] } } },
+      ],
+    ];
+    for (const [f, obj] of jsonSeedFiles) {
+      fs.mkdirSync(path.dirname(f), { recursive: true });
+      fs.writeFileSync(f, JSON.stringify(obj, null, 2) + '\n', 'utf8');
+    }
+
+    const setupRun1 = runCli(['setup', '--home', home62, '--allow', allow62], { root: root62, allowed: allow62 });
+    const setupRun2 = runCli(['setup', '--home', home62, '--allow', allow62], { root: root62, allowed: allow62 });
+    const codexAfter62 = fs.readFileSync(codexCfg62, 'utf8');
+    const allBackupsOk = (setupRun1.json?.results || []).every((r) => r.ok && r.changed === true && r.backup && fs.existsSync(r.backup));
+    const allIdempotent = (setupRun2.json?.results || []).every((r) => r.ok && r.changed === false && r.backup === null);
+    const jsonPreserved = jsonSeedFiles.every(([f, orig]) => {
+      const parsed = JSON.parse(fs.readFileSync(f, 'utf8'));
+      if (f.endsWith('opencode.json')) return parsed.model === 'x' && parsed.mcp?.keepMe?.command?.[0] === 'echo' && Boolean(parsed.mcp?.agentbus);
+      return parsed.mcpServers?.keepMe && Boolean(parsed.mcpServers?.agentbus) && Object.keys(orig).every((k) => k in parsed);
+    });
+    const tomlPreserved = codexAfter62.includes('model = "gpt-5"') &&
+      codexAfter62.includes('[mcp_servers.other]') &&
+      codexAfter62.includes('[[projects]]') &&
+      codexAfter62.includes('[mcp_servers.agentbus]');
+    assertCase(62, 'setup 保留原有其他 server/字段 + 写前备份 + 重复执行幂等（不重复写/不重复备份）',
+      setupRun1.rc === 0 && setupRun2.rc === 0 && allBackupsOk && allIdempotent && jsonPreserved && tomlPreserved,
+      `rc1=${setupRun1.rc} rc2=${setupRun2.rc} baks=${allBackupsOk} idem=${allIdempotent} jsonOk=${jsonPreserved} tomlOk=${tomlPreserved}`);
+
+    // 63. JSON 损坏时明确报错且绝不覆盖、不写备份；doctor 亦能诊断损坏配置
+    const home63 = path.join(RUN_BASE, 'corrupt home');
+    const claudeCfg63 = path.join(home63, '.claude.json');
+    const brokenRaw63 = '{ "mcpServers": { "keep": 1, broken_json ';
+    fs.mkdirSync(home63, { recursive: true });
+    fs.writeFileSync(claudeCfg63, brokenRaw63, 'utf8');
+    const setupCorrupt = runCli(['setup', '--client', 'claude', '--home', home63], { root: root62, allowed: allow62 });
+    const docCorrupt = runCli(['doctor', '--home', home63], { root: root62, allowed: allow62 });
+    const claudeClientDoc63 = (docCorrupt.json?.clients || []).find((c) => c.id === 'claude');
+    const baks63 = fs.readdirSync(home63).filter((n) => n.includes('.bak-'));
+    assertCase(63, 'JSON 损坏时 setup 明确报错(rc=1)且绝不覆盖原文件/不生成备份',
+      setupCorrupt.rc === 1 &&
+      setupCorrupt.json?.results?.[0]?.error_code === 'corrupted_config' &&
+      fs.readFileSync(claudeCfg63, 'utf8') === brokenRaw63 &&
+      baks63.length === 0 &&
+      (claudeClientDoc63?.issues || []).some((i) => i.code === 'corrupted_config'),
+      `rc=${setupCorrupt.rc} code=${setupCorrupt.json?.results?.[0]?.error_code} baks=${baks63.length}`);
+
+    // 64. --home / --root / AGENTBUS_ALLOWED_ROOTS 含空格与中文路径端到端（含 onboard --home 隔离 & MCP stdio 实测）
+    const cnSpaceBase = path.join(RUN_BASE, '中文 空格 沙盒');
+    const cnHome = path.join(cnSpaceBase, '用户 目录');
+    const cnRoot = path.join(cnSpaceBase, '总线 根目录');
+    const cnAllow = path.join(cnSpaceBase, '项目 资料');
+    const cnBinDir = path.join(cnSpaceBase, 'bin 目录');
+    fs.mkdirSync(cnAllow, { recursive: true });
+    fs.mkdirSync(cnBinDir, { recursive: true });
+    const cnCodexBin = path.join(cnBinDir, process.platform === 'win32' ? 'codex.cmd' : 'codex');
+    fs.writeFileSync(cnCodexBin, process.platform === 'win32' ? '@echo off\n' : '#!/bin/sh\n', { mode: 0o755 });
+    const cnSampleFile = path.join(cnAllow, '需求 说明.txt');
+    fs.writeFileSync(cnSampleFile, 'hello 中文 空格 path\n', 'utf8');
+
+    const onboardCn = runCli([
+      'onboard', '--home', cnHome, '--allow', cnAllow, '--conductor', 'codex', '--yes',
+    ], {
+      root: cnRoot,
+      allowed: cnAllow,
+      envExtra: {
+        AGENTBUS_CODEX_BIN: cnCodexBin,
+        AGENTBUS_CLAUDE_BIN: '',
+        AGENTBUS_GEMINI_BIN: '',
+        AGENTBUS_ANTIGRAVITY_BIN: '',
+        AGENTBUS_OPENCODE_BIN: '',
+        PATH: cnBinDir,
+      },
+    });
+    const cnSetupCfg = runCli(['setup', '--client', 'gemini', '--home', cnHome, '--allow', cnAllow], { root: cnRoot, allowed: cnAllow });
+    const gemWritten = JSON.parse(fs.readFileSync(path.join(cnHome, '.gemini', 'settings.json'), 'utf8'));
+    const gemSpec = gemWritten.mcpServers?.agentbus;
+    const mcpCnSession = await runMcpSession(
+      cnRoot,
+      gemSpec?.env?.AGENTBUS_ALLOWED_ROOTS || cnAllow,
+      [
+        { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'cn-test', version: '1.0' } } },
+        { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'bus_register', arguments: { path: cnSampleFile, by: 'codex' } } },
+        { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'bus_task_list', arguments: { limit: 10 } } },
+      ],
+    );
+    const cnRegRes = mcpCnSession.responses.find((r) => r.id === 2)?.result;
+    assertCase(64, '--home / --root / AGENTBUS_ALLOWED_ROOTS 在含空格与中文路径下 onboard/setup/MCP 全链路可用',
+      onboardCn.rc === 0 &&
+      onboardCn.json?.home === path.resolve(cnHome) &&
+      fs.existsSync(path.join(cnHome, '.codex', 'config.toml')) &&
+      fs.existsSync(path.join(cnRoot, 'agents.json')) &&
+      cnSetupCfg.rc === 0 &&
+      gemSpec?.env?.AGENTBUS_ALLOWED_ROOTS === path.resolve(cnAllow) &&
+      cnRegRes?.isError !== true &&
+      Boolean(cnRegRes?.structuredContent?.sha256),
+      `onboardRc=${onboardCn.rc} setupRc=${cnSetupCfg.rc} regSha=${cnRegRes?.structuredContent?.sha256}`);
+
+    // 65. 失败可诊断：缺二进制（含 env 覆盖失效）、缺配置目录、权限不足均给出可执行的下一步
+    const diagHome = path.join(RUN_BASE, 'diag home');
+    const diagRoot = path.join(RUN_BASE, 'diag root');
+    fs.mkdirSync(diagHome, { recursive: true });
+    // 65a & 65b: missing binary + broken env override + missing config dir in doctor & setup --require-config-dir
+    const docMissing = runCli(['doctor', '--home', diagHome], {
+      root: diagRoot,
+      allowed: diagRoot,
+      envExtra: {
+        PATH: '',
+        SCOOP: '',
+        VOLTA_HOME: '',
+        NVM_HOME: '',
+        NVM_SYMLINK: '',
+        NVM_DIR: '',
+        npm_config_prefix: '',
+        AGENTBUS_CODEX_BIN: path.join(RUN_BASE, 'does-not-exist-codex.exe'),
+        AGENTBUS_CLAUDE_BIN: '',
+        AGENTBUS_GEMINI_BIN: '',
+        AGENTBUS_ANTIGRAVITY_BIN: '',
+        AGENTBUS_OPENCODE_BIN: '',
+      },
+    });
+    const docCodex65 = (docMissing.json?.clients || []).find((c) => c.id === 'codex');
+    const docClaude65 = (docMissing.json?.clients || []).find((c) => c.id === 'claude');
+    const setupReqDir = runCli(['setup', '--client', 'codex', '--home', diagHome, '--require-config-dir'], { root: diagRoot, allowed: diagRoot });
+
+    // 65c: permission denied (read-only config file)
+    const roCfg = path.join(diagHome, '.claude.json');
+    fs.writeFileSync(roCfg, JSON.stringify({ mcpServers: {} }) + '\n', 'utf8');
+    let setupPerm;
+    let docPerm;
+    try {
+      fs.chmodSync(roCfg, 0o444);
+      setupPerm = runCli(['setup', '--client', 'claude', '--home', diagHome], { root: diagRoot, allowed: diagRoot });
+      docPerm = runCli(['doctor', '--home', diagHome], { root: diagRoot, allowed: diagRoot });
+    } finally {
+      try { fs.chmodSync(roCfg, 0o666); } catch {}
+    }
+    const docPermClaude = (docPerm?.json?.clients || []).find((c) => c.id === 'claude');
+    const codexHasEnvErr = (docCodex65?.issues || []).some((i) => i.code === 'env_bin_not_found' && Boolean(i.next));
+    const codexHasMissingDir = (docCodex65?.issues || []).some((i) => i.code === 'missing_config_dir' && String(i.next || '').includes('setup --client codex'));
+    const claudeHasMissingBin = (docClaude65?.issues || []).some((i) => i.code === 'missing_binary' && String(i.next || '').includes('AGENTBUS_CLAUDE_BIN'));
+    const reqDirFailed = setupReqDir.rc === 1 && setupReqDir.json?.results?.[0]?.error_code === 'missing_config_dir' && Boolean(setupReqDir.json?.results?.[0]?.next);
+    const permSetupFailed = setupPerm?.rc === 1 && setupPerm?.json?.results?.[0]?.error_code === 'permission_denied' && Boolean(setupPerm?.json?.results?.[0]?.next);
+    const permDocDetected = docPermClaude?.writable === false && (docPermClaude?.issues || []).some((i) => i.code === 'permission_denied' && Boolean(i.next));
+    assertCase(65, '失败可诊断：缺二进制 / 缺配置目录 / 权限不足均返回明确 error_code 与可执行 next',
+      codexHasEnvErr && codexHasMissingDir && claudeHasMissingBin && reqDirFailed && permSetupFailed && permDocDetected,
+      JSON.stringify({ codexHasEnvErr, codexHasMissingDir, claudeHasMissingBin, reqDirFailed, permSetupFailed, permDocDetected }));
   } finally {
     try { fs.rmSync(RUN_BASE, { recursive: true, force: true }); } catch {}
   }

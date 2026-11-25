@@ -1,8 +1,12 @@
 // agentbus: MCP stdio (and optional loopback HTTP) JSON-RPC 2.0 server (§4)
-// Zero third-party dependencies. Eleven tools (nine bus tools + opt-in dispatch + wait); stdout strictly JSON-RPC lines only.
+// Zero third-party dependencies. Twelve tools (nine bus tools + dispatch/run/wait); stdout strictly JSON-RPC lines only.
 
 import http from 'node:http';
 import readline from 'node:readline';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const PKG_VERSION = require('../package.json').version;
 
 import { registerArtifact } from './store.js';
 import {
@@ -15,7 +19,7 @@ import {
   listTasks,
   verifyTasks,
 } from './tasks.js';
-import { dispatchTask, dispatchEnabled, waitForTask } from './dispatch.js';
+import { dispatchTask, dispatchEnabled, waitForTask, maybeArchiveTask } from './dispatch.js';
 
 const SUPPORTED_PROTOCOL_VERSIONS = new Set(['2025-06-18', '2025-03-26']);
 const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
@@ -29,8 +33,17 @@ const WORKER_TOOLS = new Set([
   'bus_task_fail',
 ]);
 
+let warnedRole = false;
 function currentRole() {
-  return String(process.env.AGENTBUS_ROLE || 'all').toLowerCase();
+  const raw = String(process.env.AGENTBUS_ROLE || '').trim().toLowerCase();
+  if (!raw || raw === 'all') return 'all';
+  if (raw === 'worker') return 'worker';
+  if (raw === 'conductor') return 'conductor';
+  if (!warnedRole) {
+    warnedRole = true;
+    console.error(`[agentbus] 未知 AGENTBUS_ROLE=${raw}，按 worker（最小权限）处理`);
+  }
+  return 'worker';
 }
 
 function visibleTools() {
@@ -255,7 +268,7 @@ function toolError(err) {
   };
 }
 
-function invokeTool(bus, name, args = {}) {
+async function invokeTool(bus, name, args = {}) {
   const a = args && typeof args === 'object' ? args : {};
   try {
     switch (name) {
@@ -335,6 +348,7 @@ function invokeTool(bus, name, args = {}) {
           result_path: a.result_path,
           fields: a.fields || null,
         });
+        await maybeArchiveTask(bus, res.doneResult?.id || res.id);
         return toolSuccess(res);
       }
 
@@ -450,7 +464,7 @@ export async function handleJsonRpcMessage(bus, msg) {
         id: msg.id,
         result: {
           protocolVersion,
-          serverInfo: { name: 'agentbus', version: '1.0.0' },
+          serverInfo: { name: 'agentbus', version: PKG_VERSION },
           capabilities: { tools: { listChanged: false } },
         },
       };

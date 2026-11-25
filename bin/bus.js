@@ -18,7 +18,7 @@ import {
 } from '../src/tasks.js';
 import { startMcpStdio, startMcpHttp } from '../src/mcp.js';
 import { setupClients, doctor, listClients, defaultRoot } from '../src/setup.js';
-import { dispatchTask, dispatchEnabled, waitForTask } from '../src/dispatch.js';
+import { dispatchTask, dispatchEnabled, waitForTask, maybeArchiveTask } from '../src/dispatch.js';
 import { exportAgySession, defaultAgySessionPath, archiveConversation } from '../src/agy.js';
 import { loadContextLedger, confirmDecision } from '../src/context.js';
 import { detectAgents, readAgentConfig, writeAgentConfig } from '../src/agents.js';
@@ -94,8 +94,8 @@ function printHelp() {
     name: 'agentbus',
     version: VERSION,
     commands: [
-      'setup [--client <id>]... [--root <dir>] [--allow <dir>]... [--bin node|npx] [--home <dir>] [--dry-run]',
-      'doctor [--root <dir>]',
+      'setup [--client <id>]... [--root <dir>] [--allow <dir>]... [--bin node|npx] [--home <dir>] [--require-config-dir] [--dry-run]',
+      'doctor [--root <dir>] [--home <dir>]',
       'version',
       'init [--root <dir>]',
       'put <path> [--as <name>] [--by <agent>] [--root <dir>]',
@@ -112,7 +112,7 @@ function printHelp() {
       'wait <id> [--timeout <seconds>]   # 等异步 agent 把任务做完',
       'context <thread> | context confirm <thread> <decision-id> --by <agent> [--evidence <sha256>]',
       'archive <conversation-id> [--port <port>] [--title-prefix <prefix>] [--dry-run]',
-      'onboard [--conductor <agent>] [--model <agent>=<id>]... [--archive-on-done] [--yes] [--dry-run]   # 探测本机 agent 并写好通信配置',
+      'onboard [--conductor <agent>] [--model <agent>=<id>]... [--archive-on-done] [--yes] [--dry-run] [--root <dir>] [--home <dir>] [--allow <dir>]...   # 探测本机 agent 并写好通信配置',
       'agy-session [--out <file>]   # 在 Antigravity 集成终端里运行，导出会话地址与令牌',
       'mcp [--root <dir>] [--http 127.0.0.1:<port>]',
     ],
@@ -130,7 +130,15 @@ async function main() {
     process.exit(0);
   }
 
+  if (args.root === true || (typeof args.root === 'string' && !args.root.trim())) {
+    throw Object.assign(new Error('缺少 --root <dir> 参数值'), { code: 1 });
+  }
+  if (args.home === true || (typeof args.home === 'string' && !args.home.trim())) {
+    throw Object.assign(new Error('缺少 --home <dir> 参数值'), { code: 1 });
+  }
+
   const rootOverride = typeof args.root === 'string' ? args.root : null;
+  const homeOverride = typeof args.home === 'string' ? path.resolve(args.home) : undefined;
 
   // Commands that must not open a database
   if (cmd === 'version' || args.version) {
@@ -144,7 +152,7 @@ async function main() {
   }
 
   if (cmd === 'doctor') {
-    const report = doctor({ root: rootOverride, home: typeof args.home === 'string' ? args.home : undefined });
+    const report = doctor({ root: rootOverride, home: homeOverride });
     process.stdout.write(JSON.stringify(report, null, 2) + '\n');
     process.exit(0);
   }
@@ -156,10 +164,20 @@ async function main() {
         root: rootOverride,
         allowed: args.allow,
         bin: typeof args.bin === 'string' ? args.bin : 'node',
-        home: typeof args.home === 'string' ? args.home : undefined,
+        home: homeOverride,
+        requireConfigDir: !!args['require-config-dir'],
         dryRun: !!args['dry-run'],
       });
       process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+      if (!result.ok) {
+        const firstErr = result.results.find((r) => !r.ok);
+        process.stderr.write(JSON.stringify({
+          error: firstErr?.error || 'setup failed',
+          error_code: firstErr?.error_code || 'setup_failed',
+          next: firstErr?.next || null,
+          code: 1,
+        }) + '\n');
+      }
       process.exit(result.ok ? 0 : 1);
     } catch (e) {
       process.stderr.write(JSON.stringify({ error: String(e.message || e), code: 1 }) + '\n');
@@ -305,6 +323,7 @@ async function main() {
           result_path: typeof args.result === 'string' ? args.result : null,
           fields: extraFields,
         });
+        await maybeArchiveTask(bus, result.doneResult?.id || result.id);
         break;
       }
 
@@ -319,10 +338,16 @@ async function main() {
       }
 
       case 'onboard': {
-        const home = typeof args.home === 'string' ? args.home : os.homedir();
-        const detected = detectAgents(home).filter((a) => a.installed);
+        const explicitHome = homeOverride !== undefined;
+        const home = homeOverride || os.homedir();
+        const allAgents = detectAgents(home, { explicitHome });
+        const detected = allAgents.filter((a) => a.installed);
         if (!detected.length) {
-          throw Object.assign(new Error('没有探测到任何已安装的 agent'), { code: 1 });
+          const hints = allAgents
+            .filter((a) => a.diagnostic?.next)
+            .map((a) => `${a.id}: ${a.diagnostic.next}`)
+            .join('；');
+          throw Object.assign(new Error(`没有探测到任何已安装的 agent（已检查: ${allAgents.map((a) => a.id).join(', ')}）。下一步：${hints}`), { code: 1 });
         }
 
         const provided = {};
@@ -364,7 +389,11 @@ async function main() {
 
         const knownClients = listClients();
         const configured = [];
+        const warnings = [];
         for (const a of detected) {
+          if (!a.bin && a.diagnostic) {
+            warnings.push({ agent: a.id, ...a.diagnostic });
+          }
           if (!knownClients.includes(a.id)) continue;
           const env = { AGENTBUS_ROLE: a.id === conductorId ? 'conductor' : 'worker' };
           if (a.id === conductorId) env.AGENTBUS_ENABLE_DISPATCH = '1';
@@ -372,26 +401,41 @@ async function main() {
             clients: [a.id],
             root: bus.config.rootDir,
             allowed: (args.allow && args.allow.length ? args.allow : [process.cwd()]),
+            home,
             env,
             dryRun: args['dry-run'] === true,
           });
-          configured.push({ agent: a.id, role: env.AGENTBUS_ROLE, ok: r.ok, files: r.results.map((x) => x.file || x.client) });
+          const first = r.results[0] || {};
+          configured.push({
+            agent: a.id,
+            role: env.AGENTBUS_ROLE,
+            ok: r.ok,
+            files: r.results.map((x) => x.file || x.client),
+            ...(first.error ? { error_code: first.error_code, error: first.error, next: first.next } : {}),
+          });
+          if (!r.ok) exitCode = 1;
         }
 
-        const cfg = args['dry-run'] === true
-          ? { conductor: conductorId, models, archive_on_done: archiveOnDone, dry_run: true }
-          : writeAgentConfig(bus.config.rootDir, { conductor: conductorId, models, archive_on_done: archiveOnDone });
+        const allSetupOk = configured.every((c) => c.ok);
+        if (args['dry-run'] !== true && allSetupOk) {
+          writeAgentConfig(bus.config.rootDir, { conductor: conductorId, models, archive_on_done: archiveOnDone });
+        }
 
         result = {
+          ok: allSetupOk,
+          home,
           conductor: conductorId,
-          detected: detected.map((a) => ({ id: a.id, bin: a.bin, config: a.config })),
+          detected: detected.map((a) => ({ id: a.id, bin: a.bin, bin_source: a.bin_source || null, config: a.config })),
           models,
           archive_on_done: archiveOnDone,
           configured,
+          ...(warnings.length ? { warnings } : {}),
           config_file: path.join(bus.config.rootDir, 'agents.json'),
           notes,
           dry_run: args['dry-run'] === true || undefined,
-          next: `重启 ${conductorId} 后它就有派活权限；worker 只有 claim/read/complete`,
+          next: allSetupOk
+            ? `重启 ${conductorId} 后它就有派活权限；worker 只有 claim/read/complete`
+            : (configured.find((c) => !c.ok)?.next || '部分客户端配置失败，请检查 configured[].error 与 next'),
         };
         break;
       }
