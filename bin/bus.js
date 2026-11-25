@@ -111,7 +111,7 @@ function printHelp() {
       'dispatch <id> [--cwd <dir>] [--wait <seconds>] [--thread <name>] [--allow-dispatch]',
       'wait <id> [--timeout <seconds>]   # 等异步 agent 把任务做完',
       'context <thread> | context confirm <thread> <decision-id> --by <agent> [--evidence <sha256>]',
-      'archive <conversation-id> [--port <port>] [--title-prefix <prefix>] [--dry-run]',
+      'archive [<conversation-id>] [--port <port>] [--title-prefix <prefix>] [--title-contains <text>] [--dry-run]',
       'onboard [--conductor <agent>] [--model <agent>=<id>]... [--archive-on-done] [--yes] [--dry-run] [--root <dir>] [--home <dir>] [--allow <dir>]...   # 探测本机 agent 并写好通信配置',
       'agy-session [--out <file>]   # 在 Antigravity 集成终端里运行，导出会话地址与令牌',
       'mcp [--root <dir>] [--http 127.0.0.1:<port>]',
@@ -191,6 +191,7 @@ async function main() {
         conversationId: args._[1] || null,
         port: args.port !== undefined && args.port !== true ? args.port : null,
         titlePrefix: typeof args['title-prefix'] === 'string' ? args['title-prefix'] : null,
+        titleContains: typeof args['title-contains'] === 'string' ? args['title-contains'] : null,
         dryRun: args['dry-run'] === true,
       });
       process.stdout.write(JSON.stringify(res, null, 2) + '\n');
