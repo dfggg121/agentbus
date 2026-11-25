@@ -985,7 +985,7 @@ async function main() {
 
     // 54. archive 端口不通明确报错（含 "需以 --remote-debugging-port"）且不得假装成功
     const deadPort = 59871;
-    const archDead = runCli(['archive', 'conv-dead', '--port', String(deadPort)]);
+    const archDead = runCli(['archive', 'conv-dead', '--port', String(deadPort), '--force']);
     assertCase(54, 'archive 端口不通明确报错（含 --remote-debugging-port 提示）且退出码 1',
       archDead.rc === 1 && archDead.stderr.includes('需以 --remote-debugging-port'),
       `rc=${archDead.rc} stderr=${archDead.stderr.slice(0, 160)}`);
@@ -1087,17 +1087,17 @@ async function main() {
     });
     try {
       const dryRes = await runCliAsync(['archive', 'conv-mock-1', '--port', String(mockPort), '--title-prefix', 'agentbus 11-24', '--dry-run']);
-      assertCase(55, 'archive --dry-run 只做匹配不点击，返回 archived=false, dry_run=true',
-        dryRes.rc === 0 && dryRes.json?.ok === true && dryRes.json?.archived === false && dryRes.json?.dry_run === true,
+      assertCase(55, 'archive --dry-run 只做匹配不点击，返回 archived=false, dry_run=true, would_archive=false',
+        dryRes.rc === 0 && dryRes.json?.ok === true && dryRes.json?.archived === false && dryRes.json?.dry_run === true && dryRes.json?.would_archive === false,
         `rc=${dryRes.rc} json=${JSON.stringify(dryRes.json)} err=${dryRes.stderr}`);
 
       mockMode = 'miss';
-      const missRes = await runCliAsync(['archive', 'conv-missing', '--port', String(mockPort)]);
+      const missRes = await runCliAsync(['archive', 'conv-missing', '--port', String(mockPort), '--force']);
       mockMode = 'match';
-      const hitRes = await runCliAsync(['archive', 'conv-mock-1', '--port', String(mockPort)]);
-      assertCase(56, 'archive 未命中返回 row_not_found(rc=1)，命中返回 archived=true(rc=0)',
+      const hitRes = await runCliAsync(['archive', 'conv-mock-1', '--port', String(mockPort), '--force']);
+      assertCase(56, 'archive 未命中返回 row_not_found(rc=1)，命中返回 archived=true(rc=0) 且 --force 带 forced=true',
         missRes.rc === 1 && missRes.json?.ok === false && missRes.json?.reason === 'row_not_found' &&
-        hitRes.rc === 0 && hitRes.json?.ok === true && hitRes.json?.archived === true,
+        hitRes.rc === 0 && hitRes.json?.ok === true && hitRes.json?.archived === true && hitRes.json?.forced === true,
         `miss=${JSON.stringify(missRes.json)} hit=${JSON.stringify(hitRes.json)}`);
     } finally {
       mockCdpServer.close();
@@ -2278,6 +2278,179 @@ async function main() {
       noHomeCalls81.every((c) => c.hasHermesHome === false) &&
       realHashesUnchanged81,
       `isoCfg=${isoSetupRes81?.file} noHomeRc=${noHomeSetup81.status} noHomeCalls=${JSON.stringify(noHomeCalls81)} realUnchanged=${realHashesUnchanged81}`);
+
+    // 82-83. archive 任务状态闸门：未完成拒绝(rc=2, 不碰 CDP)、dry-run 只读预览、done 放行、--force 才放行批量/ID、自动归档仅限 done
+    const tOpen82 = runCli(['new', '--to', 'antigravity', '--from', 'hermes', '--goal', 'archive-guard-open']).json?.id;
+    const tClaimed82 = runCli(['new', '--to', 'antigravity', '--from', 'hermes', '--goal', 'archive-guard-claimed']).json?.id;
+    runCli(['claim', tClaimed82, '--by', 'antigravity']);
+    const tDone83 = runCli(['new', '--to', 'antigravity', '--from', 'hermes', '--goal', 'archive-guard-done']).json?.id;
+    const cDone83 = runCli(['claim', tDone83, '--by', 'antigravity']).json;
+    const doneResult83 = path.join(OUT_DIR, 'archive_guard_done_83.json');
+    fs.writeFileSync(doneResult83, JSON.stringify({ ok: true }), 'utf8');
+    runCli(['done', tDone83, '--by', 'antigravity', '--lease', cDone83.lease_token, '--result', doneResult83]);
+
+    let guardCdpRequests = 0;
+    let guardCdpClicks = 0;
+    const guardCdpServer = httpMod.default.createServer((req, res) => {
+      guardCdpRequests += 1;
+      if (req.url === '/json') {
+        const port = guardCdpServer.address().port;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify([
+          { type: 'page', title: 'Antigravity - GuardMock', webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/1` },
+        ]));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    guardCdpServer.on('upgrade', (req, socket) => {
+      socket.on('error', () => {});
+      const key = req.headers['sec-websocket-key'];
+      const accept = createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64');
+      socket.write(
+        'HTTP/1.1 101 Switching Protocols\r\n'
+        + 'Upgrade: websocket\r\n'
+        + 'Connection: Upgrade\r\n'
+        + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+      );
+      let acc = Buffer.alloc(0);
+      socket.on('data', (chunk) => {
+        acc = Buffer.concat([acc, chunk]);
+        while (acc.length >= 2) {
+          const opcode = acc[0] & 0x0f;
+          const len = acc[1] & 0x7f;
+          let offset = 2;
+          let payloadLen = len;
+          if (len === 126) {
+            if (acc.length < 4) return;
+            payloadLen = acc.readUInt16BE(2);
+            offset = 4;
+          } else if (len === 127) {
+            if (acc.length < 10) return;
+            payloadLen = Number(acc.readBigUInt64BE(2));
+            offset = 10;
+          }
+          const masked = (acc[1] & 0x80) !== 0;
+          const totalLen = offset + (masked ? 4 : 0) + payloadLen;
+          if (acc.length < totalLen) return;
+          const mask = masked ? acc.subarray(offset, offset + 4) : null;
+          const dataStart = masked ? offset + 4 : offset;
+          const data = Buffer.from(acc.subarray(dataStart, dataStart + payloadLen));
+          acc = acc.subarray(totalLen);
+          if (mask) {
+            for (let i = 0; i < data.length; i++) data[i] ^= mask[i % 4];
+          }
+          if (opcode === 0x8) {
+            try { socket.end(); } catch {}
+            return;
+          }
+          let reqMsg;
+          try { reqMsg = JSON.parse(data.toString('utf8')); } catch { continue; }
+          const expr = reqMsg?.params?.expression || '';
+          const isDry = expr.includes('const dryRun = true');
+          if (!isDry) guardCdpClicks += 1;
+          const value = isDry
+            ? { ok: true, archived: false, dry_run: true, conversation_id: null, row_text: `agentbus 11-25 ${tDone83}` }
+            : { ok: true, archived: true, conversation_id: null, row_text: `agentbus 11-25 ${tDone83}` };
+          const respBuf = Buffer.from(JSON.stringify({ id: reqMsg.id, result: { result: { value } } }), 'utf8');
+          const header = respBuf.length < 126
+            ? Buffer.from([0x81, respBuf.length])
+            : Buffer.from([0x81, 126, (respBuf.length >> 8) & 0xff, respBuf.length & 0xff]);
+          socket.write(Buffer.concat([header, respBuf]));
+        }
+      });
+    });
+    await new Promise((r) => guardCdpServer.listen(0, '127.0.0.1', r));
+    const guardMockPort = guardCdpServer.address().port;
+    try {
+      const openBlockRes = await runCliAsync(['archive', '--title-contains', tOpen82, '--port', String(guardMockPort)]);
+      const claimedBlockRes = await runCliAsync(['archive', '--title-contains', tClaimed82, '--port', String(guardMockPort)]);
+      const notTaskBlockRes = await runCliAsync(['archive', '--title-contains', 'nonexistent-task-xyz', '--port', String(guardMockPort)]);
+      const reqsAfterBlocks = guardCdpRequests;
+      const dryOfflineRes = await runCliAsync(['archive', '--title-contains', tClaimed82, '--dry-run']);
+      const dryMockRes = await runCliAsync(['archive', '--title-contains', tClaimed82, '--port', String(guardMockPort), '--dry-run']);
+      const clicksAfterDry = guardCdpClicks;
+
+      assertCase(82, 'archive 拒绝未完成任务(rc=2, reason=task_not_done, 不碰 CDP)且 --dry-run 可预览并标 would_archive=false',
+        openBlockRes.rc === 2 &&
+        openBlockRes.json?.ok === false &&
+        openBlockRes.json?.archived === false &&
+        openBlockRes.json?.reason === 'task_not_done' &&
+        openBlockRes.json?.task_id === tOpen82 &&
+        openBlockRes.json?.state === 'open' &&
+        claimedBlockRes.rc === 2 &&
+        claimedBlockRes.json?.reason === 'task_not_done' &&
+        claimedBlockRes.json?.task_id === tClaimed82 &&
+        claimedBlockRes.json?.state === 'claimed' &&
+        claimedBlockRes.stderr.includes('task_not_done') &&
+        notTaskBlockRes.rc === 1 &&
+        notTaskBlockRes.json?.reason === 'not_a_task' &&
+        reqsAfterBlocks === 0 &&
+        dryOfflineRes.rc === 0 &&
+        dryOfflineRes.json?.ok === true &&
+        dryOfflineRes.json?.dry_run === true &&
+        dryOfflineRes.json?.would_archive === false &&
+        dryOfflineRes.json?.task_id === tClaimed82 &&
+        dryOfflineRes.json?.task_state === 'claimed' &&
+        dryOfflineRes.json?.reason === 'task_not_done' &&
+        dryMockRes.rc === 0 &&
+        dryMockRes.json?.would_archive === false &&
+        clicksAfterDry === 0,
+        `open=${JSON.stringify(openBlockRes.json)} claimed=${JSON.stringify(claimedBlockRes.json)} notTask=${JSON.stringify(notTaskBlockRes.json)} reqs=${reqsAfterBlocks} dry=${JSON.stringify(dryOfflineRes.json)} clicks=${clicksAfterDry}`);
+
+      const doneRes83 = await runCliAsync(['archive', '--title-contains', tDone83, '--port', String(guardMockPort)]);
+      const clicksAfterDone = guardCdpClicks;
+      const prefixBlocked83 = await runCliAsync(['archive', '--title-prefix', 'agentbus 11-25', '--port', String(guardMockPort)]);
+      const convBlocked83 = await runCliAsync(['archive', 'conv-guard-83', '--port', String(guardMockPort)]);
+      const clicksAfterForcedBlocks = guardCdpClicks;
+      const prefixForced83 = await runCliAsync(['archive', '--title-prefix', 'agentbus 11-25', '--port', String(guardMockPort), '--force']);
+      const notTaskForced83 = await runCliAsync(['archive', '--title-contains', 'nonexistent-task-xyz', '--port', String(guardMockPort), '--force']);
+
+      const { maybeArchiveTask } = await import('../src/dispatch.js');
+      const bus83 = openBus({ rootOverride: ROOT_MAIN });
+      const prevArchEnv83 = process.env.AGENTBUS_ARCHIVE_ON_DONE;
+      process.env.AGENTBUS_ARCHIVE_ON_DONE = '1';
+      let autoRes83 = 'not-null';
+      let autoEvtCount83 = -1;
+      try {
+        autoRes83 = await maybeArchiveTask(bus83, tClaimed82);
+        autoEvtCount83 = bus83.db.prepare(
+          "SELECT COUNT(*) AS c FROM events WHERE task_id = ? AND event = 'archive_on_done'"
+        ).get(tClaimed82)?.c ?? -1;
+      } finally {
+        if (prevArchEnv83 === undefined) delete process.env.AGENTBUS_ARCHIVE_ON_DONE;
+        else process.env.AGENTBUS_ARCHIVE_ON_DONE = prevArchEnv83;
+        bus83.close();
+      }
+
+      assertCase(83, 'done 允许归档；--title-prefix/conversation-id 需 --force；maybeArchiveTask 对 claimed 返回 null 且不写事件',
+        doneRes83.rc === 0 &&
+        doneRes83.json?.ok === true &&
+        doneRes83.json?.archived === true &&
+        doneRes83.json?.task_id === tDone83 &&
+        doneRes83.json?.task_state === 'done' &&
+        clicksAfterDone === 1 &&
+        prefixBlocked83.rc === 1 &&
+        prefixBlocked83.json?.ok === false &&
+        prefixBlocked83.json?.reason === 'title_prefix_requires_force' &&
+        convBlocked83.rc === 1 &&
+        convBlocked83.json?.ok === false &&
+        convBlocked83.json?.reason === 'conversation_id_requires_force' &&
+        clicksAfterForcedBlocks === 1 &&
+        prefixForced83.rc === 0 &&
+        prefixForced83.json?.ok === true &&
+        prefixForced83.json?.archived === true &&
+        prefixForced83.json?.forced === true &&
+        notTaskForced83.rc === 0 &&
+        notTaskForced83.json?.archived === true &&
+        notTaskForced83.json?.forced === true &&
+        autoRes83 === null &&
+        autoEvtCount83 === 0,
+        `done=${JSON.stringify(doneRes83.json)} pfxBlk=${JSON.stringify(prefixBlocked83.json)} convBlk=${JSON.stringify(convBlocked83.json)} pfxFrc=${JSON.stringify(prefixForced83.json)} auto=${JSON.stringify(autoRes83)}:${autoEvtCount83}`);
+    } finally {
+      guardCdpServer.close();
+    }
   } finally {
     try { fs.rmSync(RUN_BASE, { recursive: true, force: true }); } catch {}
   }

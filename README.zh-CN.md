@@ -214,12 +214,15 @@ agentbus onboard --conductor codex --allow /path/to/workspace
 ### 归档会话
 
 ```
-agentbus archive <conversation-id> --dry-run       # 只匹配，不点击
-agentbus archive <conversation-id> --port 9222
-agentbus archive --title-contains <taskid>          # 归档该任务的全部重复会话
+agentbus archive --title-contains <taskid>          # 默认只允许归档 state=done 的任务
+agentbus archive --title-contains <taskid> --dry-run
+agentbus archive <conversation-id> --port 9222 --force
+agentbus archive --title-prefix <prefix> --force    # 仅限人工清理旧会话
 agentbus onboard --archive-on-done                  # 持久开启：写进 agents.json，重启也生效
 AGENTBUS_ARCHIVE_ON_DONE=1                          # 单次运行临时开启
 ```
+
+**归档状态闸门（默认开启）**：默认只允许通过 `--title-contains <taskid>` 归档已完成（`state === 'done'`）的任务。若任务仍为 `open` / `claimed` 等未完成状态，会在调用 CDP 前直接拒绝并返回 `task_not_done`（退出码 `2`）；查无此任务返回 `not_a_task`（退出码 `1`）。`--title-prefix`（`title_prefix_requires_force`）与裸 `<conversation-id>`（`conversation_id_requires_force`）默认同样拒绝。`--dry-run` 允许对未完成任务做只读预览，输出 `task_id`、`task_state` 与 `would_archive` 且绝不点击。`--force` 仅限人工清理陈旧/卡死会话（返回带 `forced: true`）：对仍在运行的任务强行 `--force` 只会隐藏侧栏入口、不会停止任务本身，请谨慎使用。
 
 走 CDP 点击侧边栏的 `归档对话` 按钮；应用需以 `--remote-debugging-port=<n>` 启动，否则明确报错而不是假装成功。
 

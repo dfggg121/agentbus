@@ -20,7 +20,7 @@ import {
 } from '../src/tasks.js';
 import { startMcpStdio, startMcpHttp } from '../src/mcp.js';
 import { setupClients, doctor, listClients, describeClients, defaultRoot } from '../src/setup.js';
-import { dispatchTask, dispatchEnabled, waitForTask, maybeArchiveTask } from '../src/dispatch.js';
+import { dispatchTask, dispatchEnabled, waitForTask, maybeArchiveTask, checkArchiveGuard } from '../src/dispatch.js';
 import { exportAgySession, defaultAgySessionPath, archiveConversation } from '../src/agy.js';
 import { loadContextLedger, confirmDecision } from '../src/context.js';
 import { detectAgents, readAgentConfig, writeAgentConfig } from '../src/agents.js';
@@ -115,7 +115,7 @@ function printHelp() {
       'dispatch <id> [--cwd <dir>] [--wait <seconds>] [--thread <name>] [--allow-dispatch]',
       'wait <id> [--timeout <seconds>]   # 等异步 agent 把任务做完',
       'context <thread> | context confirm <thread> <decision-id> --by <agent> [--evidence <sha256>]',
-      'archive [<conversation-id>] [--port <port>] [--title-prefix <prefix>] [--title-contains <text>] [--dry-run]',
+      'archive [<conversation-id>] [--port <port>] [--title-prefix <prefix>] [--title-contains <text>] [--dry-run] [--force]',
       'onboard [--conductor <agent>] [--model <agent>=<id>]... [--archive-on-done] [--yes] [--dry-run] [--root <dir>] [--home <dir>] [--allow <dir>]...   # 探测本机 agent 并写好通信配置',
       'agy-session [--out <file>]   # 在 Antigravity 集成终端里运行，导出会话地址与令牌',
       'mcp [--root <dir>] [--http 127.0.0.1:<port>]',
@@ -195,24 +195,6 @@ async function main() {
     } catch (e) {
       process.stderr.write(JSON.stringify({ error: String(e.message || e), code: 1 }) + '\n');
       process.exit(1);
-    }
-  }
-
-  if (cmd === 'archive') {
-    try {
-      const res = await archiveConversation({
-        conversationId: args._[1] || null,
-        port: args.port !== undefined && args.port !== true ? args.port : null,
-        titlePrefix: typeof args['title-prefix'] === 'string' ? args['title-prefix'] : null,
-        titleContains: typeof args['title-contains'] === 'string' ? args['title-contains'] : null,
-        dryRun: args['dry-run'] === true,
-      });
-      process.stdout.write(JSON.stringify(res, null, 2) + '\n');
-      process.exit(res.ok ? 0 : 1);
-    } catch (e) {
-      const code = e?.code === 2 ? 2 : 1;
-      process.stderr.write(JSON.stringify({ error: String(e?.message || e), code }) + '\n');
-      process.exit(code);
     }
   }
 
@@ -490,6 +472,90 @@ async function main() {
       case 'agy-session': {
         const out = typeof args.out === 'string' ? args.out : defaultAgySessionPath(bus.config.rootDir);
         result = exportAgySession(out);
+        break;
+      }
+
+      case 'archive': {
+        if (args['title-prefix'] === true) {
+          throw Object.assign(new Error('缺少 --title-prefix <prefix> 参数值'), { code: 1 });
+        }
+        if (args['title-contains'] === true) {
+          throw Object.assign(new Error('缺少 --title-contains <text> 参数值'), { code: 1 });
+        }
+        let conversationId = args._[1] || null;
+        let force = args.force === true || args.force === 'true';
+        if (typeof args.force === 'string' && args.force !== 'true' && args.force !== 'false' && !conversationId) {
+          conversationId = args.force;
+          force = true;
+        }
+        let dryRun = args['dry-run'] === true || args['dry-run'] === 'true';
+        if (typeof args['dry-run'] === 'string' && args['dry-run'] !== 'true' && args['dry-run'] !== 'false' && !conversationId) {
+          conversationId = args['dry-run'];
+          dryRun = true;
+        }
+        const port = args.port !== undefined && args.port !== true ? args.port : null;
+        const titlePrefix = typeof args['title-prefix'] === 'string' ? args['title-prefix'] : null;
+        const titleContains = typeof args['title-contains'] === 'string' ? args['title-contains'] : null;
+
+        const guard = checkArchiveGuard(bus, { conversationId, titlePrefix, titleContains, force });
+
+        if (dryRun) {
+          if (!guard.allowed) {
+            let preview = null;
+            if (port !== null) {
+              preview = await archiveConversation({ conversationId, port, titlePrefix, titleContains, dryRun: true }).catch(() => null);
+            }
+            result = {
+              ...(preview && typeof preview === 'object' ? preview : {}),
+              ok: true,
+              archived: false,
+              dry_run: true,
+              task_id: guard.task_id,
+              task_state: guard.task_state,
+              would_archive: false,
+              reason: guard.reason,
+              ...(guard.error ? { error: guard.error } : {}),
+            };
+          } else {
+            const cdpRes = await archiveConversation({ conversationId, port, titlePrefix, titleContains, dryRun: true });
+            result = {
+              ...cdpRes,
+              task_id: guard.task_id,
+              task_state: guard.task_state,
+              would_archive: Boolean(cdpRes.ok),
+              ...(force ? { forced: true } : {}),
+            };
+            if (!cdpRes.ok) exitCode = 1;
+          }
+          break;
+        }
+
+        if (!guard.allowed) {
+          result = {
+            ok: false,
+            archived: false,
+            reason: guard.reason,
+            ...(guard.task_id ? { task_id: guard.task_id } : {}),
+            ...(guard.task_state ? { state: guard.task_state, task_state: guard.task_state } : {}),
+            ...(guard.error ? { error: guard.error } : {}),
+          };
+          exitCode = guard.code;
+          process.stderr.write(JSON.stringify({
+            error: `archive 拒绝 (${guard.reason})`,
+            reason: guard.reason,
+            ...(guard.task_id ? { task_id: guard.task_id, state: guard.task_state } : {}),
+            code: exitCode,
+          }) + '\n');
+          break;
+        }
+
+        const cdpRes = await archiveConversation({ conversationId, port, titlePrefix, titleContains, dryRun: false });
+        result = {
+          ...cdpRes,
+          ...(guard.task_id ? { task_id: guard.task_id, task_state: guard.task_state } : {}),
+          ...(force ? { forced: true } : {}),
+        };
+        if (!cdpRes.ok) exitCode = 1;
         break;
       }
 

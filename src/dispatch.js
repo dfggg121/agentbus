@@ -291,6 +291,96 @@ function runAdapter(spec, { cwd, timeout_s }) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Guard CLI archive against hiding active or unverified conversations.
+// By default only `--title-contains <task-id>` for a `done` task is allowed;
+// `--title-prefix`, `<conversation-id>`, and unknown titles require `--force`.
+export function checkArchiveGuard(bus, {
+  conversationId = null,
+  titlePrefix = null,
+  titleContains = null,
+  force = false,
+} = {}) {
+  if (!conversationId && !titlePrefix && !titleContains) {
+    throw Object.assign(new Error('archive 需要 <conversation-id>、--title-prefix 或 --title-contains'), { code: 1 });
+  }
+
+  let task = null;
+  let lookupErr = null;
+  if (titleContains) {
+    try {
+      task = showTask(bus, titleContains);
+    } catch (err) {
+      lookupErr = err;
+    }
+  }
+
+  const taskId = task?.id || null;
+  const taskState = task?.state || null;
+
+  if (force) {
+    return {
+      allowed: true,
+      reason: null,
+      code: 0,
+      task_id: taskId,
+      task_state: taskState,
+      forced: true,
+    };
+  }
+
+  if (titlePrefix) {
+    return {
+      allowed: false,
+      reason: 'title_prefix_requires_force',
+      code: 1,
+      task_id: taskId,
+      task_state: taskState,
+    };
+  }
+
+  if (conversationId) {
+    return {
+      allowed: false,
+      reason: 'conversation_id_requires_force',
+      code: 1,
+      task_id: taskId,
+      task_state: taskState,
+    };
+  }
+
+  if (lookupErr) {
+    const msg = String(lookupErr?.message || lookupErr);
+    const isAmbiguous = /前缀不唯一/.test(msg);
+    return {
+      allowed: false,
+      reason: isAmbiguous ? 'ambiguous_task_id' : 'not_a_task',
+      code: 1,
+      task_id: null,
+      task_state: null,
+      ...(isAmbiguous ? { error: msg } : {}),
+    };
+  }
+
+  if (task.state !== 'done') {
+    return {
+      allowed: false,
+      reason: 'task_not_done',
+      code: 2,
+      task_id: task.id,
+      task_state: task.state,
+    };
+  }
+
+  return {
+    allowed: true,
+    reason: null,
+    code: 0,
+    task_id: task.id,
+    task_state: task.state,
+    forced: false,
+  };
+}
+
 // Auto-archive must run in the process that actually completes the task:
 // long async agents (Antigravity) often outlive the dispatcher that spawned them.
 export async function maybeArchiveTask(bus, taskId) {

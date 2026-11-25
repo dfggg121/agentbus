@@ -204,12 +204,15 @@ Model inference dominates, not the bus: Codex 45.5s, Antigravity 30s — communi
 ### Archiving conversations
 
 ```
-agentbus archive <conversation-id> --dry-run
-agentbus archive <conversation-id> --port 9222
-agentbus archive --title-contains <taskid>   # sweep duplicate conversations
-agentbus onboard --archive-on-done        # persistent, stored in agents.json
-AGENTBUS_ARCHIVE_ON_DONE=1                # one-off, for this process only
+agentbus archive --title-contains <taskid>          # only allowed when task state === done
+agentbus archive --title-contains <taskid> --dry-run
+agentbus archive <conversation-id> --port 9222 --force
+agentbus archive --title-prefix <prefix> --force    # manual batch cleanup only
+agentbus onboard --archive-on-done                  # persistent, stored in agents.json
+AGENTBUS_ARCHIVE_ON_DONE=1                          # one-off, for this process only
 ```
+
+**Task-state guard (default)**: By default `archive` only allows `--title-contains <taskid>` when the matching task has `state === 'done'`. Non-`done` tasks are rejected with `task_not_done` (exit code `2`) before touching CDP, and unknown IDs are rejected with `not_a_task` (exit code `1`). `--title-prefix` (`title_prefix_requires_force`) and bare `<conversation-id>` (`conversation_id_requires_force`) are also rejected unless `--force` is explicitly passed. `--dry-run` stays read-only and may be run on active tasks to inspect `task_id`, `task_state`, and `would_archive` without clicking. `--force` is strictly for manual cleanup of stale or stuck conversations (adds `forced: true`) — forcing an active task only hides its sidebar entry while the task keeps running in the background.
 
 Drives the sidebar `归档对话` button over CDP. The app must be started with `--remote-debugging-port=<n>`; otherwise the command fails loudly instead of pretending. Auto-archive runs once on final `done` inside the process that completes the task (CLI `done` or MCP `bus_task_complete`), so it still fires after the dispatcher has exited. It matches every conversation titled `agentbus MM-DD <taskid>`, retries up to 6 times while the sidebar renders, and correlates portalled buttons by row center. A miss only appends `row_not_found`; other conversations are never touched.
 
