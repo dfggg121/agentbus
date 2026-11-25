@@ -1,27 +1,49 @@
 # agentbus
 
-**agent 之间交接任务，传地址，不传正文。**
+`agentbus` 是给本机已有 coding agent 使用的任务总线。发活方先把资料就地登记，交出去的是一份很小的 JSON 信封（`tasks/<id>.json`），里面只写 `uri`、`sha256`、`goal` 和 `acceptance` 验收条款。领取方拿到租约后自己按地址读盘，卡住时可在任务内提问等待回复，交回产物后由总线重算哈希并逐条验收再关闭任务。
 
-`agentbus` 是一个本机多代理任务总线。任务信封里有目标、验收条款，以及指向所需资料的**指针**（`uri` + `sha256`）——没有正文。领取方自己按地址读盘，交回的成果在任务关闭前会重新核对哈希。
+- 零第三方依赖，持久化使用 Node 内置的 `node:sqlite`。
+- 一个 MCP stdio 服务端（`conductor` 角色 15 个工具，`worker` 最小权限 9 个工具）外加同能力 CLI。
+- 通过 `agentbus setup` 接入 Codex、Claude Code、Gemini CLI、Antigravity、Cursor、OpenCode、Claude Desktop、Windsurf、Kiro、LM Studio、Cline、DeepSeek Harness (DSH) 与 Hermes Agent，不改变各客户端原本的界面。
+- 不复制资料正文：登记一个 4 MB 文件，SQLite 只增约 48 KB，任务信封体积 2,025 B。
 
-- 零第三方依赖；SQLite 用 Node 内置的 `node:sqlite`。
-- 一个 MCP stdio 服务端，支持 Codex / Claude Code / Gemini CLI / Antigravity / Cursor / OpenCode / Claude Desktop，以及 Windsurf / Kiro / LM Studio / Cline / DeepSeek Harness (DSH) / Hermes Agent。
-- 同样的能力有 CLI，cron、批处理、不支持 MCP 的 agent 也能用。
-- 从不复制资料：登记一个 4MB 文件，数据库只增约 **48KB**。
+## 一条任务的生命周期
 
----
+![agentbus 任务生命周期图：bus_register 登记指针、open 待领、claimed 持有 900 秒租约、question 与 answer 双向沟通、重算哈希与验收后进入 done](docs/assets/agentbus-task-loop.svg)
 
-## 为什么
+流转顺序：`bus_register`（`uri + sha256`）-> `open`（`tasks/<id>.json`）-> `claimed`（`lease_token`，默认 900 秒租约，`heartbeat` 续租）-> `bus_task_message`（`question`/`blocked` 由主控 `answer` 解阻）-> `done`（重算全部引用哈希并跑 `acceptance`）。租约过期后任务回到 `open` 且 `attempt + 1`。静态兜底图见 [`docs/assets/agentbus-task-loop.png`](docs/assets/agentbus-task-loop.png)。
 
-手上不止一个 coding agent 的人都会遇到：每交接一次就重做一份"任务包"，把规格、日志、CSV、策略文件塞进去；下一个 agent 再从头读一遍。资料每跳复制一次，跳到第三手已经没人知道哪份是准的。
+## 它和常见做法哪里不同
 
-`agentbus` 只在盘上留一份，传的是一张收据：路径、大小、SHA-256。本仓库参考任务的实测：
+| 环节 | 常见 prompt / 任务包做法 | agentbus |
+|---|---|---|
+| 资料传递 | 每跳把全文或大段文本塞进 prompt | 只传 `uri + sha256` 指针；`bus_ref_read` 只内联 `<= 64 KB`，更大只给 `resource_link` |
+| 执行状态 | 发出 prompt 后子进程退出就算完成 | 状态机 `open -> claimed(lease) -> done \| failed`，带 900 秒租约、`heartbeat` 与过期回收 |
+| 遇阻沟通 | 靠日志猜测或重开一轮 | `bus_task_message` 发 `question` / `blocked` / `error`（置 `blocked_at`），主控 `answer` 清阻塞并唤醒 `bus_task_wait` |
+| 成果验收 | 默认相信 agent 嘴上说完成了 | `bus_task_complete` 重算每份引用哈希（`drift` 默认拒收），并核对 `json`、`must_contain`、`min_bytes`、`fields` |
+| 工具接入 | 需要套进特定框架或改写入口 | 通过 `agentbus setup` 写入 13 类现有 MCP 客户端配置，并用 `AGENTBUS_ROLE` 限制 worker 权限 |
+| 模块归属 | 散落在长对话历史里 | `agentbus ui` 提供仅绑 loopback 的 14 模块归属面板，勾选后先生成 conductor 任务（默认不自动派发） |
+| 运行依赖 | 依赖外部服务或框架包 | 本机 `file://` 地址 + SQLite WAL，零第三方运行时依赖 |
+
+## 模块归属面板（`agentbus ui`）
+
+执行 `agentbus ui --port 0 --no-open --root <bus-root>` 会启动一个只监听 loopback 的只读面板，按技术分层列出 14 个模块的负责人与本地 `agents.json` 解析出的工作模型。勾选模块并在右侧选定动作（重做、深度优化、调整工作模型、只检查）后，默认只把调度任务写入总线；需要立即派发时再加 `--dispatch` 或勾选页面开关（详见 [`docs/UI.md`](docs/UI.md)）。
+
+![agentbus 本机模块归属面板真实截图，左侧展示分层模块与负责人模型，已勾选 store 与 tasks 两个模块，右侧展示 Conductor 调度任务摘要预览](docs/assets/agentbus-ui.png)
+
+## 为什么传指针而不复制正文
+
+同时用多个 coding agent 时，常见做法是每次交接都把规格、日志、CSV 和策略文件重新打包进下一轮上下文。转手三次之后，盘上出现多份副本，谁也不知道哪份还是最新的。
+
+`agentbus` 只在原处保留一份文件，传递的是一张收据（路径、字节数、SHA-256）。本仓库参考任务的实测数据：
 
 | | 任务包（复制） | agentbus（指针） |
 |---|---|---|
 | 信封体积 | 4,195,256 B | **2,025 B** |
-| 4MB 资料的副本数 | 每跳 1 份 | 0 |
-| 能否发现资料已过期 | 不能 | 能——`sha256` 不符直接拒绝收工 |
+| 4 MB 资料的副本数 | 每跳 1 份 | 0 |
+| 能否发现资料已过期 | 不能 | 能（`sha256` 不符直接拒绝收工） |
+
+![对比图：左侧磁盘单份原件、中间 2,025 B 指针信封与约 48 KB 数据库记录、右侧领取方按大小读盘并在收工时重算哈希](docs/assets/agentbus-pointer.svg)
 
 ---
 

@@ -1,0 +1,144 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 260" width="1000" height="260" role="img" aria-labelledby="title desc">
+  <title id="title">agentbus task lifecycle</title>
+  <desc id="desc">A task moves from bus_register (pointer and sha256) to open, claimed with a 900s lease token, optional question and answer messages, and done after re-hashing refs and running acceptance checks. Expired leases return to open with attempt incremented.</desc>
+  <style>
+    .bg { fill: #f8f7f3; stroke: #d8d5cc; stroke-width: 1.5; }
+    .hdr-title { font: 600 14px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1b1d22; }
+    .hdr-sub { font: 400 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #575a64; }
+    .node { fill: #ffffff; stroke: #c5c1b6; stroke-width: 1.5; }
+    .node-title { font: 600 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #1b1d22; }
+    .node-sub { font: 400 11.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #4a4d57; }
+    .node-meta { font: 400 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #757268; }
+    .arrow { fill: none; stroke: #8c887d; stroke-width: 1.6; }
+    .arrow-head { fill: #8c887d; }
+    .loop-arc { fill: none; stroke: #9d7540; stroke-width: 1.4; stroke-dasharray: 5 4; }
+    .loop-head { fill: #9d7540; }
+    .loop-label { font: 400 11.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #8a5a19; }
+    .step-badge { fill: #efede6; stroke: #d5d1c6; stroke-width: 1; }
+    .step-num { font: 600 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #575a64; }
+    .track-rail { fill: none; stroke: #dcd8cd; stroke-width: 1.5; }
+    .track-tick { fill: none; stroke: #dcd8cd; stroke-width: 1.5; }
+    .pulse-ring { fill: none; stroke: #c47a1c; stroke-width: 2.2; opacity: 0; }
+    .token-dot { fill: #c47a1c; stroke: #f8f7f3; stroke-width: 2; }
+
+    @keyframes stage1 { 0%, 17% { opacity: 1; } 20%, 100% { opacity: 0; } }
+    @keyframes stage2 { 0%, 19% { opacity: 0; } 21%, 37% { opacity: 1; } 40%, 100% { opacity: 0; } }
+    @keyframes stage3 { 0%, 39% { opacity: 0; } 41%, 57% { opacity: 1; } 60%, 100% { opacity: 0; } }
+    @keyframes stage4 { 0%, 59% { opacity: 0; } 61%, 77% { opacity: 1; } 80%, 100% { opacity: 0; } }
+    @keyframes stage5 { 0%, 79% { opacity: 0; } 81%, 97% { opacity: 1; } 100% { opacity: 0; } }
+
+    .p1 { animation: stage1 8s linear infinite; }
+    .p2 { animation: stage2 8s linear infinite; }
+    .p3 { animation: stage3 8s linear infinite; }
+    .p4 { animation: stage4 8s linear infinite; }
+    .p5 { animation: stage5 8s linear infinite; }
+
+    @media (prefers-reduced-motion: reduce) {
+      .p1, .p2, .p3, .p4, .p5 { animation: none; opacity: 0; }
+      .p3 { opacity: 1; }
+      .token-dot { display: none; }
+    }
+  </style>
+
+  <rect class="bg" x="1" y="1" width="998" height="258" rx="8" />
+
+  <text class="hdr-title" x="30" y="34">Task lifecycle (pointer + lease + verification)</text>
+  <text class="hdr-sub" x="970" y="34" text-anchor="end">open -&gt; claimed(lease) -&gt; done | failed</text>
+
+  <!-- Main horizontal connectors -->
+  <line class="arrow" x1="186" y1="112" x2="220" y2="112" />
+  <polygon class="arrow-head" points="220,108 226,112 220,116" />
+
+  <line class="arrow" x1="382" y1="112" x2="416" y2="112" />
+  <polygon class="arrow-head" points="416,108 422,112 416,116" />
+
+  <line class="arrow" x1="578" y1="112" x2="612" y2="112" />
+  <polygon class="arrow-head" points="612,108 618,112 612,116" />
+
+  <line class="arrow" x1="774" y1="112" x2="808" y2="112" />
+  <polygon class="arrow-head" points="808,108 814,112 808,116" />
+
+  <!-- Lease expiry return arc (claimed -> open) -->
+  <path class="loop-arc" d="M 500 162 L 500 202 Q 500 212 490 212 L 314 212 Q 304 212 304 202 L 304 168" />
+  <polygon class="loop-head" points="300,169 304,162 308,169" />
+  <text class="loop-label" x="402" y="232" text-anchor="middle">lease expired -&gt; reopen (attempt + 1)</text>
+
+  <!-- Stage 1: bus_register -->
+  <g transform="translate(30,62)">
+    <rect class="node" width="156" height="100" rx="6" />
+    <rect class="pulse-ring p1" width="156" height="100" rx="6" />
+    <rect class="step-badge" x="10" y="10" width="22" height="18" rx="3" />
+    <text class="step-num" x="21" y="23" text-anchor="middle">01</text>
+    <text class="node-title" x="39" y="23">ref pointer</text>
+    <text class="node-sub" x="12" y="50">bus_register</text>
+    <text class="node-meta" x="12" y="69">uri + sha256</text>
+    <text class="node-meta" x="12" y="86">file stays on disk</text>
+  </g>
+
+  <!-- Stage 2: open -->
+  <g transform="translate(226,62)">
+    <rect class="node" width="156" height="100" rx="6" />
+    <rect class="pulse-ring p2" width="156" height="100" rx="6" />
+    <rect class="step-badge" x="10" y="10" width="22" height="18" rx="3" />
+    <text class="step-num" x="21" y="23" text-anchor="middle">02</text>
+    <text class="node-title" x="39" y="23">open</text>
+    <text class="node-sub" x="12" y="50">bus_task_create</text>
+    <text class="node-meta" x="12" y="69">tasks/&lt;id&gt;.json</text>
+    <text class="node-meta" x="12" y="86">~2 KB envelope</text>
+  </g>
+
+  <!-- Stage 3: claimed -->
+  <g transform="translate(422,62)">
+    <rect class="node" width="156" height="100" rx="6" />
+    <rect class="pulse-ring p3" width="156" height="100" rx="6" />
+    <rect class="step-badge" x="10" y="10" width="22" height="18" rx="3" />
+    <text class="step-num" x="21" y="23" text-anchor="middle">03</text>
+    <text class="node-title" x="39" y="23">claimed</text>
+    <text class="node-sub" x="12" y="50">lease_token</text>
+    <text class="node-meta" x="12" y="69">TTL 900s default</text>
+    <text class="node-meta" x="12" y="86">heartbeat / ref_read</text>
+  </g>
+
+  <!-- Stage 4: question / answer -->
+  <g transform="translate(618,62)">
+    <rect class="node" width="156" height="100" rx="6" />
+    <rect class="pulse-ring p4" width="156" height="100" rx="6" />
+    <rect class="step-badge" x="10" y="10" width="22" height="18" rx="3" />
+    <text class="step-num" x="21" y="23" text-anchor="middle">04</text>
+    <text class="node-title" x="39" y="23">ask / answer</text>
+    <text class="node-sub" x="12" y="50">bus_task_message</text>
+    <text class="node-meta" x="12" y="69">question / blocked</text>
+    <text class="node-meta" x="12" y="86">answer clears block</text>
+  </g>
+
+  <!-- Stage 5: done -->
+  <g transform="translate(814,62)">
+    <rect class="node" width="156" height="100" rx="6" />
+    <rect class="pulse-ring p5" width="156" height="100" rx="6" />
+    <rect class="step-badge" x="10" y="10" width="22" height="18" rx="3" />
+    <text class="step-num" x="21" y="23" text-anchor="middle">05</text>
+    <text class="node-title" x="39" y="23">done</text>
+    <text class="node-sub" x="12" y="50">bus_task_complete</text>
+    <text class="node-meta" x="12" y="69">re-hash every ref</text>
+    <text class="node-meta" x="12" y="86">check acceptance</text>
+  </g>
+
+  <!-- Top progress track for the moving marker -->
+  <line class="track-rail" x1="108" y1="50" x2="892" y2="50" />
+  <line class="track-tick" x1="108" y1="50" x2="108" y2="62" />
+  <line class="track-tick" x1="304" y1="50" x2="304" y2="62" />
+  <line class="track-tick" x1="500" y1="50" x2="500" y2="62" />
+  <line class="track-tick" x1="696" y1="50" x2="696" y2="62" />
+  <line class="track-tick" x1="892" y1="50" x2="892" y2="62" />
+
+  <!-- Animated progress marker along the top track -->
+  <circle class="token-dot" r="5" cx="108" cy="50">
+    <animateMotion
+      dur="8s"
+      repeatCount="indefinite"
+      path="M 0,0 L 196,0 L 392,0 L 588,0 L 784,0"
+      keyPoints="0;0.25;0.5;0.75;1"
+      keyTimes="0;0.22;0.45;0.68;0.9"
+      calcMode="linear" />
+  </circle>
+</svg>

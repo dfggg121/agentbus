@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 220" width="880" height="220" role="img" aria-labelledby="title desc">
+  <title id="title">Pointer-based handoff vs payload copy</title>
+  <desc id="desc">A 4 MB file stays on disk while SQLite stores only 48 KB of metadata and the task envelope stays around 2 KB with uri and sha256.</desc>
+  <style>
+    .bg { fill: #f8f7f3; stroke: #d8d5cc; stroke-width: 1.5; }
+    .hdr { font: 600 14px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1b1d22; }
+    .sub { font: 400 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #575a64; }
+    .box { fill: #ffffff; stroke: #c5c1b6; stroke-width: 1.5; }
+    .accent-box { fill: #fffaf2; stroke: #c47a1c; stroke-width: 1.5; }
+    .t1 { font: 600 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #1b1d22; }
+    .t2 { font: 400 11.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #4a4d57; }
+    .t3 { font: 600 11.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #8a5a19; }
+    .line { fill: none; stroke: #8c887d; stroke-width: 1.5; }
+    .head { fill: #8c887d; }
+  </style>
+
+  <rect class="bg" x="1" y="1" width="878" height="218" rx="8" />
+  <text class="hdr" x="28" y="34">Pass pointers (uri + sha256), leave files on disk</text>
+  <text class="sub" x="852" y="34" text-anchor="end">4 MB artifact -&gt; 2,025 B envelope</text>
+
+  <g transform="translate(28,58)">
+    <rect class="box" width="230" height="128" rx="6" />
+    <text class="t1" x="14" y="28">Local disk (single copy)</text>
+    <text class="t2" x="14" y="54">policy.bin   4,194,304 B</text>
+    <text class="t2" x="14" y="76">sha256: 208aeaff5517...</text>
+    <text class="t3" x="14" y="106">0 copies per handoff</text>
+  </g>
+
+  <line class="line" x1="258" y1="122" x2="314" y2="122" />
+  <polygon class="head" points="314,118 320,122 314,126" />
+
+  <g transform="translate(320,58)">
+    <rect class="accent-box" width="240" height="128" rx="6" />
+    <text class="t1" x="14" y="28">Task envelope + SQLite</text>
+    <text class="t2" x="14" y="54">SQLite DB delta: ~48 KB</text>
+    <text class="t2" x="14" y="76">Envelope JSON:   2,025 B</text>
+    <text class="t3" x="14" y="106">refs[]: {name, uri, sha256}</text>
+  </g>
+
+  <line class="line" x1="560" y1="122" x2="616" y2="122" />
+  <polygon class="head" points="616,118 622,122 616,126" />
+
+  <g transform="translate(622,58)">
+    <rect class="box" width="230" height="128" rx="6" />
+    <text class="t1" x="14" y="28">Claimant agent</text>
+    <text class="t2" x="14" y="54">&lt;= 64 KB: inline text</text>
+    <text class="t2" x="14" y="76">&gt;  64 KB: resource_link</text>
+    <text class="t3" x="14" y="106">complete() re-hashes refs</text>
+  </g>
+</svg>

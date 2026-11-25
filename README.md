@@ -1,27 +1,49 @@
 # agentbus
 
-**Hand tasks between agents by reference, not by copy.**
+`agentbus` is a local task bus for coding agents you already run. The sender registers input files on disk and writes a small JSON envelope (`tasks/<id>.json`) holding `uri`, `sha256`, `goal`, and `acceptance` checks. The claiming agent acquires a lease, reads references straight from disk, asks questions in-task if blocked, and submits a result path whose hash and acceptance rules are verified before the task closes.
 
-`agentbus` is a local task bus for multi-agent workflows. A task envelope contains a goal, acceptance criteria, and **pointers** (`uri` + `sha256`) to the files the receiving agent needs — never the file contents. Agents claim tasks, read references from disk themselves, and hand back a result whose hash is verified before the task is marked done.
+- Zero third-party dependencies; storage runs on Node's built-in `node:sqlite`.
+- One MCP stdio server (`15` tools for `conductor`, `9` least-privilege tools for `worker`) plus a matching CLI.
+- Works alongside Codex, Claude Code, Gemini CLI, Antigravity, Cursor, OpenCode, Claude Desktop, Windsurf, Kiro, LM Studio, Cline, DeepSeek Harness (DSH), and Hermes Agent via `agentbus setup`.
+- Keeps payloads on disk: registering a 4 MB file adds about 48 KB to SQLite and leaves the task envelope at 2,025 B.
 
-- Zero dependencies. SQLite through Node's built-in `node:sqlite`.
-- One MCP stdio server — works with Codex, Claude Code, Gemini CLI, Antigravity, Cursor, OpenCode, Claude Desktop, Windsurf, Kiro, LM Studio, Cline, DeepSeek Harness (DSH), and Hermes Agent.
-- The same operations are available as a CLI, so cron jobs, batch files, and non-MCP agents can use it.
-- Never copies payloads. Registering a 4 MB artifact costs about **48 KB** of database.
+## Task lifecycle
 
----
+![agentbus task lifecycle: bus_register pointer, open task, claimed with 900s lease, question and answer messages, and done after SHA-256 and acceptance verification](docs/assets/agentbus-task-loop.svg)
 
-## Why
+Flow: `bus_register` (`uri + sha256`) -> `open` (`tasks/<id>.json`) -> `claimed` (`lease_token`, 900 s TTL, `heartbeat`) -> `bus_task_message` (`question`/`blocked` answered by conductor) -> `done` (re-hash refs and check `acceptance`). Expired leases return the task to `open` with `attempt + 1`. Static fallback image: [`docs/assets/agentbus-task-loop.png`](docs/assets/agentbus-task-loop.png).
 
-If you run more than one coding agent, you know the pattern: every handoff recreates a "task package" that embeds the specs, the logs, the CSV, the policy file — and the next agent re-reads them from scratch. The payload is duplicated on every hop, and by the third hop nobody knows which copy is current.
+## Where it differs from common multi-agent setups
 
-`agentbus` keeps one copy on disk and passes a receipt: path, size, SHA-256. Measured on the reference task in this repo:
+| Concern | Common prompt/package handoff | agentbus |
+|---|---|---|
+| Input files | Re-embeds files into each hop | Registers `uri + sha256` pointers; `bus_ref_read` inlines `<= 64 KB` and returns `resource_link` above that |
+| Task execution | Prompt sent, process exit treated as done | State machine `open -> claimed(lease) -> done \| failed` with 900 s TTL, `heartbeat`, and lazy expiry reclaim |
+| Stuck worker | Fails silently or restarts from scratch | `bus_task_message` sends `question` / `blocked` / `error` (sets `blocked_at`); conductor `answer` unblocks and wakes `bus_task_wait` |
+| Result checking | Trusts agent text output | `bus_task_complete` re-hashes every ref (`drift` rejects by default) and checks `json`, `must_contain`, `min_bytes`, `fields` |
+| Agent integration | Custom SDK or agent wrapper required | Attaches to 13 existing MCP clients via `agentbus setup` and `AGENTBUS_ROLE` |
+| Module ownership | Hidden inside chat history | `agentbus ui` serves a loopback-only board of 14 modules with owner agent/model; creates conductor tasks without auto-dispatching |
+| Runtime footprint | Cloud broker or framework dependencies | Local `file://` URIs, SQLite WAL, zero npm runtime dependencies |
+
+## Module ownership dashboard (`agentbus ui`)
+
+`agentbus ui --port 0 --no-open --root <bus-root>` starts a loopback-only read-only view of the repository's 14 technical modules, their owning agent and configured model from local `agents.json`, and a side panel to queue `redo`, `optimize`, `adjust_model`, or `inspect` tasks for the conductor. Selecting modules builds the task envelope and preview first; actual execution only starts when `--dispatch` or the page checkbox is opted in (see [`docs/UI.md`](docs/UI.md)).
+
+![agentbus loopback UI showing module layers, owner agents and models, two selected modules, and the right-hand Conductor task preview](docs/assets/agentbus-ui.png)
+
+## Why pointers instead of copies
+
+If you run more than one coding agent, each handoff tends to recreate a task package carrying specs, logs, CSVs, and policy files. By the third hop, multiple copies exist on disk and none of them are verified against the source.
+
+`agentbus` keeps one copy on disk and passes a receipt: path, byte length, and SHA-256. Measured on the reference task in this repo:
 
 | | Task package (copy) | agentbus (pointer) |
 |---|---|---|
 | Envelope size | 4,195,256 B | **2,025 B** |
 | Copies of the 4 MB payload | one per hop | 0 |
-| Can detect a stale input | no | yes — `sha256` mismatch blocks completion |
+| Can detect a stale input | no | yes (`sha256` mismatch blocks completion) |
+
+![Diagram comparing single-copy disk storage with the 2,025 B pointer envelope and claimant verification](docs/assets/agentbus-pointer.svg)
 
 ---
 
