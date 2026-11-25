@@ -24,9 +24,11 @@ import { loadContextLedger, confirmDecision } from '../src/context.js';
 import { detectAgents, readAgentConfig, writeAgentConfig } from '../src/agents.js';
 import os from 'node:os';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 import * as rlPromises from 'node:readline/promises';
 
-const VERSION = '0.1.0';
+const require = createRequire(import.meta.url);
+const VERSION = require('../package.json').version;
 
 function parseArgs(argv) {
   const out = { _: [], ref: [], accept: [], constraint: [], field: [], client: [], allow: [], model: [] };
@@ -110,7 +112,7 @@ function printHelp() {
       'wait <id> [--timeout <seconds>]   # 等异步 agent 把任务做完',
       'context <thread> | context confirm <thread> <decision-id> --by <agent> [--evidence <sha256>]',
       'archive <conversation-id> [--port <port>] [--title-prefix <prefix>] [--dry-run]',
-      'onboard [--conductor <agent>] [--model <agent>=<id>]... [--yes] [--dry-run]   # 探测本机 agent 并写好通信配置',
+      'onboard [--conductor <agent>] [--model <agent>=<id>]... [--archive-on-done] [--yes] [--dry-run]   # 探测本机 agent 并写好通信配置',
       'agy-session [--out <file>]   # 在 Antigravity 集成终端里运行，导出会话地址与令牌',
       'mcp [--root <dir>] [--http 127.0.0.1:<port>]',
     ],
@@ -337,7 +339,11 @@ async function main() {
           throw Object.assign(new Error(`--conductor ${conductorId} 不在已探测列表里: ${detected.map((a) => a.id).join(', ')}`), { code: 1 });
         }
 
-        const models = { ...readAgentConfig(bus.config.rootDir).models, ...provided };
+        const prevCfg = readAgentConfig(bus.config.rootDir);
+        const models = { ...prevCfg.models, ...provided };
+        const archiveOnDone = args['archive-on-done'] === true
+          ? true
+          : (args['no-archive-on-done'] === true ? false : prevCfg.archive_on_done === true);
         const notes = [];
 
         if (process.stdin.isTTY && !args.yes) {
@@ -373,13 +379,14 @@ async function main() {
         }
 
         const cfg = args['dry-run'] === true
-          ? { conductor: conductorId, models, dry_run: true }
-          : writeAgentConfig(bus.config.rootDir, { conductor: conductorId, models });
+          ? { conductor: conductorId, models, archive_on_done: archiveOnDone, dry_run: true }
+          : writeAgentConfig(bus.config.rootDir, { conductor: conductorId, models, archive_on_done: archiveOnDone });
 
         result = {
           conductor: conductorId,
           detected: detected.map((a) => ({ id: a.id, bin: a.bin, config: a.config })),
           models,
+          archive_on_done: archiveOnDone,
           configured,
           config_file: path.join(bus.config.rootDir, 'agents.json'),
           notes,

@@ -11,8 +11,8 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { showTask } from './tasks.js';
-import { defaultAgySessionPath, readAgySession, detectAgentApi, discoverAgySession, archiveConversation } from './agy.js';
-import { modelFor, KNOWN_MODELS } from './agents.js';
+import { defaultAgySessionPath, readAgySession, detectAgentApi, discoverAgySession, archiveTaskConversations } from './agy.js';
+import { modelFor, KNOWN_MODELS, readAgentConfig } from './agents.js';
 import { appendEvent, withImmediateTx } from './db.js';
 import {
   threadUsable,
@@ -579,23 +579,24 @@ export async function dispatchTask(bus, { id, cwd, wait_s = 600, poll_ms = 150, 
     } catch {}
   }
 
-  if (process.env.AGENTBUS_ARCHIVE_ON_DONE === '1' && task.to === 'antigravity' && latest.state === 'done' && effectiveSession) {
+  const agentCfg = readAgentConfig(bus.config.rootDir);
+  const archiveOnDone = process.env.AGENTBUS_ARCHIVE_ON_DONE === '1' || agentCfg.archive_on_done === true;
+  if (archiveOnDone && task.to === 'antigravity' && latest.state === 'done') {
     try {
-      const archRes = await archiveConversation({
-        conversationId: effectiveSession,
-        titlePrefix: lastSpec?.conversationTitle || null,
-      });
+      const archRes = await archiveTaskConversations({ taskId: task.id });
       withImmediateTx(bus.db, () => {
         appendEvent(bus.db, task.id, 'archive_on_done', {
           conversation_id: effectiveSession,
-          ok: Boolean(archRes?.ok),
-          reason: archRes?.reason || null,
+          archived_count: archRes?.archived_count ?? 0,
+          ok: Boolean(archRes?.ok && archRes?.archived_count > 0),
+          reason: archRes?.ok ? null : (archRes?.attempts?.[0]?.error || 'archive_failed'),
         });
       });
     } catch (archErr) {
       withImmediateTx(bus.db, () => {
         appendEvent(bus.db, task.id, 'archive_on_done', {
           conversation_id: effectiveSession,
+          archived_count: 0,
           ok: false,
           error: String(archErr?.message || archErr),
         });

@@ -207,10 +207,13 @@ agentbus onboard --conductor codex --allow /path/to/workspace
 ```
 agentbus archive <conversation-id> --dry-run       # 只匹配，不点击
 agentbus archive <conversation-id> --port 9222
-AGENTBUS_ARCHIVE_ON_DONE=1                          # 任务 done 后自动归档本次会话
+agentbus onboard --archive-on-done                  # 持久开启：写进 agents.json，重启也生效
+AGENTBUS_ARCHIVE_ON_DONE=1                          # 单次运行临时开启
 ```
 
-走 CDP 点击侧边栏的 `归档对话` 按钮；应用需以 `--remote-debugging-port=<n>` 启动，否则明确报错而不是假装成功。自动归档只在最终 `done` 时执行一次，失败只记事件，不影响任务状态。
+走 CDP 点击侧边栏的 `归档对话` 按钮；应用需以 `--remote-debugging-port=<n>` 启动，否则明确报错而不是假装成功。
+
+自动归档只在任务最终 `done` 时触发，按任务 id 匹配标题 `agentbus MM-DD <taskid>`，会把该任务因重试产生的重复会话一起归档；任务刚完成时侧边栏可能还没渲染出新行，会重试最多 6 次（约 10 秒）。匹配不到只记 `row_not_found` 事件，不动其他对话，也不影响任务状态。
 
 ### 模型自动降级
 

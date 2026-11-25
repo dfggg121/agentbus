@@ -197,10 +197,11 @@ Model inference dominates, not the bus: Codex 45.5s, Antigravity 30s — communi
 ```
 agentbus archive <conversation-id> --dry-run
 agentbus archive <conversation-id> --port 9222
-AGENTBUS_ARCHIVE_ON_DONE=1
+agentbus onboard --archive-on-done        # persistent, stored in agents.json
+AGENTBUS_ARCHIVE_ON_DONE=1                # one-off, for this process only
 ```
 
-Drives the sidebar `归档对话` button over CDP. The app must be started with `--remote-debugging-port=<n>`; otherwise the command fails loudly instead of pretending. Auto-archive runs once on final `done` and never changes task state on failure.
+Drives the sidebar `归档对话` button over CDP. The app must be started with `--remote-debugging-port=<n>`; otherwise the command fails loudly instead of pretending. Auto-archive runs once on final `done`, matches every conversation titled `agentbus MM-DD <taskid>` (retries can leave duplicates), and retries up to 6 times because the sidebar may not have rendered the new row yet. A miss only appends `row_not_found`; other conversations are never touched.
 
 ### Model fallback
 

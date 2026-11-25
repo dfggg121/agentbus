@@ -5,12 +5,17 @@ All notable changes to this project are documented here. Format follows [Keep a 
 ## [Unreleased]
 
 ### Added
-- `agentbus archive <conversation-id> [--port] [--title-prefix] [--dry-run]`: archives a sidebar conversation over CDP; `AGENTBUS_ARCHIVE_ON_DONE=1` archives the conversation once a task reaches `done`. Fails loudly when the app was not started with `--remote-debugging-port`.
+- `agentbus archive <conversation-id> [--port] [--title-prefix] [--dry-run]`: archives a sidebar conversation over CDP. Fails loudly when the app was not started with `--remote-debugging-port`.
+- `agentbus onboard --archive-on-done`: persists `archive_on_done: true` in `agents.json`, so auto-archive survives restarts without an env var. `AGENTBUS_ARCHIVE_ON_DONE=1` still works as a one-off override.
 - `agentbus/context@1` thread ledger (≤8KB) at `<busRoot>/contexts/<thread>.json`, with `proposed`/`confirmed` decisions, supersede rules, and `avoid[]` for failures.
 - `ref_read` audit events and `warn`/`strict` gate on completion (`acceptance.require_ref_read`, `AGENTBUS_STRICT_REF_AUDIT`).
 - Per-client thread policies and `threads` scope columns (`cwd`, `model`, `last_ok`, `step_source`, `rotated_from`); `task:<id>` rows are removed on terminal states.
 - `agentbus context [<thread> | confirm <thread> <decision-id> --by <agent>]` and `new --thread`.
 - Acceptance suite extended to 59 assertions (threads scope, per-client limits, ledger, audit, archive dry-run/mock CDP).
+
+### Fixed
+- Auto-archive clicked the wrong row: the archive button is a sibling of the title node, so searching downward from the title always hit the first row's button in the list. Matching now starts from each button and compares its own short row title, and archives every duplicate conversation for that task.
+- Auto-archive missed freshly created conversations because the sidebar had not rendered them yet; it now retries up to 6 times before recording `row_not_found`.
 
 ### Changed
 - `--thread` on Antigravity no longer reuses the conversation by default: it opens a fresh conversation and hands over via the ledger.

@@ -186,7 +186,7 @@ Write points: `done` (artifacts + proposals), `failed` (avoid only), and rotatio
 
 ### Archiving conversations
 
-`agentbus archive <conversation-id> [--port N] [--title-prefix P] [--dry-run]` finds the sidebar row over CDP and clicks `button[aria-label="归档对话"]`. The app must run with `--remote-debugging-port=<n>`; an unreachable port is an explicit error. `AGENTBUS_ARCHIVE_ON_DONE=1` archives the conversation once the task is `done`; failures only append an `archive_on_done` event.
+`agentbus archive <conversation-id> [--port N] [--title-prefix P] [--dry-run]` finds the sidebar row over CDP and clicks `button[aria-label="归档对话"]`. Matching starts from each button and compares its own row title, so a task id appearing in chat text can never select a different row. The app must run with `--remote-debugging-port=<n>`; an unreachable port is an explicit error. Auto-archive is enabled persistently with `agentbus onboard --archive-on-done` (stored as `archive_on_done` in `agents.json`) or per run with `AGENTBUS_ARCHIVE_ON_DONE=1`. Once the task is `done`, it archives every conversation titled `agentbus MM-DD <taskid>` (retries create duplicates), re-tries up to 6 times while the sidebar renders, and only appends an `archive_on_done` event on failure.
 
 ### Roles
 
