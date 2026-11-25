@@ -5,6 +5,10 @@ All notable changes to this project are documented here. Format follows [Keep a 
 ## [Unreleased]
 
 ### Added
+- `agentbus watch <id>`: read-only, single-task watcher with a 5s default interval, stable exit codes (done 0, failed/blocked/stalled 1, timeout 3), and no TTY/readline dependency. `dispatch --watch` keeps the dispatcher alive until the task reaches the same state.
+- `agentbus doctor --bootstrap`: read-only clean-machine preflight for Node/sqlite, bus root, allowed roots, `agents.json`, client binaries, optional Antigravity CDP, and stale MCP processes.
+- Offline tarball install path documented; `package.json` no longer contains a `USERNAME` placeholder.
+- `docs/PORTABILITY.md` with the clean-machine checklist and a Linux/macOS CI matrix.
 - `agentbus archive <conversation-id> [--port] [--title-prefix] [--dry-run]`: archives a sidebar conversation over CDP. Fails loudly when the app was not started with `--remote-debugging-port`.
 - `agentbus onboard --archive-on-done`: persists `archive_on_done: true` in `agents.json`, so auto-archive survives restarts without an env var. `AGENTBUS_ARCHIVE_ON_DONE=1` still works as a one-off override.
 - `agentbus/context@1` thread ledger (≤8KB) at `<busRoot>/contexts/<thread>.json`, with `proposed`/`confirmed` decisions, supersede rules, and `avoid[]` for failures.
