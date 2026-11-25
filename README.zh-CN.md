@@ -177,6 +177,14 @@ Antigravity 是异步起会话的，`dispatch` 可能在任务还 `open` 时就�
 agentbus wait <task-id> --timeout 900
 ```
 
+模块归属可视化面板：
+
+```bash
+agentbus ui --port 0 --no-open --root var/main
+```
+
+只绑定 loopback，展示技术模块及负责人/模型，可勾选一部分模块向 conductor 提交重做/优化/调整模型请求。默认只建任务；加 `--dispatch` 或在页面勾选“立即派给主 agent”才启动派发。详见 [`docs/UI.md`](docs/UI.md)。
+
 如果宿主需要在任务完成后被自动唤醒，用 `watch`（单进程、单任务、只读、默认 5 秒一次）：
 
 ```bash

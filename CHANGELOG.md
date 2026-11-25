@@ -5,6 +5,7 @@ All notable changes to this project are documented here. Format follows [Keep a 
 ## [Unreleased]
 
 ### Added
+- `agentbus ui`: loopback-only, zero-dependency local web dashboard for the project's technical modules, owner/model badges, multi-module selection, and a conductor rework/optimize/reassign-model request flow; default task creation only, explicit `--dispatch` opt-in.
 - `agentbus watch <id>`: read-only, single-task watcher with a 5s default interval, stable exit codes (done 0, failed/blocked/stalled 1, timeout 3), and no TTY/readline dependency. `dispatch --watch` keeps the dispatcher alive until the task reaches the same state.
 - `agentbus doctor --bootstrap`: read-only clean-machine preflight for Node/sqlite, bus root, allowed roots, `agents.json`, client binaries, optional Antigravity CDP, and stale MCP processes.
 - Offline tarball install path documented; `package.json` no longer contains a `USERNAME` placeholder.

@@ -1,0 +1,156 @@
+[
+  {
+    "id": "db",
+    "label": "SQLite 数据层",
+    "layer": "storage",
+    "layer_label": "存储与校验层",
+    "paths": ["src/db.js"],
+    "owner_agent": "codex",
+    "owner_model": "未配置",
+    "summary": "基于 node:sqlite (DatabaseSync) 的 WAL 初始化、只读打开、表结构迁移与 BEGIN IMMEDIATE 事务重试。",
+    "status": "stable"
+  },
+  {
+    "id": "store",
+    "label": "指针与哈希校验",
+    "layer": "storage",
+    "layer_label": "存储与校验层",
+    "paths": ["src/store.js"],
+    "owner_agent": "codex",
+    "owner_model": "未配置",
+    "summary": "零拷贝文件指针登记、SHA-256 流式校验、allowed_roots 与 realpath 越界防护。",
+    "status": "stable"
+  },
+  {
+    "id": "tasks",
+    "label": "任务状态机与租约",
+    "layer": "core",
+    "layer_label": "任务与上下文核心",
+    "paths": ["src/tasks.js"],
+    "owner_agent": "codex",
+    "owner_model": "未配置",
+    "summary": "任务创建、幂等去重、租约领取与续租、过期回收、验收校验、recover 恢复与双向消息。",
+    "status": "stable"
+  },
+  {
+    "id": "threads",
+    "label": "会话线程策略",
+    "layer": "core",
+    "layer_label": "任务与上下文核心",
+    "paths": ["src/threads.js"],
+    "owner_agent": "codex",
+    "owner_model": "未配置",
+    "summary": "跨轮会话亲和复用、分客户端步数/时长限额、超限轮转与快照接力。",
+    "status": "stable"
+  },
+  {
+    "id": "context",
+    "label": "线程账本 context@1",
+    "layer": "core",
+    "layer_label": "任务与上下文核心",
+    "paths": ["src/context.js"],
+    "owner_agent": "codex",
+    "owner_model": "未配置",
+    "summary": "<=8KB 跨任务上下文账本、双人确认门控、失败隔离与确定性裁剪。",
+    "status": "stable"
+  },
+  {
+    "id": "dispatch",
+    "label": "主动派发与监视",
+    "layer": "orchestration",
+    "layer_label": "调度与适配器层",
+    "paths": ["src/dispatch.js"],
+    "owner_agent": "codex",
+    "owner_model": "未配置",
+    "summary": "外部 agent CLI 唤起、模型回退链、健康冷却、wait 与只读低开销 watch。",
+    "status": "stable"
+  },
+  {
+    "id": "agy",
+    "label": "Antigravity 会话桥接",
+    "layer": "orchestration",
+    "layer_label": "调度与适配器层",
+    "paths": ["src/agy.js"],
+    "owner_agent": "antigravity",
+    "owner_model": "未配置",
+    "summary": "daemon hub 发现、导出 session 失效保护、步数读取与 CDP 归档。",
+    "status": "active"
+  },
+  {
+    "id": "agents",
+    "label": "客户端探测与配置",
+    "layer": "orchestration",
+    "layer_label": "调度与适配器层",
+    "paths": ["src/agents.js"],
+    "owner_agent": "codex",
+    "owner_model": "未配置",
+    "summary": "跨平台可执行文件探测、公开产品模型目录与本地 agents.json 读写。",
+    "status": "stable"
+  },
+  {
+    "id": "mcp",
+    "label": "MCP JSON-RPC 服务端",
+    "layer": "interface",
+    "layer_label": "接口与配置层",
+    "paths": ["src/mcp.js"],
+    "owner_agent": "codex",
+    "owner_model": "未配置",
+    "summary": "stdio 与 loopback HTTP JSON-RPC 2.0 服务端、conductor/worker 工具裁剪与后台过期回收。",
+    "status": "stable"
+  },
+  {
+    "id": "bin",
+    "label": "CLI 命令入口",
+    "layer": "interface",
+    "layer_label": "接口与配置层",
+    "paths": ["bin/bus.js"],
+    "owner_agent": "codex",
+    "owner_model": "未配置",
+    "summary": "命令行参数解析、JSON 标准输出契约、权限角色路由与退出码规范。",
+    "status": "active"
+  },
+  {
+    "id": "setup",
+    "label": "自动配置与自检",
+    "layer": "interface",
+    "layer_label": "接口与配置层",
+    "paths": ["src/setup.js"],
+    "owner_agent": "codex",
+    "owner_model": "未配置",
+    "summary": "13 类 MCP 客户端幂等配置、doctor --fix 备份修复与 --bootstrap 只读预检。",
+    "status": "stable"
+  },
+  {
+    "id": "ui",
+    "label": "可视化模块面板",
+    "layer": "interface",
+    "layer_label": "接口与配置层",
+    "paths": ["src/ui/server.js", "src/ui/index.html", "src/ui/modules.json"],
+    "owner_agent": "antigravity",
+    "owner_model": "未配置",
+    "summary": "零依赖 loopback 只读模块看板、模型归属解析与 conductor 任务提交界面。",
+    "status": "active"
+  },
+  {
+    "id": "docs",
+    "label": "协议与使用文档",
+    "layer": "quality",
+    "layer_label": "文档与质量层",
+    "paths": ["README.md", "README.zh-CN.md", "docs/PROTOCOL.md", "docs/CLIENTS.md", "docs/PORTABILITY.md", "docs/UI.md"],
+    "owner_agent": "codex",
+    "owner_model": "未配置",
+    "summary": "协议信封规范、客户端矩阵、可移植性说明与可视化面板文档。",
+    "status": "active"
+  },
+  {
+    "id": "tests",
+    "label": "自验收测试套件",
+    "layer": "quality",
+    "layer_label": "文档与质量层",
+    "paths": ["test/accept.mjs"],
+    "owner_agent": "codex",
+    "owner_model": "未配置",
+    "summary": "纯 Node 内置端到端验收测试、安全红线检查与 UI HTTP 集成测试。",
+    "status": "active"
+  }
+]

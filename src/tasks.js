@@ -320,10 +320,17 @@ export function createTask(bus, {
   if (!goal || typeof goal !== 'string' || !goal.trim()) {
     throw Object.assign(new Error('缺少必填参数 --goal "..."'), { code: 1 });
   }
+  if (goal.length > 65536) {
+    throw Object.assign(new Error('goal 过长（超过 65536 字符上限，请改为指针引用）'), { code: 1 });
+  }
+  if (acceptance !== undefined && acceptance !== null && (typeof acceptance !== 'object' || Array.isArray(acceptance))) {
+    throw Object.assign(new Error('acceptance 必须是对象'), { code: 1 });
+  }
 
-  const fromAgent = String(from || 'unknown').trim();
+  const fromAgent = (typeof from === 'string' && from.trim()) ? from.trim() : 'unknown';
   const toAgent = to.trim();
-  const idemKey = idempotency_key ? String(idempotency_key).trim() : null;
+  const idemTrimmed = idempotency_key !== null && idempotency_key !== undefined ? String(idempotency_key).trim() : '';
+  const idemKey = idemTrimmed || null;
   const threadName = thread && String(thread).trim() ? String(thread).trim() : null;
   const resolvedRefs = normalizeRefInputs(bus, refs);
   const cleanConstraints = Array.isArray(constraints) ? constraints.map(String) : constraints ? [String(constraints)] : [];
@@ -414,9 +421,7 @@ export function showTask(bus, idOrPrefix) {
   return env;
 }
 
-export function listTasks(bus, { state = null, to = null, limit = 50 } = {}) {
-  syncLegacyTaskFiles(bus);
-  reapExpiredLeases(bus);
+export function listTasksReadOnly(bus, { state = null, to = null, limit = 50 } = {}) {
   const effLimit = Math.max(1, Math.min(500, Number(limit) || 50));
 
   const conds = [];
@@ -468,11 +473,18 @@ export function listTasks(bus, { state = null, to = null, limit = 50 } = {}) {
     claimed_by: r.claimed_by,
     lease_expires_at: r.lease_expires_at,
     created_at: r.created_at,
+    finished_at: r.finished_at || null,
     blocked: Boolean(r.blocked_at),
     blocked_at: r.blocked_at || null,
     last_message_at: r.last_message_at || null,
     last_message: lastMsgByTask.get(r.id) || null,
   }));
+}
+
+export function listTasks(bus, { state = null, to = null, limit = 50 } = {}) {
+  syncLegacyTaskFiles(bus);
+  reapExpiredLeases(bus);
+  return listTasksReadOnly(bus, { state, to, limit });
 }
 
 export function claimTask(bus, { id, by, ttl_s = null }) {

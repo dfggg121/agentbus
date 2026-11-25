@@ -1,0 +1,1154 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>agentbus 模块可视化调度面板</title>
+  <style>
+    :root {
+      --bg: #0a0e14;
+      --surface: #111822;
+      --surface-elevated: #17202e;
+      --surface-hover: #1c2738;
+      --border: #2a374a;
+      --border-strong: #3d506b;
+      --text: #f8fafc;
+      --text-secondary: #cbd5e1;
+      --accent: #38bdf8;
+      --accent-bg: rgba(56, 189, 248, 0.14);
+      --success: #4ade80;
+      --success-bg: rgba(74, 222, 128, 0.14);
+      --warn: #fbbf24;
+      --warn-bg: rgba(251, 191, 36, 0.14);
+      --danger: #f87171;
+      --danger-bg: rgba(248, 113, 113, 0.14);
+      --font-sans: "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", system-ui, -apple-system, sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-sans);
+      font-size: 15px;
+      line-height: 1.55;
+    }
+
+    button, input, select, textarea {
+      font-family: inherit;
+      font-size: 14px;
+      color: var(--text);
+    }
+
+    .app {
+      max-width: 1480px;
+      margin: 0 auto;
+      padding: 20px 24px 40px;
+    }
+
+    .header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 16px;
+      padding: 18px 20px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      margin-bottom: 18px;
+    }
+
+    .header-title {
+      margin: 0 0 6px;
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: 0.2px;
+      color: var(--text);
+    }
+
+    .header-sub {
+      margin: 0;
+      font-size: 14px;
+      color: var(--text-secondary);
+    }
+
+    .meta-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 11px;
+      border-radius: 999px;
+      background: var(--surface-elevated);
+      border: 1px solid var(--border);
+      font-size: 14px;
+      color: var(--text-secondary);
+    }
+
+    .pill strong {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    .pill.ok {
+      border-color: rgba(74, 222, 128, 0.45);
+      background: var(--success-bg);
+      color: #dcfce7;
+    }
+
+    .pill.warn {
+      border-color: rgba(251, 191, 36, 0.5);
+      background: var(--warn-bg);
+      color: #fef3c7;
+    }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      padding: 14px 16px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      margin-bottom: 18px;
+    }
+
+    .toolbar-group {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .toolbar-label {
+      font-size: 14px;
+      color: var(--text-secondary);
+      font-weight: 600;
+    }
+
+    .select, .input, .textarea {
+      background: var(--bg);
+      border: 1px solid var(--border-strong);
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 14px;
+      color: var(--text);
+      outline: none;
+    }
+
+    .select:focus, .input:focus, .textarea:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.22);
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 8px 14px;
+      border-radius: 8px;
+      border: 1px solid var(--border-strong);
+      background: var(--surface-elevated);
+      color: var(--text);
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+    }
+
+    .btn:hover:not(:disabled) {
+      background: var(--surface-hover);
+      border-color: var(--accent);
+    }
+
+    .btn:disabled {
+      opacity: 0.48;
+      cursor: not-allowed;
+    }
+
+    .btn-primary {
+      background: #0284c7;
+      border-color: #38bdf8;
+      color: #ffffff;
+    }
+
+    .btn-primary:hover:not(:disabled) {
+      background: #0369a1;
+    }
+
+    .btn-ghost {
+      background: transparent;
+    }
+
+    .spacer {
+      flex: 1 1 auto;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 430px;
+      gap: 20px;
+      align-items: start;
+    }
+
+    @media (max-width: 1100px) {
+      .layout {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .layer-section {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+
+    .layer-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .layer-title {
+      margin: 0;
+      font-size: 17px;
+      font-weight: 700;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .layer-code {
+      font-family: var(--font-mono);
+      font-size: 14px;
+      color: var(--accent);
+      background: var(--accent-bg);
+      padding: 2px 8px;
+      border-radius: 6px;
+    }
+
+    .cards-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+      gap: 12px;
+    }
+
+    .mod-card {
+      background: var(--surface-elevated);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s, transform 0.1s;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .mod-card:hover {
+      border-color: var(--border-strong);
+      background: var(--surface-hover);
+    }
+
+    .mod-card.selected {
+      border-color: var(--accent);
+      background: rgba(56, 189, 248, 0.1);
+      box-shadow: inset 0 0 0 1px var(--accent);
+    }
+
+    .mod-top {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .mod-check-wrap {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .mod-checkbox {
+      width: 18px;
+      height: 18px;
+      accent-color: var(--accent);
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    .mod-name {
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--text);
+    }
+
+    .mod-id {
+      font-family: var(--font-mono);
+      font-size: 14px;
+      color: var(--accent);
+      background: var(--bg);
+      border: 1px solid var(--border);
+      padding: 1px 7px;
+      border-radius: 6px;
+    }
+
+    .status-badge {
+      font-size: 14px;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-weight: 600;
+      flex-shrink: 0;
+    }
+
+    .status-stable {
+      background: var(--success-bg);
+      color: #dcfce7;
+      border: 1px solid rgba(74, 222, 128, 0.4);
+    }
+
+    .status-active {
+      background: var(--accent-bg);
+      color: #e0f2fe;
+      border: 1px solid rgba(56, 189, 248, 0.4);
+    }
+
+    .mod-summary {
+      font-size: 14px;
+      color: var(--text-secondary);
+      margin: 0;
+    }
+
+    .mod-paths {
+      font-family: var(--font-mono);
+      font-size: 14px;
+      color: #bae6fd;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 8px;
+      word-break: break-all;
+    }
+
+    .mod-owners {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      font-size: 14px;
+      margin-top: auto;
+    }
+
+    .owner-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 8px;
+      border-radius: 6px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      font-size: 14px;
+    }
+
+    .owner-tag strong {
+      color: var(--text);
+    }
+
+    .owner-tag.unconfigured {
+      border-color: rgba(251, 191, 36, 0.5);
+      background: var(--warn-bg);
+      color: #fef3c7;
+    }
+
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 18px;
+      position: sticky;
+      top: 16px;
+    }
+
+    .panel-title {
+      margin: 0 0 12px;
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--text);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .empty-hint {
+      padding: 16px;
+      border-radius: 8px;
+      border: 1px dashed var(--border-strong);
+      background: var(--bg);
+      color: var(--text-secondary);
+      font-size: 14px;
+      margin-bottom: 14px;
+    }
+
+    .field {
+      margin-bottom: 14px;
+    }
+
+    .field label {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-secondary);
+    }
+
+    .field .select,
+    .field .input,
+    .field .textarea {
+      width: 100%;
+    }
+
+    .textarea {
+      min-height: 82px;
+      resize: vertical;
+    }
+
+    .selected-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 14px;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: var(--accent-bg);
+      border: 1px solid rgba(56, 189, 248, 0.45);
+      font-size: 14px;
+      color: #e0f2fe;
+    }
+
+    .chip button {
+      background: none;
+      border: none;
+      color: #e0f2fe;
+      cursor: pointer;
+      padding: 0 2px;
+      font-size: 15px;
+      line-height: 1;
+    }
+
+    .summary-box {
+      background: var(--bg);
+      border: 1px solid var(--border-strong);
+      border-radius: 8px;
+      padding: 12px;
+      font-size: 14px;
+      color: var(--text-secondary);
+      margin-bottom: 14px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .checkbox-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 14px;
+      font-size: 14px;
+      color: var(--text-secondary);
+      cursor: pointer;
+    }
+
+    .result-box {
+      margin-top: 14px;
+      padding: 12px 14px;
+      border-radius: 8px;
+      font-size: 14px;
+      word-break: break-word;
+    }
+
+    .result-box.ok {
+      background: var(--success-bg);
+      border: 1px solid rgba(74, 222, 128, 0.5);
+      color: #ecfdf5;
+    }
+
+    .result-box.err {
+      background: var(--danger-bg);
+      border: 1px solid rgba(248, 113, 113, 0.55);
+      color: #fef2f2;
+    }
+
+    .code-line {
+      font-family: var(--font-mono);
+      font-size: 14px;
+      background: rgba(10, 14, 20, 0.75);
+      border: 1px solid var(--border);
+      padding: 8px 10px;
+      border-radius: 6px;
+      margin-top: 8px;
+      overflow-x: auto;
+    }
+
+    .tasks-section {
+      margin-top: 20px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+    }
+
+    .tasks-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+
+    .tasks-table th, .tasks-table td {
+      text-align: left;
+      padding: 9px 10px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+
+    .tasks-table th {
+      color: var(--text-secondary);
+      font-weight: 600;
+    }
+
+    .mono {
+      font-family: var(--font-mono);
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <div>
+        <h1 class="header-title">agentbus 模块可视化调度面板</h1>
+        <p class="header-sub">只读查看项目模块与本地 agents.json 模型归属；勾选模块并提交后创建 conductor 调度任务。</p>
+      </div>
+      <div class="meta-pills" id="headerPills">
+        <span class="pill">加载中...</span>
+      </div>
+    </header>
+
+    <section class="toolbar" aria-label="筛选与批量操作">
+      <div class="toolbar-group">
+        <label class="toolbar-label" for="filterLayer">分层</label>
+        <select class="select" id="filterLayer">
+          <option value="">全部分层</option>
+        </select>
+      </div>
+      <div class="toolbar-group">
+        <label class="toolbar-label" for="filterOwner">负责人</label>
+        <select class="select" id="filterOwner">
+          <option value="">全部负责人</option>
+        </select>
+      </div>
+      <div class="toolbar-group">
+        <label class="toolbar-label" for="filterModel">模型</label>
+        <select class="select" id="filterModel">
+          <option value="">全部模型</option>
+        </select>
+      </div>
+      <div class="toolbar-group">
+        <label class="toolbar-label" for="filterQuery">搜索</label>
+        <input class="input" id="filterQuery" type="search" placeholder="模块名 / id / 路径" />
+      </div>
+      <div class="spacer"></div>
+      <div class="toolbar-group">
+        <button class="btn" id="btnSelectVisible" type="button">全选当前</button>
+        <button class="btn btn-ghost" id="btnClearSelection" type="button">清空</button>
+        <button class="btn btn-ghost" id="btnRefresh" type="button">只读刷新</button>
+      </div>
+    </section>
+
+    <div class="layout">
+      <main id="modulesContainer" aria-label="技术模块清单">
+        <div class="layer-section">正在加载模块清单...</div>
+      </main>
+
+      <aside class="panel" aria-label="Conductor 任务创建面板">
+        <h2 class="panel-title">
+          <span>调度操作区</span>
+          <span class="pill" id="selectedCountPill">已选 0</span>
+        </h2>
+
+        <div id="emptySelectionHint" class="empty-hint">
+          请在左侧勾选至少一个技术模块，再填写重做 / 优化 / 调整模型要求。
+        </div>
+
+        <div id="selectedChips" class="selected-chips"></div>
+
+        <form id="requestForm">
+          <div class="field">
+            <label for="actionSelect">动作类型</label>
+            <select class="select" id="actionSelect" name="action">
+              <option value="optimize">深度优化 (optimize)</option>
+              <option value="redo">重做 (redo)</option>
+              <option value="adjust_model">调整工作模型 (adjust_model)</option>
+              <option value="inspect">只检查 (inspect)</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="targetAgentSelect">目标 Agent</label>
+            <select class="select" id="targetAgentSelect" name="target_agent"></select>
+          </div>
+
+          <div class="field">
+            <label for="targetModelSelect">目标模型（仅可选已配置/已知模型）</label>
+            <select class="select" id="targetModelSelect" name="target_model"></select>
+          </div>
+
+          <div class="field">
+            <label for="notesInput">备注与具体要求</label>
+            <textarea class="textarea" id="notesInput" name="notes" placeholder="例如：优化只读打开路径、补充边界回归测试、检查索引使用情况..."></textarea>
+          </div>
+
+          <label class="checkbox-row">
+            <input class="mod-checkbox" type="checkbox" id="dispatchCheckbox" />
+            <span>立即派给主 agent (dispatch) — 默认仅建任务不自动派发</span>
+          </label>
+
+          <div class="field">
+            <label>提交前 Conductor 任务摘要预览</label>
+            <div class="summary-box" id="summaryPreview">尚未选择模块。</div>
+          </div>
+
+          <button class="btn btn-primary" id="submitBtn" type="submit" style="width: 100%;" disabled>
+            创建 Conductor 调度任务
+          </button>
+        </form>
+
+        <div id="submitResult" aria-live="polite"></div>
+      </aside>
+    </div>
+
+    <section class="tasks-section" aria-label="近期总线任务（只读）">
+      <div class="layer-header">
+        <h2 class="layer-title">近期总线任务（只读快照）</h2>
+        <span class="pill" id="tasksStatusPill">待读取</span>
+      </div>
+      <div id="tasksContainer">加载中...</div>
+    </section>
+  </div>
+
+  <script>
+    const ACTION_LABELS = {
+      redo: '重做',
+      optimize: '深度优化',
+      adjust_model: '调整工作模型',
+      inspect: '只检查',
+    };
+
+    const state = {
+      catalog: null,
+      agentsData: null,
+      tasksData: null,
+      selectedIds: new Set(),
+      filters: {
+        layer: '',
+        owner: '',
+        model: '',
+        query: '',
+      },
+    };
+
+    const el = {
+      headerPills: document.getElementById('headerPills'),
+      filterLayer: document.getElementById('filterLayer'),
+      filterOwner: document.getElementById('filterOwner'),
+      filterModel: document.getElementById('filterModel'),
+      filterQuery: document.getElementById('filterQuery'),
+      btnSelectVisible: document.getElementById('btnSelectVisible'),
+      btnClearSelection: document.getElementById('btnClearSelection'),
+      btnRefresh: document.getElementById('btnRefresh'),
+      modulesContainer: document.getElementById('modulesContainer'),
+      selectedCountPill: document.getElementById('selectedCountPill'),
+      emptySelectionHint: document.getElementById('emptySelectionHint'),
+      selectedChips: document.getElementById('selectedChips'),
+      requestForm: document.getElementById('requestForm'),
+      actionSelect: document.getElementById('actionSelect'),
+      targetAgentSelect: document.getElementById('targetAgentSelect'),
+      targetModelSelect: document.getElementById('targetModelSelect'),
+      notesInput: document.getElementById('notesInput'),
+      dispatchCheckbox: document.getElementById('dispatchCheckbox'),
+      summaryPreview: document.getElementById('summaryPreview'),
+      submitBtn: document.getElementById('submitBtn'),
+      submitResult: document.getElementById('submitResult'),
+      tasksStatusPill: document.getElementById('tasksStatusPill'),
+      tasksContainer: document.getElementById('tasksContainer'),
+    };
+
+    function escapeHtml(s) {
+      return String(s ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function filteredModules() {
+      const mods = state.catalog?.modules || [];
+      const q = state.filters.query.trim().toLowerCase();
+      return mods.filter((m) => {
+        if (state.filters.layer && m.layer !== state.filters.layer) return false;
+        if (state.filters.owner && m.owner_agent !== state.filters.owner) return false;
+        if (state.filters.model && m.owner_model !== state.filters.model) return false;
+        if (q) {
+          const hay = [m.id, m.label, m.summary, m.owner_agent, m.owner_model, ...(m.paths || [])].join(' ').toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      });
+    }
+
+    function populateFilters() {
+      const mods = state.catalog?.modules || [];
+      const layers = state.catalog?.layers || [];
+      const owners = Array.from(new Set(mods.map((m) => m.owner_agent))).sort();
+      const models = Array.from(new Set(mods.map((m) => m.owner_model))).sort();
+
+      const curLayer = el.filterLayer.value;
+      el.filterLayer.innerHTML = '<option value="">全部分层</option>' +
+        layers.map((l) => `<option value="${escapeHtml(l.id)}">${escapeHtml(l.label)} (${l.count})</option>`).join('');
+      el.filterLayer.value = curLayer;
+
+      const curOwner = el.filterOwner.value;
+      el.filterOwner.innerHTML = '<option value="">全部负责人</option>' +
+        owners.map((o) => `<option value="${escapeHtml(o)}">${escapeHtml(o)}</option>`).join('');
+      el.filterOwner.value = curOwner;
+
+      const curModel = el.filterModel.value;
+      el.filterModel.innerHTML = '<option value="">全部模型</option>' +
+        models.map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('');
+      el.filterModel.value = curModel;
+    }
+
+    function populateAgentsAndModels() {
+      const agents = state.agentsData?.agents || [];
+      const conductor = state.agentsData?.conductor || null;
+      const hasCfg = Boolean(state.agentsData?.agents_config_exists && !state.agentsData?.agents_config_broken && (conductor || agents.some((a) => a.configured)));
+
+      const selectableAgents = hasCfg
+        ? agents.filter((a) => a.configured)
+        : agents;
+
+      const prevAgent = el.targetAgentSelect.value;
+      el.targetAgentSelect.innerHTML = '';
+      if (!hasCfg) {
+        const opt = document.createElement('option');
+        opt.value = 'conductor';
+        opt.textContent = 'conductor（未配置 agents.json，默认主控）';
+        el.targetAgentSelect.appendChild(opt);
+      }
+      for (const a of selectableAgents) {
+        const opt = document.createElement('option');
+        opt.value = a.id;
+        const tags = [];
+        if (a.is_conductor) tags.push('conductor');
+        tags.push(a.model_configured ? `当前模型: ${a.model}` : '未配置模型');
+        opt.textContent = `${a.id} (${tags.join(' | ')})`;
+        el.targetAgentSelect.appendChild(opt);
+      }
+
+      if (prevAgent && Array.from(el.targetAgentSelect.options).some((o) => o.value === prevAgent)) {
+        el.targetAgentSelect.value = prevAgent;
+      } else if (conductor && Array.from(el.targetAgentSelect.options).some((o) => o.value === conductor)) {
+        el.targetAgentSelect.value = conductor;
+      }
+
+      updateModelSelect();
+    }
+
+    function updateModelSelect() {
+      const agentId = el.targetAgentSelect.value;
+      const agentObj = (state.agentsData?.agents || []).find((a) => a.id === agentId);
+      const models = agentObj?.selectable_models || [];
+      const action = el.actionSelect.value;
+      const prevModel = el.targetModelSelect.value;
+
+      el.targetModelSelect.innerHTML = '';
+      if (action !== 'adjust_model') {
+        const keepOpt = document.createElement('option');
+        keepOpt.value = '';
+        keepOpt.textContent = agentObj?.model_configured ? `保持/不指定（当前 ${agentObj.model}）` : '未指定模型';
+        el.targetModelSelect.appendChild(keepOpt);
+      } else if (models.length === 0) {
+        const noneOpt = document.createElement('option');
+        noneOpt.value = '';
+        noneOpt.textContent = '该 agent 无可用模型配置（请先配置 agents.json）';
+        el.targetModelSelect.appendChild(noneOpt);
+      }
+
+      for (const m of models) {
+        const opt = document.createElement('option');
+        opt.value = m;
+        opt.textContent = agentObj?.model === m ? `${m}（当前已配置）` : m;
+        el.targetModelSelect.appendChild(opt);
+      }
+
+      if (prevModel && Array.from(el.targetModelSelect.options).some((o) => o.value === prevModel)) {
+        el.targetModelSelect.value = prevModel;
+      }
+    }
+
+    function renderHeader() {
+      const cat = state.catalog;
+      if (!cat) return;
+      const pills = [
+        `<span class="pill">总线目录: <strong class="mono">${escapeHtml(cat.root || '')}</strong></span>`,
+        `<span class="pill ${cat.conductor_configured ? 'ok' : 'warn'}">Conductor: <strong>${escapeHtml(cat.conductor || '未配置')}</strong></span>`,
+        `<span class="pill">模块数: <strong>${cat.module_count}</strong></span>`,
+        `<span class="pill ${cat.db_exists ? 'ok' : ''}">DB: <strong>${cat.db_exists ? '已存在 (只读浏览)' : '未初始化 (只读)'}</strong></span>`,
+      ];
+      el.headerPills.innerHTML = pills.join('');
+    }
+
+    function renderModules() {
+      const mods = filteredModules();
+      if (mods.length === 0) {
+        el.modulesContainer.innerHTML = '<div class="layer-section">没有匹配当前筛选条件的模块。</div>';
+        return;
+      }
+
+      const groups = new Map();
+      for (const m of mods) {
+        if (!groups.has(m.layer)) {
+          groups.set(m.layer, { id: m.layer, label: m.layer_label || m.layer, items: [] });
+        }
+        groups.get(m.layer).items.push(m);
+      }
+
+      const html = Array.from(groups.values()).map((g) => {
+        const cardsHtml = g.items.map((m) => {
+          const selected = state.selectedIds.has(m.id);
+          const statusCls = m.status === 'stable' ? 'status-stable' : 'status-active';
+          const modelCls = m.model_configured ? '' : 'unconfigured';
+          return `
+            <article class="mod-card ${selected ? 'selected' : ''}" data-module-id="${escapeHtml(m.id)}" tabindex="0" role="checkbox" aria-checked="${selected}">
+              <div class="mod-top">
+                <div class="mod-check-wrap">
+                  <input class="mod-checkbox" type="checkbox" data-check-id="${escapeHtml(m.id)}" ${selected ? 'checked' : ''} aria-label="选择 ${escapeHtml(m.label)}" />
+                  <span class="mod-name">${escapeHtml(m.label)}</span>
+                  <span class="mod-id">${escapeHtml(m.id)}</span>
+                </div>
+                <span class="status-badge ${statusCls}">${escapeHtml(m.status)}</span>
+              </div>
+              <p class="mod-summary">${escapeHtml(m.summary)}</p>
+              <div class="mod-paths">${escapeHtml((m.paths || []).join(' | '))}</div>
+              <div class="mod-owners">
+                <span class="owner-tag">负责人: <strong>${escapeHtml(m.owner_agent)}</strong></span>
+                <span class="owner-tag ${modelCls}">模型: <strong>${escapeHtml(m.owner_model)}</strong></span>
+              </div>
+            </article>
+          `;
+        }).join('');
+
+        return `
+          <section class="layer-section">
+            <div class="layer-header">
+              <h2 class="layer-title">
+                <span>${escapeHtml(g.label)}</span>
+                <span class="layer-code">${escapeHtml(g.id)}</span>
+              </h2>
+              <button class="btn btn-ghost" type="button" data-toggle-layer="${escapeHtml(g.id)}">
+                切换本层全选 (${g.items.length})
+              </button>
+            </div>
+            <div class="cards-grid">${cardsHtml}</div>
+          </section>
+        `;
+      }).join('');
+
+      el.modulesContainer.innerHTML = html;
+    }
+
+    function renderSelectionAndPreview() {
+      const allById = new Map((state.catalog?.modules || []).map((m) => [m.id, m]));
+      const selected = Array.from(state.selectedIds).map((id) => allById.get(id)).filter(Boolean);
+
+      el.selectedCountPill.textContent = `已选 ${selected.length}`;
+      el.emptySelectionHint.style.display = selected.length === 0 ? 'block' : 'none';
+      el.submitBtn.disabled = selected.length === 0;
+
+      el.selectedChips.innerHTML = selected.map((m) => `
+        <span class="chip">
+          <span>${escapeHtml(m.id)} (${escapeHtml(m.label)})</span>
+          <button type="button" data-remove-id="${escapeHtml(m.id)}" aria-label="移除 ${escapeHtml(m.id)}">&times;</button>
+        </span>
+      `).join('');
+
+      if (selected.length === 0) {
+        el.summaryPreview.textContent = '尚未选择模块。';
+        return;
+      }
+
+      const action = el.actionSelect.value;
+      const targetAgent = el.targetAgentSelect.value || state.catalog?.conductor || 'conductor';
+      const targetModel = el.targetModelSelect.value || '未指定（沿用当前配置）';
+      const notes = el.notesInput.value.trim() || '无';
+      const conductor = state.catalog?.conductor || 'conductor';
+      const dispatchNow = el.dispatchCheckbox.checked;
+
+      const lines = [
+        `任务接收方 (to): ${conductor}`,
+        `动作: ${ACTION_LABELS[action] || action} (${action})`,
+        `目标 Agent / 模型: ${targetAgent} / ${targetModel}`,
+        `派发方式: ${dispatchNow ? '创建后立即 dispatch 给主 agent' : '仅创建总线任务（不自动 dispatch）'}`,
+        `选中模块 (${selected.length}):`,
+        ...selected.map((m) => `  - ${m.id}: ${m.paths.join(', ')} [${m.owner_agent} / ${m.owner_model}]`),
+        `备注: ${notes}`,
+      ];
+      el.summaryPreview.textContent = lines.join('\n');
+    }
+
+    function renderTasks() {
+      const td = state.tasksData;
+      if (!td) return;
+      el.tasksStatusPill.textContent = td.db_exists ? `共 ${td.tasks.length} 条` : '库未初始化（只读）';
+      if (!td.db_exists || td.tasks.length === 0) {
+        el.tasksContainer.innerHTML = '<div class="empty-hint" style="margin-bottom:0;">暂无总线任务记录（GET 保持只读，不创建数据库文件）。</div>';
+        return;
+      }
+
+      const rowsHtml = td.tasks.map((t) => {
+        const goalShort = String(t.goal || '').split('\n')[0].slice(0, 90);
+        return `
+          <tr>
+            <td class="mono">${escapeHtml(t.id)}</td>
+            <td>${escapeHtml(t.to)}</td>
+            <td><strong>${escapeHtml(t.state)}</strong>${t.blocked ? ' (blocked)' : ''}</td>
+            <td>${escapeHtml(goalShort)}</td>
+            <td class="mono">${escapeHtml(t.created_at || '')}</td>
+          </tr>
+        `;
+      }).join('');
+
+      el.tasksContainer.innerHTML = `
+        <table class="tasks-table">
+          <thead>
+            <tr>
+              <th>Task ID</th>
+              <th>目标 (to)</th>
+              <th>状态</th>
+              <th>Goal 摘要</th>
+              <th>创建时间</th>
+            </tr>
+          </thead>
+          <tbody>${rowsHtml}</tbody>
+        </table>
+      `;
+    }
+
+    async function loadAll() {
+      const [modRes, agentRes, taskRes] = await Promise.all([
+        fetch('/api/modules'),
+        fetch('/api/agents'),
+        fetch('/api/tasks?limit=15'),
+      ]);
+      const [modJson, agentJson, taskJson] = await Promise.all([
+        modRes.json(),
+        agentRes.json(),
+        taskRes.json(),
+      ]);
+      if (!modRes.ok || !modJson.ok) throw new Error(modJson.error || '加载模块失败');
+      if (!agentRes.ok || !agentJson.ok) throw new Error(agentJson.error || '加载 agent 配置失败');
+
+      state.catalog = modJson;
+      state.agentsData = agentJson;
+      state.tasksData = taskJson;
+      el.dispatchCheckbox.checked = Boolean(modJson.dispatch_default);
+
+      renderHeader();
+      populateFilters();
+      populateAgentsAndModels();
+      renderModules();
+      renderSelectionAndPreview();
+      renderTasks();
+    }
+
+    el.filterLayer.addEventListener('change', () => {
+      state.filters.layer = el.filterLayer.value;
+      renderModules();
+    });
+    el.filterOwner.addEventListener('change', () => {
+      state.filters.owner = el.filterOwner.value;
+      renderModules();
+    });
+    el.filterModel.addEventListener('change', () => {
+      state.filters.model = el.filterModel.value;
+      renderModules();
+    });
+    el.filterQuery.addEventListener('input', () => {
+      state.filters.query = el.filterQuery.value;
+      renderModules();
+    });
+
+    el.btnSelectVisible.addEventListener('click', () => {
+      for (const m of filteredModules()) state.selectedIds.add(m.id);
+      renderModules();
+      renderSelectionAndPreview();
+    });
+
+    el.btnClearSelection.addEventListener('click', () => {
+      state.selectedIds.clear();
+      renderModules();
+      renderSelectionAndPreview();
+    });
+
+    el.btnRefresh.addEventListener('click', () => {
+      loadAll().catch((err) => {
+        el.submitResult.innerHTML = `<div class="result-box err">刷新失败：${escapeHtml(err.message)}</div>`;
+      });
+    });
+
+    el.modulesContainer.addEventListener('click', (ev) => {
+      const toggleBtn = ev.target.closest('[data-toggle-layer]');
+      if (toggleBtn) {
+        const layer = toggleBtn.getAttribute('data-toggle-layer');
+        const layerMods = filteredModules().filter((m) => m.layer === layer);
+        const allSelected = layerMods.length > 0 && layerMods.every((m) => state.selectedIds.has(m.id));
+        for (const m of layerMods) {
+          if (allSelected) state.selectedIds.delete(m.id);
+          else state.selectedIds.add(m.id);
+        }
+        renderModules();
+        renderSelectionAndPreview();
+        return;
+      }
+
+      const card = ev.target.closest('[data-module-id]');
+      if (!card) return;
+      const id = card.getAttribute('data-module-id');
+      if (state.selectedIds.has(id)) state.selectedIds.delete(id);
+      else state.selectedIds.add(id);
+      renderModules();
+      renderSelectionAndPreview();
+    });
+
+    el.modulesContainer.addEventListener('keydown', (ev) => {
+      if (ev.key !== 'Enter' && ev.key !== ' ') return;
+      const card = ev.target.closest('[data-module-id]');
+      if (!card || ev.target.tagName === 'INPUT') return;
+      ev.preventDefault();
+      const id = card.getAttribute('data-module-id');
+      if (state.selectedIds.has(id)) state.selectedIds.delete(id);
+      else state.selectedIds.add(id);
+      renderModules();
+      renderSelectionAndPreview();
+    });
+
+    el.selectedChips.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('[data-remove-id]');
+      if (!btn) return;
+      state.selectedIds.delete(btn.getAttribute('data-remove-id'));
+      renderModules();
+      renderSelectionAndPreview();
+    });
+
+    el.actionSelect.addEventListener('change', () => {
+      updateModelSelect();
+      renderSelectionAndPreview();
+    });
+    el.targetAgentSelect.addEventListener('change', () => {
+      updateModelSelect();
+      renderSelectionAndPreview();
+    });
+    el.targetModelSelect.addEventListener('change', renderSelectionAndPreview);
+    el.notesInput.addEventListener('input', renderSelectionAndPreview);
+    el.dispatchCheckbox.addEventListener('change', renderSelectionAndPreview);
+
+    el.requestForm.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const moduleIds = Array.from(state.selectedIds);
+      if (moduleIds.length === 0) return;
+
+      el.submitBtn.disabled = true;
+      el.submitResult.innerHTML = '<div class="result-box ok">正在提交请求...</div>';
+
+      try {
+        const resp = await fetch('/api/requests', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            module_ids: moduleIds,
+            action: el.actionSelect.value,
+            target_agent: el.targetAgentSelect.value,
+            target_model: el.targetModelSelect.value || undefined,
+            notes: el.notesInput.value,
+            dispatch: el.dispatchCheckbox.checked,
+          }),
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) {
+          el.submitResult.innerHTML = `
+            <div class="result-box err">
+              <strong>提交失败 (${escapeHtml(data.code || resp.status)})</strong><br />
+              ${escapeHtml(data.error || '未知错误')}
+            </div>
+          `;
+        } else {
+          const dispInfo = data.dispatch_error
+            ? `<div style="margin-top:6px;color:#fef3c7;">派发错误：${escapeHtml(data.dispatch_error)}</div>`
+            : data.dispatched
+              ? `<div style="margin-top:6px;">已触发派发：state=${escapeHtml(data.state)}</div>`
+              : `<div style="margin-top:6px;">未自动派发（默认只创建任务）。等价命令：</div><div class="code-line">${escapeHtml(data.dispatch_command)}</div>`;
+
+          el.submitResult.innerHTML = `
+            <div class="result-box ok">
+              <strong>已创建 Conductor 任务</strong><br />
+              Task ID: <span class="mono">${escapeHtml(data.task_id)}</span> | 状态: <strong>${escapeHtml(data.state)}</strong> | 接收方: <strong>${escapeHtml(data.to)}</strong><br />
+              信封文件: <span class="mono">${escapeHtml(data.uri)}</span>
+              ${dispInfo}
+            </div>
+          `;
+          await loadAll();
+        }
+      } catch (err) {
+        el.submitResult.innerHTML = `
+          <div class="result-box err">
+            <strong>网络或解析异常</strong><br />
+            ${escapeHtml(err.message)}
+          </div>
+        `;
+      } finally {
+        el.submitBtn.disabled = state.selectedIds.size === 0;
+      }
+    });
+
+    loadAll().catch((err) => {
+      el.modulesContainer.innerHTML = `<div class="result-box err">初始化加载失败：${escapeHtml(err.message)}</div>`;
+    });
+  </script>
+</body>
+</html>

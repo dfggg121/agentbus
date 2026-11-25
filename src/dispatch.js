@@ -14,7 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { showTask, listTaskMessages, latestTaskMessageSeq, ATTENTION_MESSAGE_KINDS } from './tasks.js';
-import { defaultAgySessionPath, readAgySession, detectAgentApi, discoverAgySession, archiveTaskConversations } from './agy.js';
+import { defaultAgySessionPath, detectAgentApi, resolveAgySession, archiveTaskConversations } from './agy.js';
 import { modelFor, KNOWN_MODELS, readAgentConfig, resolveAgentBin } from './agents.js';
 import { appendEvent, openBusReadOnly, withImmediateTx } from './db.js';
 import {
@@ -94,16 +94,7 @@ const BUILTIN = {
       throw Object.assign(new Error(res.next ? `${res.message}。下一步：${res.next}` : res.message), { code: 1 });
     }
     const sessionFile = defaultAgySessionPath(busRoot);
-    let sess;
-    try {
-      sess = readAgySession(sessionFile);
-    } catch (err) {
-      // No exported file: fall back to the daemon hub, which the running app
-      // rewrites on every start. If both are missing, surface the export hint.
-      const found = discoverAgySession();
-      if (!found) throw err;
-      sess = found;
-    }
+    const sess = resolveAgySession({ busRoot, sessionFile });
     // agentapi takes the prompt as one positional argument; newlines would break
     // the Windows command line, so collapse them into separators.
     const oneLine = String(prompt).replace(/\s*\n+\s*/g, '；');

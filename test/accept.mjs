@@ -228,6 +228,7 @@ async function main() {
       path.join(PKG_ROOT, 'src', 'agy.js'),
       path.join(PKG_ROOT, 'src', 'agents.js'),
       path.join(PKG_ROOT, 'src', 'dispatch.js'),
+      path.join(PKG_ROOT, 'src', 'ui', 'server.js'),
       path.join(PKG_ROOT, 'test', 'accept.mjs'),
     ];
     const syntaxFailures = [];
@@ -3541,6 +3542,402 @@ async function main() {
       bsRoRun104?.json?.checks?.find((c) => c.id === 'bus_root')?.status === 'fail' &&
       bsBadCmd104.rc === 2,
       `rc=${bsCliRun104.rc} ids=${bsIds104.join(',')} created=${!nothingCreated104} ro=${bsRoRun104?.rc} bad=${bsBadCmd104.rc}`);
+
+    // 105. UI 模块清单完整性、无个人模型硬编码、从本地 agents.json 动态解析或显示未配置
+    const uiModulesRaw105 = JSON.parse(fs.readFileSync(path.join(PKG_ROOT, 'src', 'ui', 'modules.json'), 'utf8'));
+    const uiHtml105 = fs.readFileSync(path.join(PKG_ROOT, 'src', 'ui', 'index.html'), 'utf8');
+    const uiDoc105 = fs.readFileSync(path.join(PKG_ROOT, 'docs', 'UI.md'), 'utf8');
+    const reqModIds105 = ['db', 'tasks', 'store', 'dispatch', 'agy', 'setup', 'agents', 'context', 'threads', 'mcp', 'bin', 'docs', 'tests', 'ui'];
+    const modFieldsOk105 = Array.isArray(uiModulesRaw105) &&
+      reqModIds105.every((id) => uiModulesRaw105.some((m) => m.id === id)) &&
+      uiModulesRaw105.every((m) => (
+        m.id && m.label && m.layer && Array.isArray(m.paths) && m.paths.length > 0 &&
+        m.owner_agent && m.owner_model && m.summary && m.status
+      ));
+    const uiEntry105 = uiModulesRaw105.find((m) => m.id === 'ui');
+    const uiSources105 = [
+      JSON.stringify(uiModulesRaw105),
+      uiHtml105,
+      uiDoc105,
+      fs.readFileSync(path.join(PKG_ROOT, 'src', 'ui', 'server.js'), 'utf8'),
+    ].join('\n');
+    const noPersonalLeak105 = !/gpt-?6\.2-?sol|gpt-?6\.1-?terra|Neon\s*高|极高|sk-[A-Za-z0-9]{20,}/i.test(uiSources105);
+    const noCdnInHtml105 = !/https?:\/\/cdn\.|fonts\.googleapis\.com|<script[^>]+src=["']https?:/i.test(uiHtml105);
+
+    const { loadModulesCatalog, startUiServer } = await import('../src/ui/server.js');
+    const uiEmptyRoot105 = path.join(RUN_BASE, 'ui_empty_105');
+    const uiCfgRoot105 = path.join(RUN_BASE, 'ui_cfg_105');
+    fs.mkdirSync(uiCfgRoot105, { recursive: true });
+    fs.writeFileSync(path.join(uiCfgRoot105, 'agents.json'), JSON.stringify({
+      conductor: 'hermes',
+      models: { antigravity: 'gemini-4-neon', codex: 'gpt-5-codex' },
+    }), 'utf8');
+
+    const prevAgyModel105 = process.env.AGENTBUS_AGY_MODEL;
+    const prevAgentsCfg105 = process.env.AGENTBUS_AGENTS_CONFIG;
+    let catEmpty105;
+    let catCfg105;
+    try {
+      delete process.env.AGENTBUS_AGY_MODEL;
+      delete process.env.AGENTBUS_AGENTS_CONFIG;
+      catEmpty105 = loadModulesCatalog({ rootDir: uiEmptyRoot105, pkgRoot: PKG_ROOT });
+      catCfg105 = loadModulesCatalog({ rootDir: uiCfgRoot105, pkgRoot: PKG_ROOT });
+    } finally {
+      if (prevAgyModel105 === undefined) delete process.env.AGENTBUS_AGY_MODEL;
+      else process.env.AGENTBUS_AGY_MODEL = prevAgyModel105;
+      if (prevAgentsCfg105 === undefined) delete process.env.AGENTBUS_AGENTS_CONFIG;
+      else process.env.AGENTBUS_AGENTS_CONFIG = prevAgentsCfg105;
+    }
+
+    assertCase(105, 'UI 模块清单覆盖 14 核心模块、字段完整、无个人模型硬编码、按 agents.json 动态解析或显示未配置',
+      modFieldsOk105 &&
+      uiEntry105?.owner_agent === 'antigravity' &&
+      noPersonalLeak105 &&
+      noCdnInHtml105 &&
+      catEmpty105.modules.every((m) => m.owner_model === '未配置') &&
+      catCfg105.modules.find((m) => m.id === 'ui')?.owner_model === 'gemini-4-neon' &&
+      catCfg105.modules.find((m) => m.id === 'db')?.owner_model === 'gpt-5-codex',
+      `fields=${modFieldsOk105} leak=${!noPersonalLeak105} cdn=${!noCdnInHtml105} uiModel=${catCfg105.modules.find((m) => m.id === 'ui')?.owner_model}`);
+
+    // 106. agentbus ui CLI 真实进程在临时端口启动、GET 严格只读、拒绝非 loopback 绑定
+    const uiCliRoot106 = path.join(RUN_BASE, 'ui_cli_ro_106');
+    const uiChildEnv106 = { ...process.env, AGENTBUS_ALLOWED_ROOTS: WORK_DIR };
+    delete uiChildEnv106.AGENTBUS_AGY_MODEL;
+    delete uiChildEnv106.AGENTBUS_AGENTS_CONFIG;
+
+    const badHost106 = runCli(['ui', '--host', '0.0.0.0', '--port', '0', '--no-open'], {
+      root: uiCliRoot106,
+      allowed: WORK_DIR,
+      envExtra: uiChildEnv106,
+    });
+
+    const uiProc106 = spawn(process.execPath, [BUS_BIN, 'ui', '--port', '0', '--no-open', '--root', uiCliRoot106], {
+      cwd: PKG_ROOT,
+      env: uiChildEnv106,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    let uiCliInfo106 = null;
+    let uiCliHtml106 = '';
+    let uiCliMods106 = null;
+    let uiCliAgents106 = null;
+    let uiCliTasks106 = null;
+    let uiCliRoAfterGet106 = false;
+    try {
+      uiCliInfo106 = await new Promise((resolve, reject) => {
+        let out = '';
+        let err = '';
+        const timer = setTimeout(() => reject(new Error(`ui start timeout; out=${out}; err=${err}`)), 8000);
+        uiProc106.stderr.on('data', (d) => { err += d.toString('utf8'); });
+        uiProc106.stdout.on('data', (d) => {
+          out += d.toString('utf8');
+          const nl = out.indexOf('\n');
+          if (nl >= 0) {
+            clearTimeout(timer);
+            try { resolve(JSON.parse(out.slice(0, nl))); } catch (e) { reject(e); }
+          }
+        });
+        uiProc106.on('exit', (code) => {
+          clearTimeout(timer);
+          reject(new Error(`ui exited early (${code}): ${err}`));
+        });
+      });
+
+      const rHtml106 = await fetch(`${uiCliInfo106.url}/`);
+      uiCliHtml106 = await rHtml106.text();
+      const rMods106 = await fetch(`${uiCliInfo106.url}/api/modules`);
+      uiCliMods106 = await rMods106.json();
+      const rAgents106 = await fetch(`${uiCliInfo106.url}/api/agents`);
+      uiCliAgents106 = await rAgents106.json();
+      const rTasks106 = await fetch(`${uiCliInfo106.url}/api/tasks`);
+      uiCliTasks106 = await rTasks106.json();
+      uiCliRoAfterGet106 = !fs.existsSync(uiCliRoot106);
+    } finally {
+      try { uiProc106.kill(); } catch {}
+    }
+
+    assertCase(106, 'agentbus ui 真实子进程绑定 loopback、打印 URL、GET 严格只读不建库、拒绝 0.0.0.0',
+      badHost106.rc === 1 &&
+      Boolean(uiCliInfo106?.ok && /^http:\/\/127\.0\.0\.1:\d+$/.test(uiCliInfo106?.url || '')) &&
+      uiCliHtml106.includes('agentbus 模块可视化调度面板') &&
+      uiCliMods106?.ok === true &&
+      uiCliMods106?.module_count >= 14 &&
+      uiCliAgents106?.ok === true &&
+      uiCliTasks106?.ok === true &&
+      uiCliTasks106?.db_exists === false &&
+      uiCliRoAfterGet106,
+      `badHost=${badHost106.rc} url=${uiCliInfo106?.url} ro=${uiCliRoAfterGet106}`);
+
+    // 107. POST /api/requests 创建真实 conductor 任务（临时 root，不写配置，默认不 dispatch）
+    const uiReqRoot107 = path.join(RUN_BASE, 'ui_req_107');
+    fs.mkdirSync(uiReqRoot107, { recursive: true });
+    fs.writeFileSync(path.join(uiReqRoot107, 'agents.json'), JSON.stringify({
+      conductor: 'hermes',
+      models: { hermes: 'hermes-pro', antigravity: 'gemini-4-neon', codex: 'gpt-5-codex' },
+    }), 'utf8');
+
+    let dispatchCalls107 = 0;
+    const prevAgy107 = process.env.AGENTBUS_AGY_MODEL;
+    const prevCfg107 = process.env.AGENTBUS_AGENTS_CONFIG;
+    delete process.env.AGENTBUS_AGY_MODEL;
+    delete process.env.AGENTBUS_AGENTS_CONFIG;
+
+    const srv107 = await startUiServer({
+      rootOverride: uiReqRoot107,
+      host: '127.0.0.1',
+      port: 0,
+      dispatch: false,
+      dispatchFn: async () => {
+        dispatchCalls107++;
+        return { state: 'done' };
+      },
+      pkgRoot: PKG_ROOT,
+    });
+
+    let post107Json = null;
+    let post107Status = 0;
+    let shown107 = null;
+    let tasksAfter107 = null;
+    try {
+      const rPost107 = await fetch(`${srv107.url}/api/requests`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          module_ids: ['db', 'ui'],
+          action: 'optimize',
+          target_agent: 'antigravity',
+          target_model: 'gemini-4-neon',
+          notes: '审计只读连接与索引性能',
+        }),
+      });
+      post107Status = rPost107.status;
+      post107Json = await rPost107.json();
+      shown107 = runCli(['show', post107Json.task_id], { root: uiReqRoot107, allowed: WORK_DIR }).json;
+      tasksAfter107 = await (await fetch(`${srv107.url}/api/tasks`)).json();
+
+      // 108. 非法模块 id / 非法 agent / 非法 model / 超长 body / 错误方法返回稳定 JSON + createTask 幂等清洗
+      const rBadMod108 = await fetch(`${srv107.url}/api/requests`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ module_ids: ['../evil'], action: 'optimize' }),
+      });
+      const jBadMod108 = await rBadMod108.json();
+
+      const rBadAgent108 = await fetch(`${srv107.url}/api/requests`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ module_ids: ['ui'], action: 'optimize', target_agent: 'unconfigured_bot' }),
+      });
+      const jBadAgent108 = await rBadAgent108.json();
+
+      const rBadModel108 = await fetch(`${srv107.url}/api/requests`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ module_ids: ['ui'], action: 'adjust_model', target_agent: 'antigravity', target_model: 'nonexistent-model' }),
+      });
+      const jBadModel108 = await rBadModel108.json();
+
+      const rBig108 = await fetch(`${srv107.url}/api/requests`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ module_ids: ['ui'], action: 'inspect', notes: 'x'.repeat(40000) }),
+      });
+      const jBig108 = await rBig108.json();
+
+      const r404_108 = await fetch(`${srv107.url}/api/nope`);
+      const j404_108 = await r404_108.json();
+      const r405_108 = await fetch(`${srv107.url}/api/requests`, { method: 'GET' });
+      const j405_108 = await r405_108.json();
+
+      // Whitespace-only idempotency_key must not collide
+      const wsKeyA108 = runCli(['new', '--to', 'codex', '--goal', 'ws-a', '--key', '   '], { root: uiReqRoot107, allowed: WORK_DIR });
+      const wsKeyB108 = runCli(['new', '--to', 'codex', '--goal', 'ws-b', '--key', '   '], { root: uiReqRoot107, allowed: WORK_DIR });
+
+      assertCase(107, 'POST /api/requests 写入发给 conductor 的真实任务，goal 含模块/路径/动作/模型且默认不 dispatch',
+        post107Status === 201 &&
+        post107Json?.ok === true &&
+        post107Json?.to === 'hermes' &&
+        post107Json?.dispatched === false &&
+        dispatchCalls107 === 0 &&
+        Boolean(post107Json?.dispatch_command) &&
+        shown107?.to === 'hermes' &&
+        shown107?.state === 'open' &&
+        shown107?.goal?.includes('db') &&
+        shown107?.goal?.includes('src/db.js') &&
+        shown107?.goal?.includes('ui') &&
+        shown107?.goal?.includes('src/ui/server.js') &&
+        shown107?.goal?.includes('optimize') &&
+        shown107?.goal?.includes('gemini-4-neon') &&
+        shown107?.goal?.includes('审计只读连接与索引性能') &&
+        tasksAfter107?.tasks?.some((t) => t.id === post107Json.task_id),
+        `status=${post107Status} disp=${dispatchCalls107} to=${shown107?.to}`);
+
+      assertCase(108, 'POST /api/requests 拒绝非法模块/agent/model/超长 body/未知路由且均返回 JSON；空白 key 不碰撞',
+        rBadMod108.status === 400 && jBadMod108.code === 'invalid_module_id' &&
+        rBadAgent108.status === 400 && jBadAgent108.code === 'invalid_agent' &&
+        rBadModel108.status === 400 && jBadModel108.code === 'invalid_model' &&
+        rBig108.status === 413 && jBig108.code === 'payload_too_large' &&
+        r404_108.status === 404 && j404_108.ok === false &&
+        r405_108.status === 405 && j405_108.ok === false &&
+        wsKeyA108.rc === 0 && wsKeyB108.rc === 0 &&
+        wsKeyA108.json?.id !== wsKeyB108.json?.id &&
+        wsKeyB108.json?.dedup === false,
+        `mod=${rBadMod108.status} ag=${rBadAgent108.status} mdl=${rBadModel108.status} big=${rBig108.status} ws=${wsKeyA108.json?.id}:${wsKeyB108.json?.id}`);
+
+      // 109. 显式 dispatch:true 才走 dispatch 路径（mock），dispatch 异常仍返回 JSON + task_id；MCP 工具数不退化
+      const dispatchedIds109 = [];
+      const srvDisp109 = await startUiServer({
+        rootOverride: uiReqRoot107,
+        host: '127.0.0.1',
+        port: 0,
+        dispatch: false,
+        dispatchFn: async (_bus, opts) => {
+          dispatchedIds109.push(opts.id);
+          if (dispatchedIds109.length === 2) {
+            throw new Error('simulated dispatch failure');
+          }
+          return { id: opts.id, state: 'done', dispatched: true };
+        },
+        pkgRoot: PKG_ROOT,
+      });
+      let rDispOk109;
+      let jDispOk109;
+      let rDispErr109;
+      let jDispErr109;
+      try {
+        rDispOk109 = await fetch(`${srvDisp109.url}/api/requests`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ module_ids: ['ui'], action: 'inspect', dispatch: true }),
+        });
+        jDispOk109 = await rDispOk109.json();
+
+        rDispErr109 = await fetch(`${srvDisp109.url}/api/requests`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ module_ids: ['db'], action: 'inspect', dispatch: true }),
+        });
+        jDispErr109 = await rDispErr109.json();
+      } finally {
+        await srvDisp109.close();
+      }
+
+      const mcpCheckCond109 = await runMcpSession(uiReqRoot107, WORK_DIR, [
+        { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } },
+        { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
+      ], { AGENTBUS_ROLE: 'conductor' });
+      const mcpCheckWork109 = await runMcpSession(uiReqRoot107, WORK_DIR, [
+        { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } },
+        { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
+      ], { AGENTBUS_ROLE: 'worker' });
+      const condToolCount109 = mcpCheckCond109.responses.find((r) => r.id === 2)?.result?.tools?.length;
+      const workToolCount109 = mcpCheckWork109.responses.find((r) => r.id === 2)?.result?.tools?.length;
+
+      assertCase(109, '显式 dispatch:true 走 dispatch 路径、异常返回结构化 JSON，且 MCP 15/9 工具列表完整未破坏',
+        rDispOk109.status === 201 &&
+        jDispOk109.dispatched === true &&
+        jDispOk109.state === 'done' &&
+        dispatchedIds109[0] === jDispOk109.task_id &&
+        rDispErr109.status === 201 &&
+        Boolean(jDispErr109.task_id) &&
+        jDispErr109.dispatched === false &&
+        String(jDispErr109.dispatch_error || '').includes('simulated dispatch failure') &&
+        condToolCount109 === 15 &&
+        workToolCount109 === 9,
+        `ok=${JSON.stringify(jDispOk109)} err=${JSON.stringify(jDispErr109)} tools=${condToolCount109}/${workToolCount109}`);
+    } finally {
+      await srv107.close();
+      if (prevAgy107 === undefined) delete process.env.AGENTBUS_AGY_MODEL;
+      else process.env.AGENTBUS_AGY_MODEL = prevAgy107;
+      if (prevCfg107 === undefined) delete process.env.AGENTBUS_AGENTS_CONFIG;
+      else process.env.AGENTBUS_AGENTS_CONFIG = prevCfg107;
+    }
+
+    // 110. Antigravity 导出 session 失效保护：pid 死亡或 hub 版本/端口不匹配时自动回退到 live hub_*.json
+    const { resolveAgySession, exportAgySession: exportAgy110 } = await import('../src/agy.js');
+    const agyBase110 = path.join(RUN_BASE, 'agy_stale_110');
+    const daemonDir110 = path.join(agyBase110, 'daemon');
+    fs.mkdirSync(daemonDir110, { recursive: true });
+    const liveHub110 = path.join(daemonDir110, `hub_${process.pid}.json`);
+    const oldHub110 = path.join(daemonDir110, 'hub_999999.json');
+    fs.writeFileSync(oldHub110, JSON.stringify({ httpPort: 54818, csrfToken: 'secret-old-tok', pid: 999999, version: '2.30.0' }), 'utf8');
+    fs.writeFileSync(liveHub110, JSON.stringify({ httpPort: 59123, csrfToken: 'secret-live-tok', pid: process.pid, version: '2.35.1' }), 'utf8');
+
+    const exportedFile110 = path.join(agyBase110, 'antigravity-session.json');
+    // Case A: stale pid in exported session -> falls back to live hub
+    fs.writeFileSync(exportedFile110, JSON.stringify({
+      kind: 'antigravity-session',
+      ls_address: 'http://127.0.0.1:54818',
+      csrf_token: 'secret-old-tok',
+      pid: 999999,
+      version: '2.30.0',
+    }), 'utf8');
+    const resDeadPid110 = resolveAgySession({
+      sessionFile: exportedFile110,
+      daemonOpts: { env: { AGENTBUS_AGY_DAEMON_DIR: daemonDir110 } },
+    });
+
+    // Case B: live pid in exported file (or no pid), but hub port/version mismatches live hub -> falls back to live hub
+    fs.writeFileSync(exportedFile110, JSON.stringify({
+      kind: 'antigravity-session',
+      ls_address: 'http://127.0.0.1:54818',
+      csrf_token: 'secret-old-tok',
+      version: '2.34.0',
+    }), 'utf8');
+    const resMismatch110 = resolveAgySession({
+      sessionFile: exportedFile110,
+      daemonOpts: { env: { AGENTBUS_AGY_DAEMON_DIR: daemonDir110 } },
+    });
+
+    // Case C: exportAgySession stores pid & does not print token
+    const freshExport110 = path.join(agyBase110, 'fresh-session.json');
+    const emptyHome110 = path.join(RUN_BASE, 'agy_empty_home_110');
+    fs.mkdirSync(emptyHome110, { recursive: true });
+    const expMeta110 = exportAgy110(freshExport110, {
+      home: emptyHome110,
+      platform: 'linux',
+      env: { AGENTBUS_AGY_DAEMON_DIR: daemonDir110, HOME: emptyHome110 },
+    });
+    const expJson110 = JSON.parse(fs.readFileSync(freshExport110, 'utf8'));
+    const expMetaStr110 = JSON.stringify(expMeta110);
+
+    // Case D: dead pid & no live hub -> clear error without leaking token
+    const emptyDaemon110 = path.join(RUN_BASE, 'agy_empty_daemon_110');
+    fs.mkdirSync(emptyDaemon110, { recursive: true });
+    fs.writeFileSync(exportedFile110, JSON.stringify({
+      kind: 'antigravity-session',
+      ls_address: 'http://127.0.0.1:54818',
+      csrf_token: 'secret-old-tok',
+      pid: 999999,
+    }), 'utf8');
+    let deadNoHubErr110 = '';
+    try {
+      resolveAgySession({
+        sessionFile: exportedFile110,
+        daemonOpts: {
+          home: emptyHome110,
+          platform: 'linux',
+          env: { AGENTBUS_AGY_DAEMON_DIR: emptyDaemon110, HOME: emptyHome110 },
+        },
+        isPidAlive: () => false,
+      });
+    } catch (err) {
+      deadNoHubErr110 = String(err?.message || err);
+    }
+
+    assertCase(110, 'agy session 失效保护：pid 不存活或 hub 版本/端口不匹配自动回退 live hub_*.json 且不泄漏 token',
+      resDeadPid110.ls_address === 'http://127.0.0.1:59123' &&
+      resDeadPid110.fallback === true &&
+      resDeadPid110.stale_reason === 'pid_not_alive' &&
+      resMismatch110.ls_address === 'http://127.0.0.1:59123' &&
+      resMismatch110.fallback === true &&
+      (resMismatch110.stale_reason === 'hub_version_mismatch' || resMismatch110.stale_reason === 'hub_port_mismatch') &&
+      expMeta110.pid === process.pid &&
+      expJson110.pid === process.pid &&
+      !expMetaStr110.includes('secret-live-tok') &&
+      /已退出|agy-session/.test(deadNoHubErr110) &&
+      !deadNoHubErr110.includes('secret-old-tok'),
+      `dead=${JSON.stringify({ addr: resDeadPid110.ls_address, r: resDeadPid110.stale_reason })} mismatch=${JSON.stringify({ addr: resMismatch110.ls_address, r: resMismatch110.stale_reason })} err=${deadNoHubErr110}`);
   } finally {
     try { fs.rmSync(RUN_BASE, { recursive: true, force: true }); } catch {}
   }

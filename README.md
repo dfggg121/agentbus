@@ -177,6 +177,14 @@ Antigravity starts conversations asynchronously, so `dispatch` can return while 
 agentbus wait <task-id> --timeout 900
 ```
 
+Web dashboard for module ownership and rework requests:
+
+```bash
+agentbus ui --port 0 --no-open --root var/main
+```
+
+It binds loopback only, shows the technical modules with their owning agent/model, and lets you select a subset to send a redo/optimize/reassign-model request to the conductor. Default is task creation only; add `--dispatch` or tick the page checkbox to start the conductor dispatch. See [`docs/UI.md`](docs/UI.md).
+
 For a host that should be woken after completion, use `watch` (one process, one task, read-only, default 5s interval):
 
 ```bash

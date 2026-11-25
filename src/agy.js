@@ -49,17 +49,43 @@ function tighten(file) {
   }
 }
 
+export function isPidAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  try {
+    process.kill(n, 0);
+    return true;
+  } catch (err) {
+    return err?.code === 'EPERM';
+  }
+}
+
+function extractPortFromAddress(addr) {
+  if (!addr || typeof addr !== 'string') return null;
+  try {
+    const u = new URL(addr);
+    if (u.port) return Number(u.port);
+  } catch {}
+  const m = /:(\d+)(?:\/|$)/.exec(addr);
+  return m ? Number(m[1]) : null;
+}
+
 // Run this inside Antigravity's own integrated terminal, where the two
 // variables exist. Nothing is printed but the path and the token length.
-export function exportAgySession(outPath) {
-  let address = process.env.ANTIGRAVITY_LS_ADDRESS;
-  let csrf = process.env.ANTIGRAVITY_CSRF_TOKEN;
+export function exportAgySession(outPath, opts = {}) {
+  const env = opts.env || process.env;
+  let address = env.ANTIGRAVITY_LS_ADDRESS;
+  let csrf = env.ANTIGRAVITY_CSRF_TOKEN;
+  let pid = Number(env.ANTIGRAVITY_PID) || null;
+  let version = env.ANTIGRAVITY_VERSION ? String(env.ANTIGRAVITY_VERSION).trim() : null;
   let source = 'env';
   if (!address || !csrf) {
-    const found = discoverAgySession();
+    const found = discoverAgySession(opts);
     if (found) {
       address = found.ls_address;
       csrf = found.csrf_token;
+      pid = found.pid ?? pid;
+      version = found.version ?? version;
       source = found.source;
     }
   }
@@ -75,12 +101,14 @@ export function exportAgySession(outPath) {
     kind: 'antigravity-session',
     ls_address: address,
     csrf_token: csrf,
+    ...(pid ? { pid } : {}),
+    ...(version ? { version } : {}),
     exported_at: new Date().toISOString(),
     source,
   };
   fs.writeFileSync(target, JSON.stringify(payload, null, 2) + '\n', { mode: 0o600 });
   tighten(target);
-  return { path: target, ls_address: address, token_chars: csrf.length, source, note: '重启 Antigravity 后需重新导出' };
+  return { path: target, ls_address: address, token_chars: csrf.length, source, ...(pid ? { pid } : {}), note: '重启 Antigravity 后需重新导出' };
 }
 
 export function readAgySession(file) {
@@ -169,6 +197,7 @@ export function daemonDirs(opts = {}) {
 }
 
 export function discoverAgySession(opts = {}) {
+  const pidAliveFn = typeof opts.isPidAlive === 'function' ? opts.isPidAlive : isPidAlive;
   let best = null;
   for (const dir of daemonDirs(opts)) {
     let entries = [];
@@ -183,18 +212,92 @@ export function discoverAgySession(opts = {}) {
       } catch { continue; }
       if (!data.csrfToken || !data.httpPort) continue;
       const mtime = fs.statSync(full).mtimeMs;
-      if (!best || mtime > best.mtime) {
-        best = {
-          mtime,
-          source: full,
-          ls_address: `http://127.0.0.1:${data.httpPort}`,
-          csrf_token: data.csrfToken,
-          pid: data.pid,
-        };
+      const filePid = Number(name.match(/^hub_(\d+)\.json$/)?.[1] || 0);
+      const pid = Number(data.pid || filePid || 0) || null;
+      const pidAlive = pid ? Boolean(pidAliveFn(pid)) : false;
+      if (opts.requireAlivePid && !pidAlive) continue;
+      const version = data.version || data.appVersion || data.lsVersion || null;
+      const cand = {
+        mtime,
+        source: full,
+        ls_address: `http://127.0.0.1:${data.httpPort}`,
+        csrf_token: data.csrfToken,
+        pid,
+        pid_alive: pidAlive,
+        ...(version ? { version: String(version) } : {}),
+      };
+      if (
+        !best ||
+        (cand.pid_alive && !best.pid_alive) ||
+        (cand.pid_alive === best.pid_alive && cand.mtime > best.mtime)
+      ) {
+        best = cand;
       }
     }
   }
   return best;
+}
+
+export function resolveAgySession({
+  busRoot = null,
+  sessionFile = null,
+  daemonOpts = {},
+  isPidAlive: pidAliveOverride = null,
+} = {}) {
+  const pidAliveFn = typeof pidAliveOverride === 'function' ? pidAliveOverride : isPidAlive;
+  const targetFile = sessionFile || defaultAgySessionPath(busRoot);
+  const live = discoverAgySession({ ...daemonOpts, isPidAlive: pidAliveFn });
+  const liveAlive = Boolean(live && (live.pid_alive || !live.pid));
+
+  let exported = null;
+  let readErr = null;
+  try {
+    exported = readAgySession(targetFile);
+  } catch (err) {
+    readErr = err;
+  }
+
+  if (!exported) {
+    if (live) return { ...live, fallback: true, stale_reason: 'missing_exported_session' };
+    throw readErr;
+  }
+
+  const expPid = Number(exported.pid) || null;
+  const expPort = extractPortFromAddress(exported.ls_address);
+  const livePort = live ? extractPortFromAddress(live.ls_address) : null;
+  const expVer = exported.version ? String(exported.version) : null;
+  const liveVer = live?.version ? String(live.version) : null;
+
+  let staleReason = null;
+  if (expPid && !pidAliveFn(expPid)) {
+    staleReason = 'pid_not_alive';
+  } else if (live && liveAlive) {
+    if (expVer && liveVer && expVer !== liveVer) {
+      staleReason = 'hub_version_mismatch';
+    } else if (expPort && livePort && expPort !== livePort) {
+      staleReason = 'hub_port_mismatch';
+    } else if (expPid && live.pid && expPid !== live.pid) {
+      staleReason = 'hub_pid_mismatch';
+    }
+  }
+
+  if (staleReason) {
+    if (live && liveAlive) {
+      return {
+        ...live,
+        fallback: true,
+        stale_reason: staleReason,
+      };
+    }
+    if (staleReason === 'pid_not_alive') {
+      throw Object.assign(
+        new Error(`导出会话对应的 Antigravity 进程已退出 (pid=${expPid})，且未发现活跃 hub_*.json；请重新运行 agentbus agy-session`),
+        { code: 1 }
+      );
+    }
+  }
+
+  return { ...exported, fallback: false, stale_reason: null };
 }
 
 export function resolveCdpPort(portOpt = null, env = process.env) {

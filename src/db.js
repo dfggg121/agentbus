@@ -75,6 +75,10 @@ CREATE INDEX IF NOT EXISTS idx_tasks_state_to
 CREATE INDEX IF NOT EXISTS idx_tasks_created
   ON tasks(created_at DESC);
 
+CREATE INDEX IF NOT EXISTS idx_tasks_claimed_lease
+  ON tasks(state, lease_expires_at)
+  WHERE state = 'claimed';
+
 CREATE TABLE IF NOT EXISTS threads (
   agent TEXT NOT NULL,
   name TEXT NOT NULL,
@@ -221,6 +225,7 @@ export function migrateTasksTable(db) {
   if (!cols.has('last_message_at')) {
     db.exec('ALTER TABLE tasks ADD COLUMN last_message_at TEXT DEFAULT NULL');
   }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_claimed_lease ON tasks(state, lease_expires_at) WHERE state = 'claimed'");
 }
 
 export function checkBusWritable(config) {
@@ -310,6 +315,7 @@ export function openBusReadOnly(opts = {}) {
   try {
     db = new DatabaseSync(config.dbPath, { readOnly: true });
     try { db.exec('PRAGMA busy_timeout = 5000;'); } catch {}
+    try { db.exec('PRAGMA query_only = ON;'); } catch {}
   } catch (err) {
     throw Object.assign(new Error(`无法只读打开数据库 ${config.dbPath}: ${err.message || err}`), { code: 1 });
   }

@@ -25,6 +25,8 @@ import { dispatchTask, dispatchEnabled, waitForTask, watchTask, maybeArchiveTask
 import { exportAgySession, defaultAgySessionPath, archiveConversation } from '../src/agy.js';
 import { loadContextLedger, confirmDecision } from '../src/context.js';
 import { detectAgents, readAgentConfig, writeAgentConfig } from '../src/agents.js';
+import { startUiServer } from '../src/ui/server.js';
+import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
@@ -128,6 +130,7 @@ function printHelp() {
       'archive [<conversation-id>] [--port <port>] [--title-prefix <prefix>] [--title-contains <text>] [--dry-run] [--force]',
       'onboard [--conductor <agent>] [--model <agent>=<id>]... [--archive-on-done] [--yes] [--dry-run] [--root <dir>] [--home <dir>] [--allow <dir>]...   # 探测本机 agent 并写好通信配置',
       'agy-session [--out <file>]   # 在 Antigravity 集成终端里运行，导出会话地址与令牌',
+      'ui [--port <n>] [--host 127.0.0.1] [--no-open] [--root <dir>] [--dispatch]   # 启动 loopback 只读模块看板与调度面板',
       'mcp [--root <dir>] [--http 127.0.0.1:<port>]',
     ],
     exit_codes: { '0': 'success', '1': 'validation/arg/drift or watch failed/blocked/stalled', '2': 'state/lease disallowed or bootstrap command error', '3': 'watch timeout' },
@@ -281,6 +284,71 @@ async function main() {
       process.stderr.write(JSON.stringify({ error: String(e.message || e), code: 1 }) + '\n');
       process.exit(1);
     }
+  }
+
+  if (cmd === 'ui') {
+    if (args.port === true) {
+      throw Object.assign(new Error('缺少 --port <n> 参数值'), { code: 1 });
+    }
+    if (args.host === true || (typeof args.host === 'string' && !args.host.trim())) {
+      throw Object.assign(new Error('缺少 --host <addr> 参数值'), { code: 1 });
+    }
+    const port = args.port !== undefined ? Number(args.port) : 0;
+    const host = typeof args.host === 'string' ? args.host : '127.0.0.1';
+    const noOpen = args['no-open'] === true || process.env.AGENTBUS_NO_OPEN === '1';
+    const dispatch = args.dispatch === true;
+
+    const ui = await startUiServer({
+      rootOverride,
+      host,
+      port,
+      dispatch,
+    });
+
+    process.stdout.write(JSON.stringify({
+      ok: true,
+      url: ui.url,
+      host: ui.host,
+      port: ui.port,
+      root: ui.root,
+      dispatch: ui.dispatch,
+      hint: 'Ctrl+C 退出；GET 严格只读，提交请求才创建任务',
+    }) + '\n');
+
+    if (!noOpen && process.stdout.isTTY) {
+      try {
+        if (process.platform === 'win32') {
+          const child = spawn('cmd.exe', ['/d', '/c', 'start', '', ui.url], {
+            stdio: 'ignore',
+            detached: true,
+            windowsHide: true,
+          });
+          child.unref();
+        } else if (process.platform === 'darwin') {
+          const child = spawn('open', [ui.url], { stdio: 'ignore', detached: true });
+          child.unref();
+        } else {
+          const child = spawn('xdg-open', [ui.url], { stdio: 'ignore', detached: true });
+          child.unref();
+        }
+      } catch (err) {
+        process.stderr.write(`[agentbus ui] 无法自动打开浏览器: ${err?.message || err}\n`);
+      }
+    }
+
+    await new Promise((resolve) => {
+      let stopping = false;
+      const shutdown = async () => {
+        if (stopping) return;
+        stopping = true;
+        try { await ui.close(); } catch {}
+        resolve();
+        process.exit(0);
+      };
+      process.on('SIGINT', shutdown);
+      process.on('SIGTERM', shutdown);
+    });
+    return;
   }
 
   if (cmd === 'mcp') {
