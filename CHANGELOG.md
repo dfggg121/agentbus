@@ -18,6 +18,9 @@ All notable changes to this project are documented here. Format follows [Keep a 
 - `agentbus context [<thread> | confirm <thread> <decision-id> --by <agent>]` and `new --thread`.
 - Acceptance suite extended to 59 assertions (threads scope, per-client limits, ledger, audit, archive dry-run/mock CDP).
 
+### Changed
+- Redesigned the `agentbus ui` dashboard from a card-grid template into a compact engineering console: row-aligned module list, sticky scheduler inspector, graphite/warm-white/amber palette, no gradient/glow/glass treatment. API and request semantics are unchanged.
+
 ### Fixed
 - Auto-archive clicked the wrong row: the archive button is a sibling of the title node, so searching downward from the title always hit the first row's button in the list. Matching now associates each button with the sidebar title at the same vertical center (buttons are portalled), and archives every duplicate conversation for that task.
 - Auto-archive missed freshly created conversations because the sidebar had not rendered them yet; it now retries up to 6 times before recording `row_not_found`.

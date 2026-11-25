@@ -68,10 +68,11 @@ node bin/bus.js ui --port 4310 --host 127.0.0.1 --root var/main --dispatch
 
 ## 4. 请求如何转为 Conductor 任务
 
-1. 用户在页面勾选一个或多个模块，选择动作（`重做` / `深度优化` / `调整工作模型` / `只检查`）、目标 agent、目标模型与备注。
-2. 页面在提交前展示将要创建的 conductor 任务摘要。
-3. 提交后，`POST /api/requests` 通过 `validateAndBuildConductorRequest` 组装精简 `goal`（仅包含模块 `id`、路径、当前负责人/模型、动作、目标模型、用户备注与验收要求，不塞入仓库文件内容），再调用 `createTask` 创建 `to = <conductor>`（未配置 `conductor` 时为 `conductor`）的任务。
-4. **默认不自动 dispatch**：`POST /api/requests` 默认仅创建任务，返回 HTTP `201` 与 `{ task_id, state, to, uri, dispatched: false, dispatch_command }`。仅当启动时传入 `--dispatch` 或页面显式勾选“立即派给主 agent”（请求体 `dispatch: true`）时，才调用 `dispatchTask`。
+1. **控制台布局**：页面采用值班台双栏结构——顶部为紧凑项目状态栏（总线目录、Conductor、模块数与 DB 只读状态）；左侧按技术层次分组展示列对齐的行式模块清单（含负责人、工作模型、路径与状态）及底部只读近期任务快照；右侧为固定粘性“调度操作区”。
+2. 用户在左侧勾选一个或多个模块，在右侧选择动作（`重做` / `深度优化` / `调整工作模型` / `只检查`）、目标 agent、目标模型与备注。
+3. 页面在提交前展示将要创建的 conductor 任务摘要。
+4. 提交后，`POST /api/requests` 通过 `validateAndBuildConductorRequest` 组装精简 `goal`（仅包含模块 `id`、路径、当前负责人/模型、动作、目标模型、用户备注与验收要求，不塞入仓库文件内容），再调用 `createTask` 创建 `to = <conductor>`（未配置 `conductor` 时为 `conductor`）的任务。
+5. **默认不自动 dispatch**：`POST /api/requests` 默认仅创建任务，返回 HTTP `201` 与 `{ task_id, state, to, uri, dispatched: false, dispatch_command }`。仅当启动时传入 `--dispatch` 或页面显式勾选“立即派给主 agent”（请求体 `dispatch: true`）时，才调用 `dispatchTask`。
 
 ---
 
