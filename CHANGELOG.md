@@ -26,6 +26,7 @@ All notable changes to this project are documented here. Format follows [Keep a 
 - Added an all-Chinese project introduction at `docs/INTRO.zh-CN.md` with Chinese lifecycle/pointer SVGs; `README.zh-CN.md` links to it and uses the Chinese assets. The English README remains unchanged.
 
 ### Fixed
+- CLI result output now uses `process.exitCode` instead of calling `process.exit()` immediately, so `agentbus list --limit 500` is not truncated to empty stdout on Linux/macOS (test 31). The agy daemon-dir test now uses the Windows `;` delimiter when simulating `win32`, so macOS/Linux CI exercises the same branch as Windows.
 - Auto-archive no longer blocks task completion on the Antigravity stop button, retries until the finished row exposes archive, snapshots the conversation id before clearing threads, and records attempts/timeouts in `archive_on_done`.
 - Auto-archive clicked the wrong row: the archive button is a sibling of the title node, so searching downward from the title always hit the first row's button in the list. Matching now associates each button with the sidebar title at the same vertical center (buttons are portalled), and archives every duplicate conversation for that task.
 - Auto-archive missed freshly created conversations because the sidebar had not rendered them yet; it now retries up to 6 times before recording `row_not_found`.
