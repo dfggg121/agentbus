@@ -810,18 +810,19 @@ async function main() {
     }
 
     process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+    process.exitCode = exitCode;
     bus.close();
-    process.exit(exitCode);
+    return;
   } catch (err) {
     bus.close();
     const code = err?.code === 2 ? 2 : 1;
     process.stderr.write(JSON.stringify({ error: String(err?.message || err), code }) + '\n');
-    process.exit(code);
+    process.exitCode = code;
   }
 }
 
 main().catch((err) => {
   const code = err?.code === 2 ? 2 : 1;
   process.stderr.write(JSON.stringify({ error: String(err?.message || err), code }) + '\n');
-  process.exit(code);
+  process.exitCode = code;
 });

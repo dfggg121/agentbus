@@ -3158,7 +3158,7 @@ async function main() {
       home: agyWinHome98,
       platform: 'win32',
       env: {
-        AGENTBUS_AGY_DAEMON_DIR: [agyOv1_98, agyOv2_98].join(path.delimiter),
+        AGENTBUS_AGY_DAEMON_DIR: [agyOv1_98, agyOv2_98].join(';'),
         APPDATA: agyWinAppData98,
       },
     });
@@ -3178,7 +3178,7 @@ async function main() {
     const foundSess98 = discoverAgySession({
       home: agyWinHome98,
       platform: 'win32',
-      env: { AGENTBUS_AGY_DAEMON_DIR: [agyOv1_98, agyOv2_98].join(path.delimiter), APPDATA: agyWinAppData98 },
+      env: { AGENTBUS_AGY_DAEMON_DIR: [agyOv1_98, agyOv2_98].join(';'), APPDATA: agyWinAppData98 },
     });
     let missingSessErr98 = '';
     const emptyAgyHome98 = path.join(agyBase98, 'empty_home');
