@@ -23,6 +23,7 @@ All notable changes to this project are documented here. Format follows [Keep a 
 
 ### Docs
 - README now opens with the task-bus positioning, a lifecycle SVG, a sanitized UI screenshot, and a compact "where it differs" table; added `docs/COMMENT_POST.md` with a task-receipt style comment version.
+- Added an all-Chinese project introduction at `docs/INTRO.zh-CN.md` with Chinese lifecycle/pointer SVGs; `README.zh-CN.md` links to it and uses the Chinese assets. The English README remains unchanged.
 
 ### Fixed
 - Auto-archive clicked the wrong row: the archive button is a sibling of the title node, so searching downward from the title always hit the first row's button in the list. Matching now associates each button with the sidebar title at the same vertical center (buttons are portalled), and archives every duplicate conversation for that task.

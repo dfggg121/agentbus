@@ -1,0 +1,144 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 272" width="1040" height="272" role="img" aria-labelledby="title desc">
+  <title id="title">agentbus 任务生命周期</title>
+  <desc id="desc">任务从 bus_register 登记本地文件指针与 sha256 开始，经由 open 生成约 2 KB 信封、claimed 持有 900 秒租约、按需通过 question 与 answer 双向沟通，最终在 bus_task_complete 重算全部引用哈希并逐条核验 acceptance 后进入 done；租约过期则回到 open 且 attempt 加 1。</desc>
+  <style>
+    .bg { fill: #f8f7f3; stroke: #d8d5cc; stroke-width: 1.5; }
+    .hdr-title { font: 600 14px "Microsoft YaHei", "PingFang SC", "Noto Sans SC", system-ui, -apple-system, sans-serif; fill: #1b1d22; }
+    .hdr-sub { font: 400 12px ui-monospace, SFMono-Regular, Menlo, Consolas, "Microsoft YaHei", sans-serif; fill: #575a64; }
+    .node { fill: #ffffff; stroke: #c5c1b6; stroke-width: 1.5; }
+    .node-title { font: 600 13px "Microsoft YaHei", "PingFang SC", "Noto Sans SC", system-ui, -apple-system, sans-serif; fill: #1b1d22; }
+    .node-cmd { font: 600 11.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #3b4252; }
+    .node-meta { font: 400 11.5px "Microsoft YaHei", "PingFang SC", "Noto Sans SC", system-ui, -apple-system, sans-serif; fill: #575a64; }
+    .arrow { fill: none; stroke: #8c887d; stroke-width: 1.6; }
+    .arrow-head { fill: #8c887d; }
+    .loop-arc { fill: none; stroke: #9d7540; stroke-width: 1.5; stroke-dasharray: 5 4; }
+    .loop-head { fill: #9d7540; }
+    .loop-label { font: 500 12px "Microsoft YaHei", "PingFang SC", "Noto Sans SC", system-ui, -apple-system, sans-serif; fill: #8a5a19; }
+    .step-badge { fill: #efede6; stroke: #d5d1c6; stroke-width: 1; }
+    .step-num { font: 600 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #575a64; }
+    .track-rail { fill: none; stroke: #dcd8cd; stroke-width: 1.5; }
+    .track-tick { fill: none; stroke: #dcd8cd; stroke-width: 1.5; }
+    .pulse-ring { fill: none; stroke: #c47a1c; stroke-width: 2.2; opacity: 0; }
+    .token-dot { fill: #c47a1c; stroke: #f8f7f3; stroke-width: 2; }
+
+    @keyframes stage1 { 0%, 17% { opacity: 1; } 20%, 100% { opacity: 0; } }
+    @keyframes stage2 { 0%, 19% { opacity: 0; } 21%, 37% { opacity: 1; } 40%, 100% { opacity: 0; } }
+    @keyframes stage3 { 0%, 39% { opacity: 0; } 41%, 57% { opacity: 1; } 60%, 100% { opacity: 0; } }
+    @keyframes stage4 { 0%, 59% { opacity: 0; } 61%, 77% { opacity: 1; } 80%, 100% { opacity: 0; } }
+    @keyframes stage5 { 0%, 79% { opacity: 0; } 81%, 97% { opacity: 1; } 100% { opacity: 0; } }
+
+    .p1 { animation: stage1 8s linear infinite; }
+    .p2 { animation: stage2 8s linear infinite; }
+    .p3 { animation: stage3 8s linear infinite; }
+    .p4 { animation: stage4 8s linear infinite; }
+    .p5 { animation: stage5 8s linear infinite; }
+
+    @media (prefers-reduced-motion: reduce) {
+      .p1, .p2, .p3, .p4, .p5 { animation: none; opacity: 0; }
+      .p3 { opacity: 1; }
+      .token-dot { display: none; }
+    }
+  </style>
+
+  <rect class="bg" x="1" y="1" width="1038" height="270" rx="8" />
+
+  <text class="hdr-title" x="30" y="34">任务生命周期（指针登记 · 租约执行 · 核验收工）</text>
+  <text class="hdr-sub" x="1010" y="34" text-anchor="end">open -&gt; claimed（租约）-&gt; done | failed</text>
+
+  <!-- Main horizontal connectors -->
+  <line class="arrow" x1="198" y1="119" x2="227" y2="119" />
+  <polygon class="arrow-head" points="227,115 233,119 227,123" />
+
+  <line class="arrow" x1="401" y1="119" x2="430" y2="119" />
+  <polygon class="arrow-head" points="430,115 436,119 430,123" />
+
+  <line class="arrow" x1="604" y1="119" x2="633" y2="119" />
+  <polygon class="arrow-head" points="633,115 639,119 633,123" />
+
+  <line class="arrow" x1="807" y1="119" x2="836" y2="119" />
+  <polygon class="arrow-head" points="836,115 842,119 836,123" />
+
+  <!-- Lease expiry return arc (claimed -> open) -->
+  <path class="loop-arc" d="M 520 172 L 520 214 Q 520 224 510 224 L 327 224 Q 317 224 317 214 L 317 178" />
+  <polygon class="loop-head" points="313,179 317,172 321,179" />
+  <text class="loop-label" x="418" y="246" text-anchor="middle">租约过期回收 -&gt; 回到 open（attempt + 1）</text>
+
+  <!-- Stage 1: bus_register -->
+  <g transform="translate(30,66)">
+    <rect class="node" width="168" height="106" rx="6" />
+    <rect class="pulse-ring p1" width="168" height="106" rx="6" />
+    <rect class="step-badge" x="10" y="10" width="24" height="19" rx="3" />
+    <text class="step-num" x="22" y="23.5" text-anchor="middle">01</text>
+    <text class="node-title" x="41" y="24">登记指针</text>
+    <text class="node-cmd" x="12" y="52">bus_register</text>
+    <text class="node-meta" x="12" y="73">只记 uri + sha256</text>
+    <text class="node-meta" x="12" y="93">原文件留在本地磁盘</text>
+  </g>
+
+  <!-- Stage 2: open -->
+  <g transform="translate(233,66)">
+    <rect class="node" width="168" height="106" rx="6" />
+    <rect class="pulse-ring p2" width="168" height="106" rx="6" />
+    <rect class="step-badge" x="10" y="10" width="24" height="19" rx="3" />
+    <text class="step-num" x="22" y="23.5" text-anchor="middle">02</text>
+    <text class="node-title" x="41" y="24">待领（open）</text>
+    <text class="node-cmd" x="12" y="52">bus_task_create</text>
+    <text class="node-meta" x="12" y="73">落盘 tasks/&lt;id&gt;.json</text>
+    <text class="node-meta" x="12" y="93">信封仅约 2,025 B</text>
+  </g>
+
+  <!-- Stage 3: claimed -->
+  <g transform="translate(436,66)">
+    <rect class="node" width="168" height="106" rx="6" />
+    <rect class="pulse-ring p3" width="168" height="106" rx="6" />
+    <rect class="step-badge" x="10" y="10" width="24" height="19" rx="3" />
+    <text class="step-num" x="22" y="23.5" text-anchor="middle">03</text>
+    <text class="node-title" x="41" y="24">已领（claimed）</text>
+    <text class="node-cmd" x="12" y="52">bus_task_claim</text>
+    <text class="node-meta" x="12" y="73">发 lease_token（900 秒）</text>
+    <text class="node-meta" x="12" y="93">heartbeat 续租与读盘</text>
+  </g>
+
+  <!-- Stage 4: question / answer -->
+  <g transform="translate(639,66)">
+    <rect class="node" width="168" height="106" rx="6" />
+    <rect class="pulse-ring p4" width="168" height="106" rx="6" />
+    <rect class="step-badge" x="10" y="10" width="24" height="19" rx="3" />
+    <text class="step-num" x="22" y="23.5" text-anchor="middle">04</text>
+    <text class="node-title" x="41" y="24">双向沟通</text>
+    <text class="node-cmd" x="12" y="52">bus_task_message</text>
+    <text class="node-meta" x="12" y="73">question / blocked 报阻</text>
+    <text class="node-meta" x="12" y="93">主控 answer 清除阻塞</text>
+  </g>
+
+  <!-- Stage 5: done -->
+  <g transform="translate(842,66)">
+    <rect class="node" width="168" height="106" rx="6" />
+    <rect class="pulse-ring p5" width="168" height="106" rx="6" />
+    <rect class="step-badge" x="10" y="10" width="24" height="19" rx="3" />
+    <text class="step-num" x="22" y="23.5" text-anchor="middle">05</text>
+    <text class="node-title" x="41" y="24">核验收工（done）</text>
+    <text class="node-cmd" x="12" y="52">bus_task_complete</text>
+    <text class="node-meta" x="12" y="73">重算全部引用哈希</text>
+    <text class="node-meta" x="12" y="93">逐条校验 acceptance</text>
+  </g>
+
+  <!-- Top progress track for the moving marker -->
+  <line class="track-rail" x1="114" y1="52" x2="926" y2="52" />
+  <line class="track-tick" x1="114" y1="52" x2="114" y2="66" />
+  <line class="track-tick" x1="317" y1="52" x2="317" y2="66" />
+  <line class="track-tick" x1="520" y1="52" x2="520" y2="66" />
+  <line class="track-tick" x1="723" y1="52" x2="723" y2="66" />
+  <line class="track-tick" x1="926" y1="52" x2="926" y2="66" />
+
+  <!-- Animated progress marker along the top track -->
+  <circle class="token-dot" r="5" cx="114" cy="52">
+    <animateMotion
+      dur="8s"
+      repeatCount="indefinite"
+      path="M 0,0 L 203,0 L 406,0 L 609,0 L 812,0"
+      keyPoints="0;0.25;0.5;0.75;1"
+      keyTimes="0;0.22;0.45;0.68;0.9"
+      calcMode="linear" />
+  </circle>
+</svg>

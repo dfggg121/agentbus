@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 232" width="920" height="232" role="img" aria-labelledby="title desc">
+  <title id="title">指针交接与正文复制对比</title>
+  <desc id="desc">一份 4 MB 资料原件留在本地磁盘，SQLite 只新增约 48 KB 元数据，任务信封 JSON 体积 2,025 B，领取方按 64 KB 阈值决定内联读取或按 resource_link 读盘，收工前重算哈希校验完整性。</desc>
+  <style>
+    .bg { fill: #f8f7f3; stroke: #d8d5cc; stroke-width: 1.5; }
+    .hdr { font: 600 14px "Microsoft YaHei", "PingFang SC", "Noto Sans SC", system-ui, -apple-system, sans-serif; fill: #1b1d22; }
+    .sub { font: 400 12px "Microsoft YaHei", "PingFang SC", "Noto Sans SC", system-ui, -apple-system, sans-serif; fill: #575a64; }
+    .box { fill: #ffffff; stroke: #c5c1b6; stroke-width: 1.5; }
+    .accent-box { fill: #fffaf2; stroke: #c47a1c; stroke-width: 1.5; }
+    .t1 { font: 600 13.5px "Microsoft YaHei", "PingFang SC", "Noto Sans SC", system-ui, -apple-system, sans-serif; fill: #1b1d22; }
+    .t2 { font: 400 12px "Microsoft YaHei", "PingFang SC", "Noto Sans SC", system-ui, -apple-system, sans-serif; fill: #4a4d57; }
+    .t2-mono { font: 400 11.5px ui-monospace, SFMono-Regular, Menlo, Consolas, "Microsoft YaHei", sans-serif; fill: #4a4d57; }
+    .t3 { font: 600 12px "Microsoft YaHei", "PingFang SC", "Noto Sans SC", system-ui, -apple-system, sans-serif; fill: #8a5a19; }
+    .line { fill: none; stroke: #8c887d; stroke-width: 1.5; }
+    .head { fill: #8c887d; }
+  </style>
+
+  <rect class="bg" x="1" y="1" width="918" height="230" rx="8" />
+  <text class="hdr" x="28" y="34">只传指针（uri + sha256），原文件留在磁盘</text>
+  <text class="sub" x="892" y="34" text-anchor="end">仓库实测：4 MB 资料 -&gt; 2,025 B 信封</text>
+
+  <g transform="translate(28,58)">
+    <rect class="box" width="250" height="142" rx="6" />
+    <text class="t1" x="16" y="30">本地磁盘（唯一原件）</text>
+    <text class="t2-mono" x="16" y="58">policy.bin  4,194,304 B</text>
+    <text class="t2-mono" x="16" y="82">sha256: 208aeaff5517...</text>
+    <text class="t3" x="16" y="116">每次交接新增副本：0 份</text>
+  </g>
+
+  <line class="line" x1="278" y1="129" x2="329" y2="129" />
+  <polygon class="head" points="329,125 335,129 329,133" />
+
+  <g transform="translate(335,58)">
+    <rect class="accent-box" width="250" height="142" rx="6" />
+    <text class="t1" x="16" y="30">任务信封 + SQLite</text>
+    <text class="t2" x="16" y="58">SQLite 数据库增量：约 48 KB</text>
+    <text class="t2" x="16" y="82">任务信封 JSON：2,025 B</text>
+    <text class="t3" x="16" y="116">refs[] 仅含 name / uri / sha256</text>
+  </g>
+
+  <line class="line" x1="585" y1="129" x2="636" y2="129" />
+  <polygon class="head" points="636,125 642,129 636,133" />
+
+  <g transform="translate(642,58)">
+    <rect class="box" width="250" height="142" rx="6" />
+    <text class="t1" x="16" y="30">领取方 agent 按需读盘</text>
+    <text class="t2" x="16" y="58">&lt;= 64 KB：直接返回正文</text>
+    <text class="t2" x="16" y="82">&gt;  64 KB：只给 resource_link</text>
+    <text class="t3" x="16" y="116">收工前重算哈希，漂移即拒收</text>
+  </g>
+</svg>

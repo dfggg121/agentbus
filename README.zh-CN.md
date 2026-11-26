@@ -1,17 +1,19 @@
 # agentbus
 
-`agentbus` 是给本机已有 coding agent 使用的任务总线。发活方先把资料就地登记，交出去的是一份很小的 JSON 信封（`tasks/<id>.json`），里面只写 `uri`、`sha256`、`goal` 和 `acceptance` 验收条款。领取方拿到租约后自己按地址读盘，卡住时可在任务内提问等待回复，交回产物后由总线重算哈希并逐条验收再关闭任务。
+> 完整版全中文项目简介见 [`docs/INTRO.zh-CN.md`](docs/INTRO.zh-CN.md)。
+
+`agentbus` 是给本机已有 coding agent 使用的轻量任务总线。发活方先把资料就地登记，交出去的是一份很小的 JSON 信封（`tasks/<id>.json`），里面只写 `uri`、`sha256`、`goal` 和 `acceptance` 验收条款。领取方拿到租约后自己按地址读盘，卡住时可在任务内提问等待回复，交回产物后由总线重算哈希并逐条验收再关闭任务。
 
 - 零第三方依赖，持久化使用 Node 内置的 `node:sqlite`。
 - 一个 MCP stdio 服务端（`conductor` 角色 15 个工具，`worker` 最小权限 9 个工具）外加同能力 CLI。
-- 通过 `agentbus setup` 接入 Codex、Claude Code、Gemini CLI、Antigravity、Cursor、OpenCode、Claude Desktop、Windsurf、Kiro、LM Studio、Cline、DeepSeek Harness (DSH) 与 Hermes Agent，不改变各客户端原本的界面。
+- 通过 `agentbus setup` 接入 Codex、Claude Code、Gemini CLI、Antigravity、Cursor、OpenCode、Claude Desktop、Windsurf、Kiro、LM Studio、Cline、DeepSeek Harness (DSH) 与 Hermes Agent，保留各客户端原本的界面。
 - 不复制资料正文：登记一个 4 MB 文件，SQLite 只增约 48 KB，任务信封体积 2,025 B。
 
 ## 一条任务的生命周期
 
-![agentbus 任务生命周期图：bus_register 登记指针、open 待领、claimed 持有 900 秒租约、question 与 answer 双向沟通、重算哈希与验收后进入 done](docs/assets/agentbus-task-loop.svg)
+![agentbus 任务生命周期中文图：bus_register 登记指针、open 待领、claimed 持有 900 秒租约、question 与 answer 双向沟通、重算哈希与验收后进入 done](docs/assets/agentbus-task-loop.zh.svg)
 
-流转顺序：`bus_register`（`uri + sha256`）-> `open`（`tasks/<id>.json`）-> `claimed`（`lease_token`，默认 900 秒租约，`heartbeat` 续租）-> `bus_task_message`（`question`/`blocked` 由主控 `answer` 解阻）-> `done`（重算全部引用哈希并跑 `acceptance`）。租约过期后任务回到 `open` 且 `attempt + 1`。静态兜底图见 [`docs/assets/agentbus-task-loop.png`](docs/assets/agentbus-task-loop.png)。
+流转顺序：`bus_register`（`uri + sha256`）-> `open`（`tasks/<id>.json`）-> `claimed`（`lease_token`，默认 900 秒租约，`heartbeat` 续租）-> `bus_task_message`（`question`/`blocked` 由主控 `answer` 解阻）-> `done`（重算全部引用哈希并跑 `acceptance`）。租约过期后任务回到 `open` 且 `attempt + 1`。静态兜底图见 [`docs/assets/agentbus-task-loop.zh.png`](docs/assets/agentbus-task-loop.zh.png)。
 
 ## 它和常见做法哪里不同
 
@@ -43,7 +45,7 @@
 | 4 MB 资料的副本数 | 每跳 1 份 | 0 |
 | 能否发现资料已过期 | 不能 | 能（`sha256` 不符直接拒绝收工） |
 
-![对比图：左侧磁盘单份原件、中间 2,025 B 指针信封与约 48 KB 数据库记录、右侧领取方按大小读盘并在收工时重算哈希](docs/assets/agentbus-pointer.svg)
+![对比图：左侧磁盘单份原件、中间 2,025 B 指针信封与约 48 KB 数据库记录、右侧领取方按大小读盘并在收工时重算哈希](docs/assets/agentbus-pointer.zh.svg)
 
 ---
 
