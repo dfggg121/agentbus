@@ -1,0 +1,358 @@
+# agentbus
+
+> 中文说明（默认）: [README.md](README.md)
+
+`agentbus` is a local task bus for coding agents you already run. The sender registers input files on disk and writes a small JSON envelope (`tasks/<id>.json`) holding `uri`, `sha256`, `goal`, and `acceptance` checks. The claiming agent acquires a lease, reads references straight from disk, asks questions in-task if blocked, and submits a result path whose hash and acceptance rules are verified before the task closes.
+
+- Zero third-party dependencies; storage runs on Node's built-in `node:sqlite`.
+- One MCP stdio server (`15` tools for `conductor`, `9` least-privilege tools for `worker`) plus a matching CLI.
+- Works alongside Codex, Claude Code, Gemini CLI, Antigravity, Cursor, OpenCode, Claude Desktop, Windsurf, Kiro, LM Studio, Cline, DeepSeek Harness (DSH), and Hermes Agent via `agentbus setup`.
+- Keeps payloads on disk: registering a 4 MB file adds about 48 KB to SQLite and leaves the task envelope at 2,025 B.
+
+## Task lifecycle
+
+![agentbus task lifecycle: bus_register pointer, open task, claimed with 900s lease, question and answer messages, and done after SHA-256 and acceptance verification](docs/assets/agentbus-task-loop.svg)
+
+Flow: `bus_register` (`uri + sha256`) -> `open` (`tasks/<id>.json`) -> `claimed` (`lease_token`, 900 s TTL, `heartbeat`) -> `bus_task_message` (`question`/`blocked` answered by conductor) -> `done` (re-hash refs and check `acceptance`). Expired leases return the task to `open` with `attempt + 1`. Static fallback image: [`docs/assets/agentbus-task-loop.png`](docs/assets/agentbus-task-loop.png).
+
+## Where it differs from common multi-agent setups
+
+| Concern | Common prompt/package handoff | agentbus |
+|---|---|---|
+| Input files | Re-embeds files into each hop | Registers `uri + sha256` pointers; `bus_ref_read` inlines `<= 64 KB` and returns `resource_link` above that |
+| Task execution | Prompt sent, process exit treated as done | State machine `open -> claimed(lease) -> done \| failed` with 900 s TTL, `heartbeat`, and lazy expiry reclaim |
+| Stuck worker | Fails silently or restarts from scratch | `bus_task_message` sends `question` / `blocked` / `error` (sets `blocked_at`); conductor `answer` unblocks and wakes `bus_task_wait` |
+| Result checking | Trusts agent text output | `bus_task_complete` re-hashes every ref (`drift` rejects by default) and checks `json`, `must_contain`, `min_bytes`, `fields` |
+| Agent integration | Custom SDK or agent wrapper required | Attaches to 13 existing MCP clients via `agentbus setup` and `AGENTBUS_ROLE` |
+| Module ownership | Hidden inside chat history | `agentbus ui` serves a loopback-only board of 14 modules with owner agent/model; creates conductor tasks without auto-dispatching |
+| Runtime footprint | Cloud broker or framework dependencies | Local `file://` URIs, SQLite WAL, zero npm runtime dependencies |
+
+## Module ownership dashboard (`agentbus ui`)
+
+`agentbus ui --port 0 --no-open --root <bus-root>` starts a loopback-only read-only view of the repository's 14 technical modules, their owning agent and configured model from local `agents.json`, and a side panel to queue `redo`, `optimize`, `adjust_model`, or `inspect` tasks for the conductor. Selecting modules builds the task envelope and preview first; actual execution only starts when `--dispatch` or the page checkbox is opted in (see [`docs/UI.md`](docs/UI.md)).
+
+![agentbus loopback UI showing module layers, owner agents and models, two selected modules, and the right-hand Conductor task preview](docs/assets/agentbus-ui.png)
+
+## Why pointers instead of copies
+
+If you run more than one coding agent, each handoff tends to recreate a task package carrying specs, logs, CSVs, and policy files. By the third hop, multiple copies exist on disk and none of them are verified against the source.
+
+`agentbus` keeps one copy on disk and passes a receipt: path, byte length, and SHA-256. Measured on the reference task in this repo:
+
+| | Task package (copy) | agentbus (pointer) |
+|---|---|---|
+| Envelope size | 4,195,256 B | **2,025 B** |
+| Copies of the 4 MB payload | one per hop | 0 |
+| Can detect a stale input | no | yes (`sha256` mismatch blocks completion) |
+
+![Diagram comparing single-copy disk storage with the 2,025 B pointer envelope and claimant verification](docs/assets/agentbus-pointer.svg)
+
+---
+
+## Install
+
+Requires **Node.js ≥ 22.13** (for `node:sqlite` without an experimental flag; Node 23.4+ also works).
+
+### Offline tarball (current supported path)
+
+The package is not published to npm yet. Build or receive `agentbus-mcp-<version>.tgz`, copy it to the target machine, then:
+
+```bash
+npm install -g ./agentbus-mcp-0.2.0.tgz
+agentbus setup --client codex
+```
+
+If you do not want a global install, install into a project-local prefix:
+
+```bash
+npm install --prefix ./agentbus-local ./agentbus-mcp-0.2.0.tgz
+./agentbus-local/node_modules/.bin/agentbus setup --client codex
+```
+
+`npx agentbus-mcp ...` only works after the package is published to npm; it is intentionally not the primary install path in this release.
+
+`setup` writes the MCP server entry into the client's config (with a timestamped backup) and prints what it touched. Supported ids (core + optional):
+
+```
+Core:     codex  claude  gemini  antigravity  cursor  opencode  claude-desktop
+Optional: windsurf  kiro  lmstudio  cline  dsh  hermes
+```
+
+Pick several at once, or set role & dispatch permissions:
+
+```bash
+agentbus setup --client codex --client claude --client gemini
+agentbus setup --client codex --role conductor --allow-dispatch
+agentbus setup --list   # id, label, format, config, installed, optional (read-only)
+agentbus doctor         # show what is configured
+agentbus clients        # ids only
+```
+
+Optional clients are skipped by default if not installed (no directories created); pass `--client <id>` explicitly to initialize them. Full automatic & manual client matrix (including Trae, Qoder, CodeBuddy, VS Code, Zed, OpenClaw): [`docs/CLIENTS.md`](docs/CLIENTS.md).
+
+By default the bus lives in `~/.agentbus` and only files inside it may be referenced. Pass `--allow` for the project you actually work in:
+
+```bash
+agentbus setup --client codex --root ~/.agentbus --allow ~/projects/my-app
+```
+
+Restart the client afterwards — MCP servers are loaded at startup.
+
+> Tip: a per-project bus works well too: `--root .agentbus --allow .`
+
+---
+
+## 60-second tour
+
+```bash
+# 1. register a file: metadata + hash only, never a copy
+agentbus put ./specs/report.md --by planner
+
+# 2. create a task for another agent, pointing at that hash
+agentbus new --to codex \
+  --goal "Build report.json following specs/report.md" \
+  --ref <sha256-from-step-1> \
+  --from planner \
+  --accept json=true --accept must_contain=total_kwh
+
+# 3. the other agent claims it and reads the reference itself
+agentbus claim <task-id> --by codex
+agentbus ref   <task-id> --name report.md     # text if small, resource_link if > 64 KB
+
+# 4. hand back a result; refs are re-hashed and acceptance rules enforced
+agentbus done <task-id> --by codex --lease <token> --result ./out/report.json
+```
+
+`done` fails if any referenced file changed since registration (`drift`), if an acceptance rule does not match, or if the lease does not belong to the caller. There is no "trust me, it's done" path.
+
+From an MCP-capable agent the same flow is four tool calls: `bus_register` → `bus_task_claim` → `bus_ref_read` → `bus_task_complete`.
+
+---
+
+## How it works
+
+```
+planner ──put──▶ artifacts(sha256, uri, bytes)        ← metadata only
+        └─new──▶ tasks/<id>.json  {goal, refs[], acceptance}
+                                 │
+                     MCP: bus_task_claim (lease)
+                                 ▼
+                        executor agent
+                     reads refs from disk itself
+                                 │  writes result file
+                                 ▼
+        bus_task_complete → re-hash refs → run acceptance → done
+```
+
+- **States**: `open → claimed(lease) → done | failed`. Expired leases return the task to `open` with `attempt + 1`.
+- **Leases**: 900 s default, renewable with `heartbeat`; every mutation checks the token.
+- **Idempotency**: `--key` makes task creation safe to retry.
+- **Pointer semantics**: `bus_ref_read` inlines only files up to 64 KB; larger ones return an MCP `resource_link` so the agent fetches them directly.
+- **Integrity**: SHA-256 is recomputed on read, on completion, and during `verify`.
+
+Protocol details: [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+
+---
+
+## MCP tools
+
+| Tool | Purpose |
+|---|---|
+| `bus_register` | Register a file by path; returns `sha256`, `uri`, `bytes` |
+| `bus_task_create` | Create a task from refs + acceptance (optional idempotency key) |
+| `bus_task_claim` | Claim a task, receive a lease token and the full goal/refs/acceptance envelope |
+| `bus_task_heartbeat` | Extend a lease |
+| `bus_ref_read` | Read a reference (text, base64, or `resource_link` when large) |
+| `bus_task_complete` | Validate refs + acceptance, store the result hash, close the task |
+| `bus_task_fail` | Close a task as failed with a reason (and emit an `error` message) |
+| `bus_task_message` | Send in-task `note`/`progress`/`question`/`blocked`/`answer`/`error` messages |
+| `bus_task_inbox` | Read task messages (`for_agent`, `since_id`, `mark_read`) |
+| `bus_task_list` | List tasks (`state`, `to`, `limit`) |
+| `bus_verify` | Re-hash every ref and result; report drift |
+| `bus_task_dispatch` | **Opt-in**: start the target agent CLI for a task and wait for its result |
+| `bus_task_wait` | Wait for `done`/`failed` or a new `question`/`blocked`/`error` message |
+| `bus_task_run` | Create and dispatch in one call |
+
+### Active dispatch
+
+A task board needs someone to tell the other agent to pick work up. Dispatch removes that step: `bus_task_dispatch` (or `agentbus dispatch <id>`) starts the target agent's CLI, waits for it to claim/complete, and returns the result hash.
+
+```bash
+AGENTBUS_ENABLE_DISPATCH=1 agentbus dispatch <task-id> --cwd . --wait 600
+```
+
+It is off by default because it gives the bus the ability to start processes. Adapters ship for `codex`, `claude`, `gemini` and `antigravity`; anything else can be wired with `AGENTBUS_ADAPTER_<NAME>` (JSON `{command, args}` where `{prompt}` is substituted).
+
+Dispatch trusts the bus, not the child process: if the spawned agent exits without calling `bus_task_complete`, the result is `state=claimed`, not success.
+
+**Threads (session affinity).** `--thread <name>` keeps a conversation: the first run records the agent's session id, later tasks in the same thread resume it instead of starting cold. Codex's `exec resume` has no `--approve-for-me`, so resumed runs pass `--dangerously-bypass-approvals-and-sandbox` — see SECURITY.md before using threads.
+
+Antigravity's coordinates (`ANTIGRAVITY_LS_ADDRESS`, `ANTIGRAVITY_CSRF_TOKEN`) live only inside its own runtime. The adapter reads an exported session file first, then falls back to the running app's `daemon/hub_*.json`, which carries the CSRF token and the HTTP port. If neither is found, run this inside Antigravity's integrated terminal:
+
+```bash
+node <agentbus>/bin/bus.js agy-session --out <bus-root>/antigravity-session.json
+```
+
+The file is written 0600 and expires when the app restarts. Note the port changes on every restart, so never hardcode it.
+
+Antigravity starts conversations asynchronously, so `dispatch` can return while the task is still `open`. Wait on the bus instead of on the child process:
+
+```bash
+agentbus wait <task-id> --timeout 900
+```
+
+Web dashboard for module ownership and rework requests:
+
+```bash
+agentbus ui --port 0 --no-open --root var/main
+```
+
+It binds loopback only, shows the technical modules with their owning agent/model, and lets you select a subset to send a redo/optimize/reassign-model request to the conductor. Default is task creation only; add `--dispatch` or tick the page checkbox to start the conductor dispatch. See [`docs/UI.md`](docs/UI.md).
+
+For a host that should be woken after completion, use `watch` (one process, one task, read-only, default 5s interval):
+
+```bash
+agentbus watch <task-id> --interval 5 --timeout 3600
+# done -> 0, failed/blocked/lease-expired -> 1, timeout -> 3
+# dispatch --watch keeps the dispatcher alive until the same final state
+```
+
+`watch` always prints one JSON line and has no TTY/readline dependency. It does not start a daemon and only performs a primary-key task lookup. A host can run it as a supervised background process and notify on exit.
+
+Before wiring a new machine, run the read-only preflight:
+
+```bash
+agentbus doctor --bootstrap --root ~/.agentbus --json
+```
+
+It checks Node/sqlite, the bus root, allowed roots, `agents.json`, client binaries, optional Antigravity CDP, and stale MCP processes; it never edits configs or kills processes.
+
+### Onboarding: detect agents, split roles
+
+```bash
+agentbus onboard --conductor codex --allow /path/to/workspace
+```
+
+It scans PATH and known install locations for Codex, Claude Code, Gemini CLI, Antigravity and OpenCode, picks one **conductor** (can create/dispatch/verify) and writes the rest as **worker**. It then asks which model each agent should default to and stores the answers in `agents.json` in the bus root (git-ignored), and rewrites each client's MCP config with `AGENTBUS_ROLE`.
+
+Roles are enforced, not cosmetic: a worker's `tools/list` returns only 8 tools (`register` / `claim` / `heartbeat` / `ref_read` / `complete` / `fail` / `message` / `inbox`), and calling `bus_task_create` or `bus_task_dispatch` is rejected — a dispatched agent cannot dispatch further. Unknown `AGENTBUS_ROLE` values also fall back to `worker`.
+
+Model choices stay local: the repo ships the ask/store/apply mechanism, never anybody's preferences.
+
+### Health cooldown
+
+When an agent fails because of upstream capacity (e.g. `503 No capacity available`), the bus records a cooldown (900s for capacity, 120s otherwise). `dispatch` then returns `skipped: true` with the expiry instead of waiting; pass `--force` to retry anyway. One success clears it.
+
+### Concurrency and latency
+
+- **Fan-out in one call**: `agentbus dispatch <id1> <id2> ...` or MCP `bus_task_dispatch {ids:[...]}`. Wall time is the slowest task. Measured with three tasks: 2,899ms one-by-one vs 910ms fan-out (3.2×).
+- **`bus_task_run`** creates and dispatches in one round-trip.
+- **MCP dispatch returns within 3s** instead of blocking 20s; follow with `bus_task_wait`, and the conductor is free to start other work meanwhile.
+- **Session affinity**: a second task on the same `--thread` resumes the recorded session instead of re-reading context (measured 63.9s → 49.5s).
+- **Polling**: 150ms for the first 8 seconds, backing off to 400ms. Pure protocol overhead is ~0.19s per dispatch (825ms end-to-end with a 300ms fake agent, minus the agent's own two CLI calls).
+
+Model inference dominates, not the bus: Codex 45.5s, Antigravity 30s — communication overhead is under 1%. For speed, fan out, reuse sessions, pick the right model.
+
+### Session reuse and limits
+
+- **A task's retries share one conversation**: the `threads` table records `task:<id>` automatically, and the row is cleared once the task reaches `done`/`failed`.
+- **Cross-task reuse is per-client**: `antigravity` is disabled by default (it replays the whole history; measured 36.6s → 78.8s). Passing `--thread` does not error — it means "fresh conversation + `context@1` ledger handoff". `codex` may `exec resume` (measured 63.9s → 49.5s).
+- **Limits**: antigravity 20 steps / 1h / 30m idle / 3 uses; codex 60 / 2h / 30m / 6. Override with `AGENTBUS_AGY_MAX_STEPS` or `AGENTBUS_THREAD_LIMITS_JSON`.
+- **Scope checks**: a mismatch in `cwd`, `model`, or `last_ok` forces a fresh conversation; fast failures, model failures, and empty conversations are never persisted; a fallback model never inherits the failed session.
+- **Steps are never hard-coded to 0**: antigravity reads its conversation DB, codex reads JSONL/stdout, otherwise 8 steps per use (`step_source` records which).
+
+### Thread ledger `context@1`
+
+`--thread <name>` maintains a ≤8KB ledger at `<busRoot>/contexts/<name>.json`: `contract_refs`, `decisions`, `latest_artifacts`, `avoid`. Only `done` writes artifacts and proposals; failures only append to `avoid`. Decisions are `proposed`/`confirmed`, and a decision takes effect only after a **different** agent confirms it. Fresh conversations receive one pointer line — payload never enters the task envelope.
+
+### Archiving conversations
+
+```
+agentbus archive --title-contains <taskid>          # only allowed when task state === done
+agentbus archive --title-contains <taskid> --dry-run
+agentbus archive <conversation-id> --port 9222 --force
+agentbus archive --title-prefix <prefix> --force    # manual batch cleanup only
+agentbus onboard --archive-on-done                  # persistent, stored in agents.json
+AGENTBUS_ARCHIVE_ON_DONE=1                          # one-off, for this process only
+```
+
+**Task-state guard (default)**: By default `archive` only allows `--title-contains <taskid>` when the matching task has `state === 'done'`. Non-`done` tasks are rejected with `task_not_done` (exit code `2`) before touching CDP, and unknown IDs are rejected with `not_a_task` (exit code `1`). `--title-prefix` (`title_prefix_requires_force`) and bare `<conversation-id>` (`conversation_id_requires_force`) are also rejected unless `--force` is explicitly passed. `--dry-run` stays read-only and may be run on active tasks to inspect `task_id`, `task_state`, and `would_archive` without clicking. `--force` is strictly for manual cleanup of stale or stuck conversations (adds `forced: true`) — forcing an active task only hides its sidebar entry while the task keeps running in the background.
+
+Drives the sidebar `归档对话` button over CDP. The app must be started with `--remote-debugging-port=<n>`; otherwise the command fails loudly instead of pretending. Auto-archive runs once on final `done` inside the process that completes the task (CLI `done` or MCP `bus_task_complete`), so it still fires after the dispatcher has exited. It matches every conversation titled `agentbus MM-DD <taskid>`, retries up to 6 times while the sidebar renders, and correlates portalled buttons by row center. A miss only appends `row_not_found`; other conversations are never touched.
+
+### Model fallback
+
+If the configured model fails (`model_not_found`, `not supported`, `503 No capacity`), dispatch walks a candidate list: configured value → `AGENTBUS_FALLBACK_MODELS` (comma-separated) → the agent's known models → no model (CLI default). Each attempt gets at most 120s; model errors abort the wait immediately and move on. The result's `attempts` array records every model tried.
+
+---
+
+## Security model
+
+- No network listener by default (stdio MCP). Optional HTTP mode binds `127.0.0.1` only.
+- Reference paths must resolve inside `AGENTBUS_ALLOWED_ROOTS`. Symlinks and Windows junctions are resolved with `realpath` first, so escapes are rejected.
+- Payloads are never stored in the database — only `uri`, `bytes`, `sha256`.
+- No shell, no arbitrary file write, no credential access.
+- Config edits made by `setup` are backed up as `<file>.bak-<timestamp>`.
+
+Details and reporting: [`SECURITY.md`](SECURITY.md).
+
+---
+
+## Compatibility
+
+| Client | Auto-config | Verified |
+|---|---|---|
+| OpenAI Codex CLI | `--client codex` | ✅ 2026-11 — full claim → complete loop |
+| Claude Code | `--client claude` | config only |
+| Gemini CLI | `--client gemini` | config only |
+| Google Antigravity | `--client antigravity` | ✅ 2026-11 — full claim → complete loop |
+| Cursor | `--client cursor` | config only |
+| OpenCode | `--client opencode` | config only |
+| Claude Desktop | `--client claude-desktop` | config only |
+| Windsurf | `--client windsurf` (optional) | config only |
+| Kiro | `--client kiro` (optional) | config only |
+| LM Studio | `--client lmstudio` (optional) | config only |
+| Cline (VS Code / CLI) | `--client cline` (optional) | config only |
+| DeepSeek Harness (DSH) | `--client dsh` (optional) | Cordis YAML block + parser check |
+| Hermes Agent | `--client hermes` (optional) | `hermes mcp add` + `mcp list` |
+
+> **Hermes config path:** `%LOCALAPPDATA%\hermes\config.yaml` on Windows (falling back to `%USERPROFILE%\.hermes\config.yaml`), `~/.hermes/config.yaml` on macOS/Linux, or `$HERMES_HOME/config.yaml` when `HERMES_HOME` is set.
+
+Any MCP client that speaks stdio JSON-RPC works; `setup` automates these 13 clients, and [`docs/CLIENTS.md`](docs/CLIENTS.md) covers manual setup for Trae, Qoder, CodeBuddy, VS Code, Zed, and OpenClaw as well as DSH/Hermes verification and rollback.
+
+---
+
+## Known limitations
+
+- **Same machine only.** References are `file://` URIs. Cross-machine handoff needs an HTTP-backed artifact store; the envelope shape would not change.
+- **CLI messages are currently Chinese.** English/localized messages are on the roadmap; MCP results are JSON and language-neutral.
+- **No background daemon.** Lease expiry is reclaimed lazily on the next read/write.
+- **Node ≥ 22.13 required** (Node 23.4+ also works), since SQLite comes from `node:sqlite`.
+- **Offline tarball first.** npm is not published yet; `npx agentbus-mcp` is not the supported install path. See [`docs/PORTABILITY.md`](docs/PORTABILITY.md) for the clean-machine checklist and per-layer limits.
+
+---
+
+## Related work
+
+| Project | What it does | How it differs |
+|---|---|---|
+| [turnbus](https://github.com/jgreen01/turnbus) | SQLite message bus + MCP; wakes idle agent turns | messaging and wakeups, not artifact handoff |
+| [multiagents](https://github.com/zetbrush/multiagents) | broker + orchestrator with roles and review loops | full team platform; agentbus is a thin bus |
+| [agentmesh](https://github.com/BlueHeisenberg/agentmesh) | LAN mesh, mDNS + mTLS | cross-machine messaging; agentbus is local and file-centric |
+| [A2A](https://github.com/a2aproject/A2A) | cross-vendor HTTP agent protocol | heavyweight for one machine; envelope fields map cleanly |
+
+`agentbus` deliberately does one thing: **make a handoff auditable without duplicating the payload.**
+
+---
+
+## Development
+
+```bash
+git clone https://github.com/dfggg121/agentbus.git
+cd agentbus
+node test/accept.mjs     # self-contained acceptance suite
+```
+
+The suite generates its own fixtures, spawns real CLI processes, opens the real SQLite database, and speaks real MCP over stdio. No test framework, no shell pipes (a piped exit code is a lie).
+
+MIT licensed. Contributions welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md).

@@ -66,7 +66,7 @@ agentbus ref   <task-id> --name report.md
 agentbus done <task-id> --by codex --lease <token> --result ./out/report.json
 ```
 
-在支持 MCP 的客户端内，对应工具调用为 `bus_register`、`bus_task_create`、`bus_task_claim`、`bus_ref_read` 与 `bus_task_complete`。完整安装矩阵与协议字段见 [`README.zh-CN.md`](../README.zh-CN.md) 与 [`PROTOCOL.md`](PROTOCOL.md)。
+在支持 MCP 的客户端内，对应工具调用为 `bus_register`、`bus_task_create`、`bus_task_claim`、`bus_ref_read` 与 `bus_task_complete`。完整安装矩阵与协议字段见 [`README.md`](../README.md) 与 [`PROTOCOL.md`](PROTOCOL.md)。
 
 ## 适用边界与限制
 

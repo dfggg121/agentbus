@@ -1,356 +1,372 @@
 # agentbus
 
-`agentbus` is a local task bus for coding agents you already run. The sender registers input files on disk and writes a small JSON envelope (`tasks/<id>.json`) holding `uri`, `sha256`, `goal`, and `acceptance` checks. The claiming agent acquires a lease, reads references straight from disk, asks questions in-task if blocked, and submits a result path whose hash and acceptance rules are verified before the task closes.
+> English: [README.en.md](README.en.md)
 
-- Zero third-party dependencies; storage runs on Node's built-in `node:sqlite`.
-- One MCP stdio server (`15` tools for `conductor`, `9` least-privilege tools for `worker`) plus a matching CLI.
-- Works alongside Codex, Claude Code, Gemini CLI, Antigravity, Cursor, OpenCode, Claude Desktop, Windsurf, Kiro, LM Studio, Cline, DeepSeek Harness (DSH), and Hermes Agent via `agentbus setup`.
-- Keeps payloads on disk: registering a 4 MB file adds about 48 KB to SQLite and leaves the task envelope at 2,025 B.
+> 完整版全中文项目简介见 [`docs/INTRO.zh-CN.md`](docs/INTRO.zh-CN.md)。
 
-## Task lifecycle
+`agentbus` 是给本机已有 coding agent 使用的轻量任务总线。发活方先把资料就地登记，交出去的是一份很小的 JSON 信封（`tasks/<id>.json`），里面只写 `uri`、`sha256`、`goal` 和 `acceptance` 验收条款。领取方拿到租约后自己按地址读盘，卡住时可在任务内提问等待回复，交回产物后由总线重算哈希并逐条验收再关闭任务。
 
-![agentbus task lifecycle: bus_register pointer, open task, claimed with 900s lease, question and answer messages, and done after SHA-256 and acceptance verification](docs/assets/agentbus-task-loop.svg)
+- 零第三方依赖，持久化使用 Node 内置的 `node:sqlite`。
+- 一个 MCP stdio 服务端（`conductor` 角色 15 个工具，`worker` 最小权限 9 个工具）外加同能力 CLI。
+- 通过 `agentbus setup` 接入 Codex、Claude Code、Gemini CLI、Antigravity、Cursor、OpenCode、Claude Desktop、Windsurf、Kiro、LM Studio、Cline、DeepSeek Harness (DSH) 与 Hermes Agent，保留各客户端原本的界面。
+- 不复制资料正文：登记一个 4 MB 文件，SQLite 只增约 48 KB，任务信封体积 2,025 B。
 
-Flow: `bus_register` (`uri + sha256`) -> `open` (`tasks/<id>.json`) -> `claimed` (`lease_token`, 900 s TTL, `heartbeat`) -> `bus_task_message` (`question`/`blocked` answered by conductor) -> `done` (re-hash refs and check `acceptance`). Expired leases return the task to `open` with `attempt + 1`. Static fallback image: [`docs/assets/agentbus-task-loop.png`](docs/assets/agentbus-task-loop.png).
+## 一条任务的生命周期
 
-## Where it differs from common multi-agent setups
+![agentbus 任务生命周期中文图：bus_register 登记指针、open 待领、claimed 持有 900 秒租约、question 与 answer 双向沟通、重算哈希与验收后进入 done](docs/assets/agentbus-task-loop.zh.svg)
 
-| Concern | Common prompt/package handoff | agentbus |
+流转顺序：`bus_register`（`uri + sha256`）-> `open`（`tasks/<id>.json`）-> `claimed`（`lease_token`，默认 900 秒租约，`heartbeat` 续租）-> `bus_task_message`（`question`/`blocked` 由主控 `answer` 解阻）-> `done`（重算全部引用哈希并跑 `acceptance`）。租约过期后任务回到 `open` 且 `attempt + 1`。静态兜底图见 [`docs/assets/agentbus-task-loop.zh.png`](docs/assets/agentbus-task-loop.zh.png)。
+
+## 它和常见做法哪里不同
+
+| 环节 | 常见 prompt / 任务包做法 | agentbus |
 |---|---|---|
-| Input files | Re-embeds files into each hop | Registers `uri + sha256` pointers; `bus_ref_read` inlines `<= 64 KB` and returns `resource_link` above that |
-| Task execution | Prompt sent, process exit treated as done | State machine `open -> claimed(lease) -> done \| failed` with 900 s TTL, `heartbeat`, and lazy expiry reclaim |
-| Stuck worker | Fails silently or restarts from scratch | `bus_task_message` sends `question` / `blocked` / `error` (sets `blocked_at`); conductor `answer` unblocks and wakes `bus_task_wait` |
-| Result checking | Trusts agent text output | `bus_task_complete` re-hashes every ref (`drift` rejects by default) and checks `json`, `must_contain`, `min_bytes`, `fields` |
-| Agent integration | Custom SDK or agent wrapper required | Attaches to 13 existing MCP clients via `agentbus setup` and `AGENTBUS_ROLE` |
-| Module ownership | Hidden inside chat history | `agentbus ui` serves a loopback-only board of 14 modules with owner agent/model; creates conductor tasks without auto-dispatching |
-| Runtime footprint | Cloud broker or framework dependencies | Local `file://` URIs, SQLite WAL, zero npm runtime dependencies |
+| 资料传递 | 每跳把全文或大段文本塞进 prompt | 只传 `uri + sha256` 指针；`bus_ref_read` 只内联 `<= 64 KB`，更大只给 `resource_link` |
+| 执行状态 | 发出 prompt 后子进程退出就算完成 | 状态机 `open -> claimed(lease) -> done \| failed`，带 900 秒租约、`heartbeat` 与过期回收 |
+| 遇阻沟通 | 靠日志猜测或重开一轮 | `bus_task_message` 发 `question` / `blocked` / `error`（置 `blocked_at`），主控 `answer` 清阻塞并唤醒 `bus_task_wait` |
+| 成果验收 | 默认相信 agent 嘴上说完成了 | `bus_task_complete` 重算每份引用哈希（`drift` 默认拒收），并核对 `json`、`must_contain`、`min_bytes`、`fields` |
+| 工具接入 | 需要套进特定框架或改写入口 | 通过 `agentbus setup` 写入 13 类现有 MCP 客户端配置，并用 `AGENTBUS_ROLE` 限制 worker 权限 |
+| 模块归属 | 散落在长对话历史里 | `agentbus ui` 提供仅绑 loopback 的 14 模块归属面板，勾选后先生成 conductor 任务（默认不自动派发） |
+| 运行依赖 | 依赖外部服务或框架包 | 本机 `file://` 地址 + SQLite WAL，零第三方运行时依赖 |
 
-## Module ownership dashboard (`agentbus ui`)
+## 模块归属面板（`agentbus ui`）
 
-`agentbus ui --port 0 --no-open --root <bus-root>` starts a loopback-only read-only view of the repository's 14 technical modules, their owning agent and configured model from local `agents.json`, and a side panel to queue `redo`, `optimize`, `adjust_model`, or `inspect` tasks for the conductor. Selecting modules builds the task envelope and preview first; actual execution only starts when `--dispatch` or the page checkbox is opted in (see [`docs/UI.md`](docs/UI.md)).
+执行 `agentbus ui --port 0 --no-open --root <bus-root>` 会启动一个只监听 loopback 的只读面板，按技术分层列出 14 个模块的负责人与本地 `agents.json` 解析出的工作模型。勾选模块并在右侧选定动作（重做、深度优化、调整工作模型、只检查）后，默认只把调度任务写入总线；需要立即派发时再加 `--dispatch` 或勾选页面开关（详见 [`docs/UI.md`](docs/UI.md)）。
 
-![agentbus loopback UI showing module layers, owner agents and models, two selected modules, and the right-hand Conductor task preview](docs/assets/agentbus-ui.png)
+![agentbus 本机模块归属面板真实截图，左侧展示分层模块与负责人模型，已勾选 store 与 tasks 两个模块，右侧展示 Conductor 调度任务摘要预览](docs/assets/agentbus-ui.png)
 
-## Why pointers instead of copies
+## 为什么传指针而不复制正文
 
-If you run more than one coding agent, each handoff tends to recreate a task package carrying specs, logs, CSVs, and policy files. By the third hop, multiple copies exist on disk and none of them are verified against the source.
+同时用多个 coding agent 时，常见做法是每次交接都把规格、日志、CSV 和策略文件重新打包进下一轮上下文。转手三次之后，盘上出现多份副本，谁也不知道哪份还是最新的。
 
-`agentbus` keeps one copy on disk and passes a receipt: path, byte length, and SHA-256. Measured on the reference task in this repo:
+`agentbus` 只在原处保留一份文件，传递的是一张收据（路径、字节数、SHA-256）。本仓库参考任务的实测数据：
 
-| | Task package (copy) | agentbus (pointer) |
+| | 任务包（复制） | agentbus（指针） |
 |---|---|---|
-| Envelope size | 4,195,256 B | **2,025 B** |
-| Copies of the 4 MB payload | one per hop | 0 |
-| Can detect a stale input | no | yes (`sha256` mismatch blocks completion) |
+| 信封体积 | 4,195,256 B | **2,025 B** |
+| 4 MB 资料的副本数 | 每跳 1 份 | 0 |
+| 能否发现资料已过期 | 不能 | 能（`sha256` 不符直接拒绝收工） |
 
-![Diagram comparing single-copy disk storage with the 2,025 B pointer envelope and claimant verification](docs/assets/agentbus-pointer.svg)
+![对比图：左侧磁盘单份原件、中间 2,025 B 指针信封与约 48 KB 数据库记录、右侧领取方按大小读盘并在收工时重算哈希](docs/assets/agentbus-pointer.zh.svg)
 
 ---
 
-## Install
+## 安装
 
-Requires **Node.js ≥ 22.13** (for `node:sqlite` without an experimental flag; Node 23.4+ also works).
+需要 **Node.js ≥ 22.13**（`node:sqlite` 无需实验 flag；Node 23.4+ 也可）。
 
-### Offline tarball (current supported path)
+### 离线 tarball（当前支持方式）
 
-The package is not published to npm yet. Build or receive `agentbus-mcp-<version>.tgz`, copy it to the target machine, then:
+包暂未发布到 npm。先在源机器执行 `npm pack` 得到 `agentbus-mcp-<version>.tgz`，拷到目标机器后：
 
 ```bash
 npm install -g ./agentbus-mcp-0.2.0.tgz
 agentbus setup --client codex
 ```
 
-If you do not want a global install, install into a project-local prefix:
+不想全局安装时，用项目内前缀：
 
 ```bash
 npm install --prefix ./agentbus-local ./agentbus-mcp-0.2.0.tgz
 ./agentbus-local/node_modules/.bin/agentbus setup --client codex
 ```
 
-`npx agentbus-mcp ...` only works after the package is published to npm; it is intentionally not the primary install path in this release.
+`npx agentbus-mcp ...` 只有在包正式发布到 npm 后才可用；本版本不把它作为主安装路径。
 
-`setup` writes the MCP server entry into the client's config (with a timestamped backup) and prints what it touched. Supported ids (core + optional):
+`setup` 会把 MCP 配置写进对应客户端的配置文件（先做带时间戳的备份），并打印改了哪些文件。支持的 id（核心 + 可选）：
 
 ```
-Core:     codex  claude  gemini  antigravity  cursor  opencode  claude-desktop
-Optional: windsurf  kiro  lmstudio  cline  dsh  hermes
+核心: codex  claude  gemini  antigravity  cursor  opencode  claude-desktop
+可选: windsurf  kiro  lmstudio  cline  dsh  hermes
 ```
 
-Pick several at once, or set role & dispatch permissions:
+可以一次配多个，或指定角色与 dispatch 权限：
 
 ```bash
 agentbus setup --client codex --client claude --client gemini
 agentbus setup --client codex --role conductor --allow-dispatch
-agentbus setup --list   # id, label, format, config, installed, optional (read-only)
-agentbus doctor         # show what is configured
-agentbus clients        # ids only
+agentbus setup --list   # 看 id、label、format、路径、installed、optional；只读不写盘
+agentbus doctor         # 看当前配置状态
+agentbus clients        # 只列 id
 ```
 
-Optional clients are skipped by default if not installed (no directories created); pass `--client <id>` explicitly to initialize them. Full automatic & manual client matrix (including Trae, Qoder, CodeBuddy, VS Code, Zed, OpenClaw): [`docs/CLIENTS.md`](docs/CLIENTS.md).
+可选客户端未安装时默认跳过（不建目录）；显式传 `--client <id>` 才初始化。完整自动/手动矩阵（含 Trae / Qoder / CodeBuddy / VS Code / Zed / OpenClaw 及 DSH/Hermes 验证与回滚）：[`docs/CLIENTS.md`](docs/CLIENTS.md)。
 
-By default the bus lives in `~/.agentbus` and only files inside it may be referenced. Pass `--allow` for the project you actually work in:
+默认总线目录是 `~/.agentbus`，只有该目录下的文件能作为引用。实际项目请显式放行：
 
 ```bash
 agentbus setup --client codex --root ~/.agentbus --allow ~/projects/my-app
 ```
 
-Restart the client afterwards — MCP servers are loaded at startup.
+配完**重启客户端**才生效——MCP 服务是启动时加载的。
 
-> Tip: a per-project bus works well too: `--root .agentbus --allow .`
+> 也可以一个项目一条总线：`--root .agentbus --allow .`
 
 ---
 
-## 60-second tour
+## 一分钟跑通
 
 ```bash
-# 1. register a file: metadata + hash only, never a copy
+# 1. 登记文件：只存元数据与哈希，不复制
 agentbus put ./specs/report.md --by planner
 
-# 2. create a task for another agent, pointing at that hash
+# 2. 建任务，用哈希指向前一步的资料
 agentbus new --to codex \
-  --goal "Build report.json following specs/report.md" \
-  --ref <sha256-from-step-1> \
+  --goal "按 specs/report.md 产出 report.json" \
+  --ref <第1步输出的sha256> \
   --from planner \
   --accept json=true --accept must_contain=total_kwh
 
-# 3. the other agent claims it and reads the reference itself
+# 3. 对方领取，并按地址自己读资料
 agentbus claim <task-id> --by codex
-agentbus ref   <task-id> --name report.md     # text if small, resource_link if > 64 KB
+agentbus ref   <task-id> --name report.md     # 小文件给正文，>64KB 只给 resource_link
 
-# 4. hand back a result; refs are re-hashed and acceptance rules enforced
+# 4. 交回成果；总线重算引用哈希并逐条验收
 agentbus done <task-id> --by codex --lease <token> --result ./out/report.json
 ```
 
-`done` fails if any referenced file changed since registration (`drift`), if an acceptance rule does not match, or if the lease does not belong to the caller. There is no "trust me, it's done" path.
+以下任一情况 `done` 都会失败：引用文件被改过（`drift`）、验收条款不满足、租约不属于调用方。**没有"我说完成了就算完成"这条路。**
 
-From an MCP-capable agent the same flow is four tool calls: `bus_register` → `bus_task_claim` → `bus_ref_read` → `bus_task_complete`.
+在支持 MCP 的 agent 里，同样的流程是四个工具调用：`bus_register` → `bus_task_claim` → `bus_ref_read` → `bus_task_complete`。
 
 ---
 
-## How it works
+## 工作方式
 
 ```
-planner ──put──▶ artifacts(sha256, uri, bytes)        ← metadata only
+planner ──put──▶ artifacts(sha256, uri, bytes)        ← 只有元数据
         └─new──▶ tasks/<id>.json  {goal, refs[], acceptance}
                                  │
-                     MCP: bus_task_claim (lease)
+                     MCP: bus_task_claim（租约）
                                  ▼
-                        executor agent
-                     reads refs from disk itself
-                                 │  writes result file
+                          执行方 agent
+                     自己按地址读 refs
+                                 │  写出结果文件
                                  ▼
-        bus_task_complete → re-hash refs → run acceptance → done
+        bus_task_complete → 重算 refs 哈希 → 跑验收 → done
 ```
 
-- **States**: `open → claimed(lease) → done | failed`. Expired leases return the task to `open` with `attempt + 1`.
-- **Leases**: 900 s default, renewable with `heartbeat`; every mutation checks the token.
-- **Idempotency**: `--key` makes task creation safe to retry.
-- **Pointer semantics**: `bus_ref_read` inlines only files up to 64 KB; larger ones return an MCP `resource_link` so the agent fetches them directly.
-- **Integrity**: SHA-256 is recomputed on read, on completion, and during `verify`.
+- **状态**：`open → claimed(租约) → done | failed`；租约过期自动回 `open`，`attempt + 1`。
+- **租约**：默认 900 秒，可用 `heartbeat` 续期；任何写操作都校验 token。
+- **幂等**：`--key` 让建任务可以安全重试。
+- **指针语义**：`bus_ref_read` 只内联 ≤64KB 的文件，更大的返回 MCP `resource_link`，由 agent 自己去取。
+- **完整性**：读取时、收工前、`verify` 时三处都重算 SHA-256。
 
-Protocol details: [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+协议细节见 [`docs/PROTOCOL.md`](docs/PROTOCOL.md)。
 
 ---
 
-## MCP tools
+## MCP 工具
 
-| Tool | Purpose |
+| 工具 | 作用 |
 |---|---|
-| `bus_register` | Register a file by path; returns `sha256`, `uri`, `bytes` |
-| `bus_task_create` | Create a task from refs + acceptance (optional idempotency key) |
-| `bus_task_claim` | Claim a task, receive a lease token and the full goal/refs/acceptance envelope |
-| `bus_task_heartbeat` | Extend a lease |
-| `bus_ref_read` | Read a reference (text, base64, or `resource_link` when large) |
-| `bus_task_complete` | Validate refs + acceptance, store the result hash, close the task |
-| `bus_task_fail` | Close a task as failed with a reason (and emit an `error` message) |
-| `bus_task_message` | Send in-task `note`/`progress`/`question`/`blocked`/`answer`/`error` messages |
-| `bus_task_inbox` | Read task messages (`for_agent`, `since_id`, `mark_read`) |
-| `bus_task_list` | List tasks (`state`, `to`, `limit`) |
-| `bus_verify` | Re-hash every ref and result; report drift |
-| `bus_task_dispatch` | **Opt-in**: start the target agent CLI for a task and wait for its result |
-| `bus_task_wait` | Wait for `done`/`failed` or a new `question`/`blocked`/`error` message |
-| `bus_task_run` | Create and dispatch in one call |
+| `bus_register` | 按路径登记文件，返回 `sha256`/`uri`/`bytes` |
+| `bus_task_create` | 用 refs + 验收条款建任务（可带幂等键） |
+| `bus_task_claim` | 领取任务，拿到租约 token 与完整 goal / refs / acceptance 信封 |
+| `bus_task_heartbeat` | 续租 |
+| `bus_ref_read` | 读引用（正文 / base64 / 大文件只给 `resource_link`） |
+| `bus_task_complete` | 校验引用与验收、记录结果哈希、关闭任务 |
+| `bus_task_fail` | 以失败关闭并写明原因（同步写入 `error` 消息） |
+| `bus_task_message` | 任务内发送 `note` / `progress` / `question` / `blocked` / `answer` / `error` 消息 |
+| `bus_task_inbox` | 拉取任务消息收件箱（`for_agent` / `since_id` / `mark_read`） |
+| `bus_task_list` | 列任务（`state`/`to`/`limit`） |
+| `bus_verify` | 全量重算引用与结果哈希，报告漂移 |
+| `bus_task_dispatch` | **默认关闭**：主动唤起目标 agent 的 CLI 并等结果 |
+| `bus_task_wait` | 等总线进入终态或收到新的 `question`/`blocked`/`error` 消息 |
+| `bus_task_run` | 建任务并立刻派发 |
 
-### Active dispatch
+### 主动唤起（dispatch）
 
-A task board needs someone to tell the other agent to pick work up. Dispatch removes that step: `bus_task_dispatch` (or `agentbus dispatch <id>`) starts the target agent's CLI, waits for it to claim/complete, and returns the result hash.
+任务板需要有人去通知对方"来领活"。dispatch 把这一步去掉：`bus_task_dispatch`（或 `agentbus dispatch <id>`）直接起目标 agent 的 CLI，等它 claim/complete，然后返回结果哈希。
 
 ```bash
 AGENTBUS_ENABLE_DISPATCH=1 agentbus dispatch <task-id> --cwd . --wait 600
 ```
 
-It is off by default because it gives the bus the ability to start processes. Adapters ship for `codex`, `claude`, `gemini` and `antigravity`; anything else can be wired with `AGENTBUS_ADAPTER_<NAME>` (JSON `{command, args}` where `{prompt}` is substituted).
+默认关闭，因为这意味着总线获得了"起进程"的能力。内置 `codex` / `claude` / `gemini` / `antigravity` 四个适配器；其它 agent 用 `AGENTBUS_ADAPTER_<NAME>`（JSON `{command, args}`，`{prompt}` 会被替换）。
 
-Dispatch trusts the bus, not the child process: if the spawned agent exits without calling `bus_task_complete`, the result is `state=claimed`, not success.
+dispatch **只信总线，不信子进程**：子进程退出但没调 `bus_task_complete`，结果是 `state=claimed`，不算成功。
 
-**Threads (session affinity).** `--thread <name>` keeps a conversation: the first run records the agent's session id, later tasks in the same thread resume it instead of starting cold. Codex's `exec resume` has no `--approve-for-me`, so resumed runs pass `--dangerously-bypass-approvals-and-sandbox` — see SECURITY.md before using threads.
+**线程（会话亲和）**：`--thread <name>` 保持同一段对话——首轮记下 agent 的会话 id，同线程的后续任务会 resume 它，而不是从零开始。Codex 的 `exec resume` 没有 `--approve-for-me`，所以 resume 分支带 `--dangerously-bypass-approvals-and-sandbox`；用线程前先看 SECURITY.md。
 
-Antigravity's coordinates (`ANTIGRAVITY_LS_ADDRESS`, `ANTIGRAVITY_CSRF_TOKEN`) live only inside its own runtime. The adapter reads an exported session file first, then falls back to the running app's `daemon/hub_*.json`, which carries the CSRF token and the HTTP port. If neither is found, run this inside Antigravity's integrated terminal:
+Antigravity 的坐标（`ANTIGRAVITY_LS_ADDRESS`、`ANTIGRAVITY_CSRF_TOKEN`）只活在它自己的运行时里。适配器先读导出的会话文件，没有就回退到运行中应用的 `daemon/hub_*.json`（里面有 CSRF 令牌和 HTTP 端口）。两边都没有时，在它的集成终端里跑一次：
 
 ```bash
-node <agentbus>/bin/bus.js agy-session --out <bus-root>/antigravity-session.json
+node <agentbus>/bin/bus.js agy-session --out <总线根目录>/antigravity-session.json
 ```
 
-The file is written 0600 and expires when the app restarts. Note the port changes on every restart, so never hardcode it.
+文件按 0600 落盘，应用重启即失效。注意端口每次重启都会变，不要硬编码。
 
-Antigravity starts conversations asynchronously, so `dispatch` can return while the task is still `open`. Wait on the bus instead of on the child process:
+Antigravity 是异步起会话的，`dispatch` 可能在任务还 `open` 时就返回。这时等总线，不要等子进程：
 
 ```bash
 agentbus wait <task-id> --timeout 900
 ```
 
-Web dashboard for module ownership and rework requests:
+模块归属可视化面板：
 
 ```bash
 agentbus ui --port 0 --no-open --root var/main
 ```
 
-It binds loopback only, shows the technical modules with their owning agent/model, and lets you select a subset to send a redo/optimize/reassign-model request to the conductor. Default is task creation only; add `--dispatch` or tick the page checkbox to start the conductor dispatch. See [`docs/UI.md`](docs/UI.md).
+只绑定 loopback，展示技术模块及负责人/模型，可勾选一部分模块向 conductor 提交重做/优化/调整模型请求。默认只建任务；加 `--dispatch` 或在页面勾选“立即派给主 agent”才启动派发。详见 [`docs/UI.md`](docs/UI.md)。
 
-For a host that should be woken after completion, use `watch` (one process, one task, read-only, default 5s interval):
+如果宿主需要在任务完成后被自动唤醒，用 `watch`（单进程、单任务、只读、默认 5 秒一次）：
 
 ```bash
 agentbus watch <task-id> --interval 5 --timeout 3600
-# done -> 0, failed/blocked/lease-expired -> 1, timeout -> 3
-# dispatch --watch keeps the dispatcher alive until the same final state
+# done -> 0；failed/blocked/租约过期 -> 1；超时 -> 3
+# dispatch --watch 让派发进程一直活到同样的终态
 ```
 
-`watch` always prints one JSON line and has no TTY/readline dependency. It does not start a daemon and only performs a primary-key task lookup. A host can run it as a supervised background process and notify on exit.
+`watch` 只输出一行 JSON，不依赖 TTY/readline，不起 daemon，只做任务主键查询。宿主可以把它作为受监督的后台进程，退出时发通知。
 
-Before wiring a new machine, run the read-only preflight:
+新机器接线前先跑只读预检：
 
 ```bash
 agentbus doctor --bootstrap --root ~/.agentbus --json
 ```
 
-It checks Node/sqlite, the bus root, allowed roots, `agents.json`, client binaries, optional Antigravity CDP, and stale MCP processes; it never edits configs or kills processes.
+它会检查 Node/sqlite、总线根、allowed roots、`agents.json`、客户端二进制、可选的反重力 CDP、旧 MCP 进程；不会改配置、不会杀进程。
 
-### Onboarding: detect agents, split roles
+通过 MCP 调用时，`bus_task_dispatch` 最多阻塞 20 秒就返回（很多客户端对单次工具调用有超时），接着调 `bus_task_wait` 等总线即可——它只查状态、不起进程，可以放心长等。
+
+### 导入：探测本机 agent 并分角色（onboard）
+
+在一台新机器上，不用逐个手写配置：
 
 ```bash
 agentbus onboard --conductor codex --allow /path/to/workspace
 ```
 
-It scans PATH and known install locations for Codex, Claude Code, Gemini CLI, Antigravity and OpenCode, picks one **conductor** (can create/dispatch/verify) and writes the rest as **worker**. It then asks which model each agent should default to and stores the answers in `agents.json` in the bus root (git-ignored), and rewrites each client's MCP config with `AGENTBUS_ROLE`.
+它会：
 
-Roles are enforced, not cosmetic: a worker's `tools/list` returns only 8 tools (`register` / `claim` / `heartbeat` / `ref_read` / `complete` / `fail` / `message` / `inbox`), and calling `bus_task_create` or `bus_task_dispatch` is rejected — a dispatched agent cannot dispatch further. Unknown `AGENTBUS_ROLE` values also fall back to `worker`.
+1. 扫 PATH 与已知安装位置，列出本机装了哪些 agent（Codex / Claude Code / Gemini / Antigravity / OpenCode）
+2. 选一个 **conductor**（主 agent，能建任务、派活、验收），其余写成 **worker**
+3. 交互式询问每个 agent 主要用哪个模型（回车=默认），答案存进总线根目录的 `agents.json`（已在 .gitignore，不进仓库）
+4. 改写各家的 MCP 配置，注入 `AGENTBUS_ROLE`
 
-Model choices stay local: the repo ships the ask/store/apply mechanism, never anybody's preferences.
+角色不是摆设：worker 的 `tools/list` 只返回 8 个工具（`register` / `claim` / `heartbeat` / `ref_read` / `complete` / `fail` / `message` / `inbox`），调用 `bus_task_create` 或 `bus_task_dispatch` 会被直接拒绝；未知 `AGENTBUS_ROLE` 也回落为 `worker`。这样被派的 agent 没法自己再派活，避免回路。
 
-### Health cooldown
+模型只存本机：仓库里没有任何人的偏好值，只有"询问 + 存储 + 生效"这套机制。
 
-When an agent fails because of upstream capacity (e.g. `503 No capacity available`), the bus records a cooldown (900s for capacity, 120s otherwise). `dispatch` then returns `skipped: true` with the expiry instead of waiting; pass `--force` to retry anyway. One success clears it.
+### 健康冷却
 
-### Concurrency and latency
+某个 agent 因上游容量（例如 503 `No capacity available`）失败后，总线会给它记一段冷却（默认 900 秒，其它失败 120 秒）。冷却期内 `dispatch` 直接返回 `skipped: true` 并给出到期时间，不再干等；确认要重试加 `--force`。成功一次即清除。
 
-- **Fan-out in one call**: `agentbus dispatch <id1> <id2> ...` or MCP `bus_task_dispatch {ids:[...]}`. Wall time is the slowest task. Measured with three tasks: 2,899ms one-by-one vs 910ms fan-out (3.2×).
-- **`bus_task_run`** creates and dispatches in one round-trip.
-- **MCP dispatch returns within 3s** instead of blocking 20s; follow with `bus_task_wait`, and the conductor is free to start other work meanwhile.
-- **Session affinity**: a second task on the same `--thread` resumes the recorded session instead of re-reading context (measured 63.9s → 49.5s).
-- **Polling**: 150ms for the first 8 seconds, backing off to 400ms. Pure protocol overhead is ~0.19s per dispatch (825ms end-to-end with a 300ms fake agent, minus the agent's own two CLI calls).
+### 并发与延迟
 
-Model inference dominates, not the bus: Codex 45.5s, Antigravity 30s — communication overhead is under 1%. For speed, fan out, reuse sessions, pick the right model.
+- **一条命令并发派发**：`agentbus dispatch <id1> <id2> ...` 或 MCP `bus_task_dispatch {ids:[...]}`。墙钟时间取最慢的那个。实测三个任务：逐个派 2,899ms，一次并发 910ms（3.2×）。
+- **`bus_task_run`**：建任务并立刻派发，省掉 create→dispatch 一次往返。
+- **MCP 的 dispatch 3 秒内返回**（不再阻塞 20 秒），随后用 `bus_task_wait` 等总线；等待期间主 agent 可以继续派别的活。
+- **会话亲和**：同一 `--thread` 的第二轮走 `resume`，省掉重新读上下文的时间（实测 63.9s → 49.5s）。
+- **轮询**：前 8 秒 150ms 一次，之后退避到 400ms；协议本身的开销约 0.19 秒/次（用 300ms 的假 agent 实测 825ms，扣掉 agent 自身两次 CLI 调用）。
 
-### Session reuse and limits
+真正占时间的是模型推理，不是总线：实测 Codex 45.5s、Antigravity 30s，通信开销不到 1%。要更快就并发、复用会话、选对模型。
 
-- **A task's retries share one conversation**: the `threads` table records `task:<id>` automatically, and the row is cleared once the task reaches `done`/`failed`.
-- **Cross-task reuse is per-client**: `antigravity` is disabled by default (it replays the whole history; measured 36.6s → 78.8s). Passing `--thread` does not error — it means "fresh conversation + `context@1` ledger handoff". `codex` may `exec resume` (measured 63.9s → 49.5s).
-- **Limits**: antigravity 20 steps / 1h / 30m idle / 3 uses; codex 60 / 2h / 30m / 6. Override with `AGENTBUS_AGY_MAX_STEPS` or `AGENTBUS_THREAD_LIMITS_JSON`.
-- **Scope checks**: a mismatch in `cwd`, `model`, or `last_ok` forces a fresh conversation; fast failures, model failures, and empty conversations are never persisted; a fallback model never inherits the failed session.
-- **Steps are never hard-coded to 0**: antigravity reads its conversation DB, codex reads JSONL/stdout, otherwise 8 steps per use (`step_source` records which).
+### 会话复用与上限
 
-### Thread ledger `context@1`
+- **同一任务的重试只占一条会话**：`threads` 表自动记 `task:<id>`，重试时沿用同一会话；任务进入 `done`/`failed` 后该行自动清理。
+- **跨任务复用按客户端分策略**：`antigravity` 默认**禁止**（每轮重放全量历史，实测 36.6s→78.8s）；传 `--thread` 不会报错，而是"新开干净会话 + 用 `context@1` 账本接力"。`codex` 允许 `exec resume`（实测 63.9s→49.5s）。
+- **上限表**：antigravity 20 步 / 1h / 空闲 30m / 3 次；codex 60 步 / 2h / 30m / 6 次。可用 `AGENTBUS_AGY_MAX_STEPS` 或 `AGENTBUS_THREAD_LIMITS_JSON` 覆盖。
+- **作用域校验**：`cwd`、`model`、`last_ok` 任一不匹配就换新；秒败/模型失败/空对话不写表；降级模型切换不继承失败会话。
+- **步数不再写死 0**：antigravity 读会话库、codex 读 JSONL/stdout、都没有则按每次 8 步估算（`step_source` 会写明来源）。
+- **标题带日期**：新会话标题形如 `agentbus 11-24 tmw…`。
 
-`--thread <name>` maintains a ≤8KB ledger at `<busRoot>/contexts/<name>.json`: `contract_refs`, `decisions`, `latest_artifacts`, `avoid`. Only `done` writes artifacts and proposals; failures only append to `avoid`. Decisions are `proposed`/`confirmed`, and a decision takes effect only after a **different** agent confirms it. Fresh conversations receive one pointer line — payload never enters the task envelope.
+### 线程账本 `context@1`
 
-### Archiving conversations
+`--thread <name>` 会在 `<busRoot>/contexts/<name>.json` 维护一份 ≤8KB 的账本：`contract_refs`、`decisions`、`latest_artifacts`、`avoid`。任务 `done` 才写产物与提议，失败只进 `avoid`；决策分 `proposed`/`confirmed`，必须由**另一个 agent** 确认才生效，未确认的提议不会顶掉已确认决策。新会话 prompt 只挂一行指针，正文仍不进任务信封。
+
+### 归档会话
 
 ```
-agentbus archive --title-contains <taskid>          # only allowed when task state === done
+agentbus archive --title-contains <taskid>          # 默认只允许归档 state=done 的任务
 agentbus archive --title-contains <taskid> --dry-run
 agentbus archive <conversation-id> --port 9222 --force
-agentbus archive --title-prefix <prefix> --force    # manual batch cleanup only
-agentbus onboard --archive-on-done                  # persistent, stored in agents.json
-AGENTBUS_ARCHIVE_ON_DONE=1                          # one-off, for this process only
+agentbus archive --title-prefix <prefix> --force    # 仅限人工清理旧会话
+agentbus onboard --archive-on-done                  # 持久开启：写进 agents.json，重启也生效
+AGENTBUS_ARCHIVE_ON_DONE=1                          # 单次运行临时开启
 ```
 
-**Task-state guard (default)**: By default `archive` only allows `--title-contains <taskid>` when the matching task has `state === 'done'`. Non-`done` tasks are rejected with `task_not_done` (exit code `2`) before touching CDP, and unknown IDs are rejected with `not_a_task` (exit code `1`). `--title-prefix` (`title_prefix_requires_force`) and bare `<conversation-id>` (`conversation_id_requires_force`) are also rejected unless `--force` is explicitly passed. `--dry-run` stays read-only and may be run on active tasks to inspect `task_id`, `task_state`, and `would_archive` without clicking. `--force` is strictly for manual cleanup of stale or stuck conversations (adds `forced: true`) — forcing an active task only hides its sidebar entry while the task keeps running in the background.
+**归档状态闸门（默认开启）**：默认只允许通过 `--title-contains <taskid>` 归档已完成（`state === 'done'`）的任务。若任务仍为 `open` / `claimed` 等未完成状态，会在调用 CDP 前直接拒绝并返回 `task_not_done`（退出码 `2`）；查无此任务返回 `not_a_task`（退出码 `1`）。`--title-prefix`（`title_prefix_requires_force`）与裸 `<conversation-id>`（`conversation_id_requires_force`）默认同样拒绝。`--dry-run` 允许对未完成任务做只读预览，输出 `task_id`、`task_state` 与 `would_archive` 且绝不点击。`--force` 仅限人工清理陈旧/卡死会话（返回带 `forced: true`）：对仍在运行的任务强行 `--force` 只会隐藏侧栏入口、不会停止任务本身，请谨慎使用。
 
-Drives the sidebar `归档对话` button over CDP. The app must be started with `--remote-debugging-port=<n>`; otherwise the command fails loudly instead of pretending. Auto-archive runs once on final `done` inside the process that completes the task (CLI `done` or MCP `bus_task_complete`), so it still fires after the dispatcher has exited. It matches every conversation titled `agentbus MM-DD <taskid>`, retries up to 6 times while the sidebar renders, and correlates portalled buttons by row center. A miss only appends `row_not_found`; other conversations are never touched.
+走 CDP 点击侧边栏的 `归档对话` 按钮；应用需以 `--remote-debugging-port=<n>` 启动，否则明确报错而不是假装成功。
 
-### Model fallback
+自动归档只在任务最终 `done` 时触发，由**完成任务的进程**执行（CLI `done` 或 MCP `bus_task_complete`），所以长任务即使派发进程早已退出也能归档。它按任务 id 匹配标题 `agentbus MM-DD <taskid>`，会把该任务因重试产生的重复会话一起归档；任务刚完成时侧边栏可能还没渲染出新行，会重试最多 6 次（约 10 秒）；按钮被 portal 到行外时按同一水平中心线关联标题。匹配不到只记 `row_not_found` 事件，不动其他对话，也不影响任务状态。
 
-If the configured model fails (`model_not_found`, `not supported`, `503 No capacity`), dispatch walks a candidate list: configured value → `AGENTBUS_FALLBACK_MODELS` (comma-separated) → the agent's known models → no model (CLI default). Each attempt gets at most 120s; model errors abort the wait immediately and move on. The result's `attempts` array records every model tried.
+### 模型自动降级
 
----
-
-## Security model
-
-- No network listener by default (stdio MCP). Optional HTTP mode binds `127.0.0.1` only.
-- Reference paths must resolve inside `AGENTBUS_ALLOWED_ROOTS`. Symlinks and Windows junctions are resolved with `realpath` first, so escapes are rejected.
-- Payloads are never stored in the database — only `uri`, `bytes`, `sha256`.
-- No shell, no arbitrary file write, no credential access.
-- Config edits made by `setup` are backed up as `<file>.bak-<timestamp>`.
-
-Details and reporting: [`SECURITY.md`](SECURITY.md).
+`agents.json` 指定的模型失败时（`model_not_found`、`not supported`、`503 No capacity`），dispatch 会按顺序换下一个候选：配置值 → `AGENTBUS_FALLBACK_MODELS`（逗号分隔）→ 该 agent 的已知模型表 → 不传模型（用 CLI 默认）。每次尝试最多等 120 秒，模型类错误会立即中止等待、直接换下一个。返回里的 `attempts` 会列出每个模型的结果。
 
 ---
 
-## Compatibility
+## 安全模型
 
-| Client | Auto-config | Verified |
+- 默认不监听任何端口（stdio MCP）；可选 HTTP 模式只绑 `127.0.0.1`。
+- 引用路径必须落在 `AGENTBUS_ALLOWED_ROOTS` 内；符号链接与 Windows Junction 先做 `realpath` 解析，越界一律拒绝。
+- 资料正文永不入库，库里只有 `uri`、`bytes`、`sha256`。
+- 不提供 shell、不写任意路径、不碰凭据。
+- `setup` 改配置前会备份为 `<file>.bak-<timestamp>`。
+
+详见 [`SECURITY.md`](SECURITY.md)。
+
+---
+
+## 兼容性
+
+| 客户端 | 自动配置 | 验证程度 |
 |---|---|---|
-| OpenAI Codex CLI | `--client codex` | ✅ 2026-11 — full claim → complete loop |
-| Claude Code | `--client claude` | config only |
-| Gemini CLI | `--client gemini` | config only |
-| Google Antigravity | `--client antigravity` | ✅ 2026-11 — full claim → complete loop |
-| Cursor | `--client cursor` | config only |
-| OpenCode | `--client opencode` | config only |
-| Claude Desktop | `--client claude-desktop` | config only |
-| Windsurf | `--client windsurf` (optional) | config only |
-| Kiro | `--client kiro` (optional) | config only |
-| LM Studio | `--client lmstudio` (optional) | config only |
-| Cline (VS Code / CLI) | `--client cline` (optional) | config only |
-| DeepSeek Harness (DSH) | `--client dsh` (optional) | Cordis YAML block + parser check |
-| Hermes Agent | `--client hermes` (optional) | `hermes mcp add` + `mcp list` |
+| OpenAI Codex CLI | `--client codex` | ✅ 2026-11，跑通完整 claim → complete |
+| Claude Code | `--client claude` | 仅验证配置写入 |
+| Gemini CLI | `--client gemini` | 仅验证配置写入 |
+| Google Antigravity | `--client antigravity` | ✅ 2026-11，跑通完整 claim → complete |
+| Cursor | `--client cursor` | 仅验证配置写入 |
+| OpenCode | `--client opencode` | 仅验证配置写入 |
+| Claude Desktop | `--client claude-desktop` | 仅验证配置写入 |
+| Windsurf | `--client windsurf`（可选） | 仅验证配置写入 |
+| Kiro | `--client kiro`（可选） | 仅验证配置写入 |
+| LM Studio | `--client lmstudio`（可选） | 仅验证配置写入 |
+| Cline (VS Code / CLI) | `--client cline`（可选） | 仅验证配置写入 |
+| DeepSeek Harness (DSH) | `--client dsh`（可选） | Cordis YAML 块 + 解析校验 |
+| Hermes Agent | `--client hermes`（可选） | `hermes mcp add` + `mcp list` |
 
-> **Hermes config path:** `%LOCALAPPDATA%\hermes\config.yaml` on Windows (falling back to `%USERPROFILE%\.hermes\config.yaml`), `~/.hermes/config.yaml` on macOS/Linux, or `$HERMES_HOME/config.yaml` when `HERMES_HOME` is set.
+> **Hermes 配置路径：** Windows 默认 `%LOCALAPPDATA%\hermes\config.yaml`（不存在时回退 `%USERPROFILE%\.hermes\config.yaml`），macOS/Linux 为 `~/.hermes/config.yaml`，设置 `HERMES_HOME` 时优先使用 `$HERMES_HOME/config.yaml`。
 
-Any MCP client that speaks stdio JSON-RPC works; `setup` automates these 13 clients, and [`docs/CLIENTS.md`](docs/CLIENTS.md) covers manual setup for Trae, Qoder, CodeBuddy, VS Code, Zed, and OpenClaw as well as DSH/Hermes verification and rollback.
-
----
-
-## Known limitations
-
-- **Same machine only.** References are `file://` URIs. Cross-machine handoff needs an HTTP-backed artifact store; the envelope shape would not change.
-- **CLI messages are currently Chinese.** English/localized messages are on the roadmap; MCP results are JSON and language-neutral.
-- **No background daemon.** Lease expiry is reclaimed lazily on the next read/write.
-- **Node ≥ 22.13 required** (Node 23.4+ also works), since SQLite comes from `node:sqlite`.
-- **Offline tarball first.** npm is not published yet; `npx agentbus-mcp` is not the supported install path. See [`docs/PORTABILITY.md`](docs/PORTABILITY.md) for the clean-machine checklist and per-layer limits.
+任何说 stdio JSON-RPC 的 MCP 客户端都能用；`setup` 自动化以上 13 家，Trae / Qoder / CodeBuddy / VS Code / Zed / OpenClaw 的手动步骤以及 DSH / Hermes 验证与回滚见 [`docs/CLIENTS.md`](docs/CLIENTS.md)。
 
 ---
 
-## Related work
+## 已知限制
 
-| Project | What it does | How it differs |
+- **仅限本机。** 引用是 `file://` 地址。跨机需要一层 HTTP 资料库，信封结构不用改。
+- **CLI 提示目前是中文。** 英文/多语言在路线图上；MCP 返回是 JSON，与语言无关。
+- **没有后台守护进程。** 租约过期在下一次读/写时惰性回收。
+- **要求 Node ≥ 22.13**（Node 23.4+ 也可），因为 SQLite 来自 `node:sqlite`。
+- **当前先走离线 tarball。** npm 尚未发布，`npx agentbus-mcp` 不是本版本支持的安装方式。干净机器清单和分层边界见 [`docs/PORTABILITY.md`](docs/PORTABILITY.md)。
+
+---
+
+## 与同类项目的关系
+
+| 项目 | 做什么 | 差异 |
 |---|---|---|
-| [turnbus](https://github.com/jgreen01/turnbus) | SQLite message bus + MCP; wakes idle agent turns | messaging and wakeups, not artifact handoff |
-| [multiagents](https://github.com/zetbrush/multiagents) | broker + orchestrator with roles and review loops | full team platform; agentbus is a thin bus |
-| [agentmesh](https://github.com/BlueHeisenberg/agentmesh) | LAN mesh, mDNS + mTLS | cross-machine messaging; agentbus is local and file-centric |
-| [A2A](https://github.com/a2aproject/A2A) | cross-vendor HTTP agent protocol | heavyweight for one machine; envelope fields map cleanly |
+| [turnbus](https://github.com/jgreen01/turnbus) | SQLite 消息总线 + MCP，能唤醒空闲会话 | 解决"消息与唤醒"，不解决"资料怎么给" |
+| [multiagents](https://github.com/zetbrush/multiagents) | broker + 编排器，带角色与评审循环 | 完整团队平台；agentbus 只是一条细总线 |
+| [agentmesh](https://github.com/BlueHeisenberg/agentmesh) | 局域网 mDNS + mTLS 组网 | 跨机通信；agentbus 是本机、以文件为中心 |
+| [A2A](https://github.com/a2aproject/A2A) | 跨厂商 HTTP 协议 | 单机场景偏重；信封字段可平滑映射 |
 
-`agentbus` deliberately does one thing: **make a handoff auditable without duplicating the payload.**
+`agentbus` 只做一件事：**让一次交接可审计，且不复制资料。**
 
 ---
 
-## Development
+## 开发
 
 ```bash
 git clone https://github.com/dfggg121/agentbus.git
 cd agentbus
-node test/accept.mjs     # self-contained acceptance suite
+node test/accept.mjs     # 自包含验收测试套件
 ```
 
-The suite generates its own fixtures, spawns real CLI processes, opens the real SQLite database, and speaks real MCP over stdio. No test framework, no shell pipes (a piped exit code is a lie).
+自验套件自己生成测试资料、起真实 CLI 进程、打开真实 SQLite、用真实 MCP stdio 通信。不用测试框架，也不用 shell 管道（管道会把退出码吞掉，等于自欺）。
 
-MIT licensed. Contributions welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+MIT 许可，欢迎提交——见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。

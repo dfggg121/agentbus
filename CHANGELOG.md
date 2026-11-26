@@ -23,6 +23,7 @@ All notable changes to this project are documented here. Format follows [Keep a 
 
 ### Docs
 - README now opens with the task-bus positioning, a lifecycle SVG, a sanitized UI screenshot, and a compact "where it differs" table; added `docs/COMMENT_POST.md` with a task-receipt style comment version.
+- Repository landing README is now Chinese (`README.md`); the previous English README moved to `README.en.md`, and the Chinese long-form intro remains at `docs/INTRO.zh-CN.md`. `README.zh-CN.md` is kept as a compatibility copy.
 - Added an all-Chinese project introduction at `docs/INTRO.zh-CN.md` with Chinese lifecycle/pointer SVGs; `README.zh-CN.md` links to it and uses the Chinese assets. The English README remains unchanged.
 
 ### Fixed
