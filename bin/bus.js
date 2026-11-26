@@ -21,7 +21,7 @@ import {
 } from '../src/tasks.js';
 import { startMcpStdio, startMcpHttp } from '../src/mcp.js';
 import { setupClients, doctor, doctorFix, doctorBootstrap, listClients, describeClients, defaultRoot } from '../src/setup.js';
-import { dispatchTask, dispatchEnabled, waitForTask, watchTask, maybeArchiveTask, checkArchiveGuard } from '../src/dispatch.js';
+import { dispatchTask, dispatchEnabled, waitForTask, watchTask, maybeArchiveTask, spawnDetachedArchiveTask, checkArchiveGuard } from '../src/dispatch.js';
 import { exportAgySession, defaultAgySessionPath, archiveConversation } from '../src/agy.js';
 import { loadContextLedger, confirmDecision } from '../src/context.js';
 import { detectAgents, readAgentConfig, writeAgentConfig } from '../src/agents.js';
@@ -472,7 +472,7 @@ async function main() {
           result_path: typeof args.result === 'string' ? args.result : null,
           fields: extraFields,
         });
-        await maybeArchiveTask(bus, result.doneResult?.id || result.id);
+        await spawnDetachedArchiveTask(bus, result.doneResult?.id || result.id);
         break;
       }
 
@@ -500,7 +500,7 @@ async function main() {
           fields: extraFields,
         });
         if (result.state === 'done') {
-          await maybeArchiveTask(bus, result.id);
+          await spawnDetachedArchiveTask(bus, result.id);
         }
         break;
       }
@@ -642,6 +642,15 @@ async function main() {
       case 'agy-session': {
         const out = typeof args.out === 'string' ? args.out : defaultAgySessionPath(bus.config.rootDir);
         result = exportAgySession(out);
+        break;
+      }
+
+      case 'archive-done': {
+        const taskId = args._[1];
+        if (!taskId) throw Object.assign(new Error('缺少任务 id: agentbus archive-done <task-id>'), { code: 1 });
+        const port = args.port !== undefined && args.port !== true ? args.port : null;
+        const payload = await maybeArchiveTask(bus, taskId, port !== null ? { port } : {});
+        result = payload || { ok: false, archived_count: 0, skipped: true, reason: 'ineligible_or_disabled' };
         break;
       }
 

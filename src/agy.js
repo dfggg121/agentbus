@@ -429,8 +429,8 @@ function buildArchiveEvalJs({ conversationId, titlePrefix, titleContains, dryRun
     const titlePrefix = ${JSON.stringify(titlePrefix || '')};
     const titleContains = ${JSON.stringify(titleContains || '')};
     const dryRun = ${dryRun ? 'true' : 'false'};
-    const aria = '归档对话';
-    const selector = 'button[aria-label="' + aria + '"]';
+    const selector = 'button[aria-label="归档对话"], button[aria-label="Archive conversation"]';
+    const stopSelector = 'button[aria-label="停止执行"], button[aria-label="Stop execution"], button[aria-label="Stop"]';
 
     // The archive button is not a descendant of the title node: it lives in a
     // sibling action wrapper. Match from the button side instead — each button
@@ -463,14 +463,21 @@ function buildArchiveEvalJs({ conversationId, titlePrefix, titleContains, dryRun
     // In current builds the action button is portalled outside the row, so the
     // ancestor-text lookup above finds only a time label ("2d") or nothing.
     // Associate each button with the sidebar title that shares its vertical center.
-    if (!btn) {
-      const leaves = Array.from(document.querySelectorAll('*'))
+    let leavesCache = null;
+    const getSidebarLeaves = () => {
+      if (leavesCache) return leavesCache;
+      leavesCache = Array.from(document.querySelectorAll('*'))
         .filter((n) => n.children.length === 0)
         .map((n) => {
           const r = n.getBoundingClientRect();
           return { text: (n.textContent || '').trim(), y: r.top + r.height / 2, left: r.left, width: r.width, height: r.height };
         })
         .filter((x) => x.text && x.width > 20 && x.height > 0 && x.left < 320);
+      return leavesCache;
+    };
+
+    if (!btn) {
+      const leaves = getSidebarLeaves();
       for (const b of Array.from(document.querySelectorAll(selector))) {
         const br = b.getBoundingClientRect();
         const cy = br.top + br.height / 2;
@@ -479,35 +486,71 @@ function buildArchiveEvalJs({ conversationId, titlePrefix, titleContains, dryRun
       }
     }
 
-    // Fallback: locate by data attribute, then map that row's title to its button.
-    if (!btn && convId) {
+    const findByConvId = () => {
+      if (!convId) return null;
       const attrNodes = Array.from(document.querySelectorAll('[data-conversation-id], [data-id], [href]'));
-      const hit = attrNodes.find((n) => {
+      return attrNodes.find((n) => {
         const vals = [
           n.getAttribute('data-conversation-id') || '',
           n.getAttribute('data-id') || '',
           n.getAttribute('href') || '',
         ];
         return vals.some((v) => v === convId || v.includes(convId));
-      });
-      if (hit) {
-        const hr = hit.getBoundingClientRect();
+      }) || null;
+    };
+
+    // Fallback: locate by data attribute / href (/c/<convId>), then map that row to its button.
+    let convHit = null;
+    if (!btn && convId) {
+      convHit = findByConvId();
+      if (convHit) {
+        const hr = convHit.getBoundingClientRect();
         const cy = hr.top + hr.height / 2;
-        let row = hit;
+        let row = convHit;
         for (let i = 0; i < 8 && row; i++) {
           const t = (row.innerText || '').trim();
-          if (t && t.length <= 250) { rowText = t; break; }
+          if (!rowText && t && t.length <= 250) rowText = t;
+          const directBtn = row.querySelector ? row.querySelector(selector) : null;
+          if (directBtn && row.tagName !== 'BODY' && row.tagName !== 'HTML') {
+            const rr = row.getBoundingClientRect();
+            if (rr.height <= 80) { btn = directBtn; break; }
+          }
           row = row.parentElement;
         }
-        const byY = Array.from(document.querySelectorAll(selector)).find((b) => {
-          const br = b.getBoundingClientRect();
-          return Math.abs((br.top + br.height / 2) - cy) <= 14;
-        });
-        if (byY) btn = byY;
+        if (!btn) {
+          const byY = Array.from(document.querySelectorAll(selector)).find((b) => {
+            const br = b.getBoundingClientRect();
+            return Math.abs((br.top + br.height / 2) - cy) <= 14;
+          });
+          if (byY) btn = byY;
+        }
       }
     }
 
+    // While a conversation turn is still executing, Antigravity renders a "停止执行"
+    // button in place of "归档对话". Distinguish that state from a missing row so
+    // the auto-archive poller knows the row is present and waiting for turn completion.
     if (!btn) {
+      const stopBtns = Array.from(document.querySelectorAll(stopSelector));
+      if (stopBtns.length > 0) {
+        let runningText = '';
+        for (const sb of stopBtns) {
+          const t = rowTextOf(sb);
+          if (matches(t)) { runningText = t; break; }
+          const sr = sb.getBoundingClientRect();
+          const scy = sr.top + sr.height / 2;
+          const leafHit = getSidebarLeaves().find((x) => Math.abs(x.y - scy) <= 14 && matches(x.text));
+          if (leafHit) { runningText = leafHit.text; break; }
+          if (convHit) {
+            const hr = convHit.getBoundingClientRect();
+            const hcy = hr.top + hr.height / 2;
+            if (Math.abs(hcy - scy) <= 14) { runningText = rowText || convId; break; }
+          }
+        }
+        if (runningText) {
+          return { ok: false, archived: false, conversation_id: convId || null, reason: 'row_running', row_text: runningText.slice(0, 120) };
+        }
+      }
       return { ok: false, archived: false, conversation_id: convId || null, reason: 'row_not_found' };
     }
     if (dryRun) {
@@ -528,9 +571,9 @@ function buildTitleRectJs({ conversationId, titlePrefix, titleContains }) {
     const matches = leaves.filter((n) => {
       const t = (n.textContent || '').trim();
       if (!t) return false;
-      if (convId) return t.includes(convId);
-      if (titlePrefix) return t.startsWith(titlePrefix);
-      if (titleContains) return t.includes(titleContains);
+      if (titlePrefix && t.startsWith(titlePrefix)) return true;
+      if (titleContains && t.includes(titleContains)) return true;
+      if (convId && t.includes(convId)) return true;
       return false;
     });
     if (!matches.length) return null;
@@ -560,9 +603,13 @@ export async function archiveConversation({ conversationId = null, port = null, 
   }
 
   const pages = (Array.isArray(targetList) ? targetList : [])
-    .filter((t) => t && t.type === 'page' && String(t.title || '').includes('Antigravity'));
-  const page = pages[0];
-  if (!page || !page.webSocketDebuggerUrl) {
+    .filter((t) => t && t.type === 'page' && String(t.title || '').includes('Antigravity') && t.webSocketDebuggerUrl)
+    .sort((a, b) => {
+      const aData = String(a.url || '').startsWith('data:') ? 1 : 0;
+      const bData = String(b.url || '').startsWith('data:') ? 1 : 0;
+      return aData - bData;
+    });
+  if (!pages.length) {
     throw Object.assign(
       new Error(`CDP 端口 ${cdpPort} 上未找到标题包含 Antigravity 的 page target`),
       { code: 1 }
@@ -570,65 +617,206 @@ export async function archiveConversation({ conversationId = null, port = null, 
   }
 
   const expr = buildArchiveEvalJs({ conversationId, titlePrefix, titleContains, dryRun });
-  try {
-    let result = await cdpEvaluate(page.webSocketDebuggerUrl, expr, 10000);
-    // The active row hides its action buttons until hovered. Move a real mouse
-    // over the title, then re-run the matcher so that row can still be archived.
-    if (result?.reason === 'row_not_found') {
-      const rect = await cdpEvaluate(page.webSocketDebuggerUrl, buildTitleRectJs({ conversationId, titlePrefix, titleContains }), 5000).catch(() => null);
-      if (rect && Number.isFinite(rect.x) && Number.isFinite(rect.y)) {
-        await cdpSend(page.webSocketDebuggerUrl, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: rect.x, y: rect.y }, 5000).catch(() => {});
-        await sleep(450);
-        result = await cdpEvaluate(page.webSocketDebuggerUrl, expr, 10000);
+  let runningResult = null;
+  let lastResult = null;
+  let lastError = null;
+
+  for (const page of pages) {
+    try {
+      let result = await cdpEvaluate(page.webSocketDebuggerUrl, expr, 10000);
+      // The active row hides its action buttons until hovered. Move a real mouse
+      // over the title, then re-run the matcher so that row can still be archived.
+      // Skip hovering when reason === 'row_running' because the row is visible and
+      // waiting for the turn to finish before the archive button is rendered.
+      if (result?.reason === 'row_not_found') {
+        const rect = await cdpEvaluate(page.webSocketDebuggerUrl, buildTitleRectJs({ conversationId, titlePrefix, titleContains }), 5000).catch(() => null);
+        if (rect && Number.isFinite(rect.x) && Number.isFinite(rect.y)) {
+          await cdpSend(page.webSocketDebuggerUrl, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: rect.x, y: rect.y }, 5000).catch(() => {});
+          await sleep(450);
+          result = await cdpEvaluate(page.webSocketDebuggerUrl, expr, 10000);
+        }
       }
+      if (!result || typeof result !== 'object') {
+        lastResult = { ok: false, archived: false, conversation_id: conversationId || null, reason: 'unexpected_cdp_result' };
+        continue;
+      }
+      if (result.ok) {
+        return result;
+      }
+      if (result.reason === 'row_running' && !runningResult) {
+        runningResult = result;
+      }
+      lastResult = result;
+    } catch (err) {
+      lastError = err;
     }
-    if (!result || typeof result !== 'object') {
-      return { ok: false, archived: false, conversation_id: conversationId || null, reason: 'unexpected_cdp_result' };
-    }
-    return result;
-  } catch (err) {
-    throw Object.assign(
-      new Error(`CDP 执行归档失败 (port=${cdpPort}): ${err.message}`),
-      { code: 1 }
-    );
   }
+
+  if (runningResult) return runningResult;
+  if (lastResult) return lastResult;
+  throw Object.assign(
+    new Error(`CDP 执行归档失败 (port=${cdpPort}): ${lastError?.message || 'unknown error'}`),
+    { code: 1 }
+  );
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Archive every sidebar row whose title contains the task id. Retries once after
-// a short delay because the sidebar can lag behind a freshly finished task; also
-// removes duplicate conversations left by earlier failed/parallel dispatches.
-export async function archiveTaskConversations({ taskId, port = null, dryRun = false, maxRows = 12, lagMs = 1500 } = {}) {
+function parseIntOpt(optVal, envVal, fallback, { min = 0 } = {}) {
+  const raw = optVal !== undefined && optVal !== null ? optVal : envVal;
+  if (raw !== undefined && raw !== null && String(raw).trim() !== '') {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= min) return Math.floor(n);
+  }
+  return fallback;
+}
+
+// Archive every sidebar row matching the finished task (by taskId in title and/or
+// snapshotted conversationId). Polls with a bounded retry budget until the row
+// appears and finishes its turn ("停止执行" -> "归档对话"), or times out cleanly.
+export async function archiveTaskConversations({
+  taskId,
+  conversationId = null,
+  port = null,
+  dryRun = false,
+  maxRows = 12,
+  lagMs,
+  retryIntervalMs,
+  maxWaitMs,
+  maxAttempts,
+  cdpMaxAttempts,
+} = {}) {
   if (!taskId) {
     throw Object.assign(new Error('archiveTaskConversations 需要 taskId'), { code: 1 });
   }
+  const effLagMs = parseIntOpt(lagMs, process.env.AGENTBUS_ARCHIVE_LAG_MS, 2500, { min: 0 });
+  const effRetryMs = parseIntOpt(retryIntervalMs, process.env.AGENTBUS_ARCHIVE_RETRY_MS, 2000, { min: 20 });
+  const effMaxWaitMs = parseIntOpt(maxWaitMs, process.env.AGENTBUS_ARCHIVE_TIMEOUT_MS, 45000, { min: 50 });
+  const effMaxAttempts = parseIntOpt(maxAttempts, process.env.AGENTBUS_ARCHIVE_MAX_ATTEMPTS, 15, { min: 1 });
+  const effCdpMaxAttempts = parseIntOpt(cdpMaxAttempts, process.env.AGENTBUS_ARCHIVE_CDP_RETRIES, 2, { min: 1 });
+
+  const startedAt = Date.now();
   let archived = 0;
-  const attempts = [];
-  await sleep(lagMs);
-  for (let i = 0; i < maxRows; i++) {
+  let probeAttempts = 0;
+  let cdpErrors = 0;
+  let lastMissReason = null;
+  const attemptLog = [];
+  const archivedRows = [];
+
+  if (effLagMs > 0) {
+    await sleep(effLagMs);
+  }
+
+  while (archived < maxRows) {
+    probeAttempts += 1;
     let res;
     try {
-      res = await archiveConversation({ titleContains: taskId, port, dryRun });
+      res = await archiveConversation({
+        titleContains: taskId,
+        conversationId: conversationId || null,
+        port,
+        dryRun,
+      });
     } catch (err) {
-      attempts.push({ ok: false, error: String(err?.message || err) });
-      return { ok: false, archived_count: archived, attempts };
+      cdpErrors += 1;
+      const errMsg = String(err?.message || err);
+      attemptLog.push({ attempt: probeAttempts, ok: false, error: errMsg });
+      const elapsed = Date.now() - startedAt;
+      if (cdpErrors >= effCdpMaxAttempts || probeAttempts >= effMaxAttempts || elapsed >= effMaxWaitMs) {
+        return {
+          ok: archived > 0,
+          archived_count: archived,
+          attempts: probeAttempts,
+          max_attempts: effMaxAttempts,
+          timed_out: false,
+          elapsed_ms: elapsed,
+          reason: archived > 0 ? null : 'cdp_unavailable',
+          error: errMsg,
+          attempt_log: attemptLog,
+          archived_rows: archivedRows,
+        };
+      }
+      await sleep(Math.min(effRetryMs, 1000));
+      continue;
     }
-    attempts.push(res);
+
+    cdpErrors = 0;
+    attemptLog.push({ attempt: probeAttempts, ...res });
+
     if (res?.ok && res.archived) {
       archived += 1;
+      if (res.row_text) archivedRows.push(res.row_text);
       await sleep(350);
       continue;
     }
-    if (res?.ok && dryRun) break;
-    if (res?.reason === 'row_not_found') {
-      // Give the renderer one chance to catch up, then treat "no row" as done.
-      if (i === 0) {
-        await sleep(2500);
-        continue;
-      }
+
+    if (res?.ok && dryRun) {
+      return {
+        ok: true,
+        archived_count: 0,
+        dry_run: true,
+        attempts: probeAttempts,
+        max_attempts: effMaxAttempts,
+        timed_out: false,
+        elapsed_ms: Date.now() - startedAt,
+        reason: null,
+        row_text: res.row_text || null,
+        attempt_log: attemptLog,
+        archived_rows: archivedRows,
+      };
     }
-    break;
+
+    if (res?.reason === 'row_not_found' && archived > 0) {
+      break;
+    }
+
+    if (res?.reason === 'row_not_found' || res?.reason === 'row_running') {
+      lastMissReason = res.reason;
+      const elapsed = Date.now() - startedAt;
+      if (probeAttempts >= effMaxAttempts || elapsed >= effMaxWaitMs) {
+        const timeoutReason = lastMissReason === 'row_running'
+          ? 'row_running_timeout'
+          : 'row_not_found_timeout';
+        return {
+          ok: archived > 0,
+          archived_count: archived,
+          attempts: probeAttempts,
+          max_attempts: effMaxAttempts,
+          timed_out: archived === 0,
+          elapsed_ms: elapsed,
+          reason: archived > 0 ? null : timeoutReason,
+          last_reason: lastMissReason,
+          attempt_log: attemptLog,
+          archived_rows: archivedRows,
+        };
+      }
+      const remaining = effMaxWaitMs - elapsed;
+      await sleep(Math.min(effRetryMs, Math.max(20, remaining)));
+      continue;
+    }
+
+    return {
+      ok: archived > 0,
+      archived_count: archived,
+      attempts: probeAttempts,
+      max_attempts: effMaxAttempts,
+      timed_out: false,
+      elapsed_ms: Date.now() - startedAt,
+      reason: archived > 0 ? null : (res?.reason || 'archive_failed'),
+      attempt_log: attemptLog,
+      archived_rows: archivedRows,
+    };
   }
-  return { ok: true, archived_count: archived, attempts };
+
+  return {
+    ok: archived > 0,
+    archived_count: archived,
+    attempts: probeAttempts,
+    max_attempts: effMaxAttempts,
+    timed_out: false,
+    elapsed_ms: Date.now() - startedAt,
+    reason: archived > 0 ? null : 'row_not_found_timeout',
+    attempt_log: attemptLog,
+    archived_rows: archivedRows,
+  };
 }

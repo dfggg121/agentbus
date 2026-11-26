@@ -1062,7 +1062,15 @@ export function completeTask(bus, { id, by, lease_token, result_path, fields = n
       });
     }
 
-    appendEvent(bus.db, row.id, 'complete', { by, result_sha256: resultSha, result_bytes: resStat.size });
+    const agyThread = bus.db.prepare(
+      "SELECT session_id FROM threads WHERE agent = 'antigravity' AND name = ?"
+    ).get(`task:${row.id}`);
+    appendEvent(bus.db, row.id, 'complete', {
+      by,
+      result_sha256: resultSha,
+      result_bytes: resStat.size,
+      ...(agyThread?.session_id ? { conversation_id: agyThread.session_id } : {}),
+    });
     clearTaskThreadByName(bus.db, `task:${row.id}`);
 
     const updated = bus.db.prepare('SELECT * FROM tasks WHERE id = ?').get(row.id);
@@ -1323,6 +1331,9 @@ export function recoverTask(bus, {
           drifted,
         });
       }
+      const agyThread = bus.db.prepare(
+        "SELECT session_id FROM threads WHERE agent = 'antigravity' AND name = ?"
+      ).get(`task:${row.id}`);
       appendEvent(bus.db, row.id, 'recover_adopt', {
         action: 'adopt',
         by: agent,
@@ -1333,6 +1344,7 @@ export function recoverTask(bus, {
         previous_state: row.state,
         result_sha256: resultSha,
         result_bytes: resStat.size,
+        ...(agyThread?.session_id ? { conversation_id: agyThread.session_id } : {}),
       });
       clearTaskThreadByName(bus.db, `task:${row.id}`);
     }

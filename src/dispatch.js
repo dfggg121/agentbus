@@ -16,7 +16,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { showTask, listTaskMessages, latestTaskMessageSeq, ATTENTION_MESSAGE_KINDS } from './tasks.js';
 import { defaultAgySessionPath, detectAgentApi, resolveAgySession, archiveTaskConversations } from './agy.js';
 import { modelFor, KNOWN_MODELS, readAgentConfig, resolveAgentBin } from './agents.js';
-import { appendEvent, openBusReadOnly, withImmediateTx } from './db.js';
+import { appendEvent, openBus, openBusReadOnly, withImmediateTx, PKG_ROOT } from './db.js';
 import {
   threadUsable,
   getThread,
@@ -378,28 +378,165 @@ export function checkArchiveGuard(bus, {
   };
 }
 
-// Auto-archive must run in the process that actually completes the task:
-// long async agents (Antigravity) often outlive the dispatcher that spawned them.
-export async function maybeArchiveTask(bus, taskId) {
+function resolveTaskConversationId(db, taskId) {
+  if (!db || !taskId) return null;
+  try {
+    const th = db.prepare(
+      "SELECT session_id FROM threads WHERE agent = 'antigravity' AND name = ?"
+    ).get(`task:${taskId}`);
+    if (th?.session_id) return String(th.session_id);
+  } catch {}
+  try {
+    const evt = db.prepare(
+      "SELECT payload_json FROM events WHERE task_id = ? AND event IN ('complete', 'recover_adopt') ORDER BY seq DESC LIMIT 1"
+    ).get(taskId);
+    if (evt?.payload_json) {
+      const parsed = JSON.parse(evt.payload_json);
+      if (parsed?.conversation_id) return String(parsed.conversation_id);
+    }
+  } catch {}
+  return null;
+}
+
+export function shouldAutoArchiveTask(bus, taskId, opts = {}) {
+  if (!bus || !taskId) return { eligible: false, row: null, conversationId: null };
   const row = bus.db.prepare('SELECT id, to_agent, state FROM tasks WHERE id = ?').get(taskId);
-  if (!row || row.state !== 'done' || row.to_agent !== 'antigravity') return null;
+  if (!row || row.state !== 'done' || row.to_agent !== 'antigravity') {
+    return { eligible: false, row: row || null, conversationId: null };
+  }
   const cfg = readAgentConfig(bus.config.rootDir);
-  const enabled = process.env.AGENTBUS_ARCHIVE_ON_DONE === '1' || cfg.archive_on_done === true;
-  if (!enabled) return null;
+  const enabled = opts.forceEnable === true || process.env.AGENTBUS_ARCHIVE_ON_DONE === '1' || cfg.archive_on_done === true;
+  if (!enabled) return { eligible: false, row, conversationId: null };
+  const conversationId = opts.conversationId ?? resolveTaskConversationId(bus.db, row.id);
+  return { eligible: true, row, conversationId };
+}
+
+function appendArchiveEventSafely(bus, rootDir, taskId, payload) {
+  try {
+    withImmediateTx(bus.db, () => appendEvent(bus.db, taskId, 'archive_on_done', payload));
+    return;
+  } catch {
+    // Caller may have closed bus.db while a background archive retry was in flight.
+  }
+  if (!rootDir) return;
+  let tmpBus = null;
+  try {
+    tmpBus = openBus({ rootOverride: rootDir });
+    withImmediateTx(tmpBus.db, () => appendEvent(tmpBus.db, taskId, 'archive_on_done', payload));
+  } catch (err) {
+    process.stderr.write(`[agentbus] archive_on_done event write failed (${taskId}): ${err?.message || err}\n`);
+  } finally {
+    if (tmpBus) tmpBus.close();
+  }
+}
+
+// Auto-archive must run after the task transitions to done, never on open/claimed
+// tasks. Polls until the Antigravity sidebar row finishes its turn ("停止执行" ->
+// "归档对话") or the bounded retry window expires, and records real attempts.
+export async function maybeArchiveTask(bus, taskId, opts = {}) {
+  const check = shouldAutoArchiveTask(bus, taskId, opts);
+  if (!check.eligible) return null;
+  const { row, conversationId } = check;
+  const rootDir = bus.config?.rootDir || null;
 
   let payload;
   try {
-    const res = await archiveTaskConversations({ taskId: row.id });
+    const res = await archiveTaskConversations({
+      taskId: row.id,
+      conversationId,
+      ...(opts.port !== undefined ? { port: opts.port } : {}),
+      ...(opts.lagMs !== undefined ? { lagMs: opts.lagMs } : {}),
+      ...(opts.retryIntervalMs !== undefined ? { retryIntervalMs: opts.retryIntervalMs } : {}),
+      ...(opts.maxWaitMs !== undefined ? { maxWaitMs: opts.maxWaitMs } : {}),
+      ...(opts.maxAttempts !== undefined ? { maxAttempts: opts.maxAttempts } : {}),
+      ...(opts.cdpMaxAttempts !== undefined ? { cdpMaxAttempts: opts.cdpMaxAttempts } : {}),
+    });
+    const archivedCount = Number(res?.archived_count ?? 0);
+    const ok = Boolean(res?.ok && archivedCount > 0);
     payload = {
-      archived_count: res?.archived_count ?? 0,
-      ok: Boolean(res?.ok && res?.archived_count > 0),
-      reason: res?.ok ? (res?.archived_count > 0 ? null : 'row_not_found') : (res?.attempts?.[0]?.error || 'archive_failed'),
+      archived_count: archivedCount,
+      ok,
+      attempts: Number(res?.attempts ?? 0),
+      ...(res?.max_attempts !== undefined ? { max_attempts: res.max_attempts } : {}),
+      ...(res?.elapsed_ms !== undefined ? { elapsed_ms: res.elapsed_ms } : {}),
+      ...(res?.timed_out ? { timed_out: true } : {}),
+      ...(conversationId ? { conversation_id: conversationId } : {}),
+      reason: ok ? null : (res?.reason || res?.error || 'archive_failed'),
+      ...(res?.error ? { error: res.error } : {}),
+      ...(res?.last_reason ? { last_reason: res.last_reason } : {}),
+      ...(Array.isArray(res?.archived_rows) && res.archived_rows.length ? { archived_rows: res.archived_rows } : {}),
     };
   } catch (err) {
-    payload = { archived_count: 0, ok: false, error: String(err?.message || err) };
+    payload = {
+      archived_count: 0,
+      ok: false,
+      attempts: 1,
+      ...(conversationId ? { conversation_id: conversationId } : {}),
+      reason: 'archive_error',
+      error: String(err?.message || err),
+    };
   }
-  withImmediateTx(bus.db, () => appendEvent(bus.db, row.id, 'archive_on_done', payload));
+  appendArchiveEventSafely(bus, rootDir, row.id, payload);
   return payload;
+}
+
+const PENDING_ARCHIVES = new Set();
+
+// Non-blocking background scheduler for long-lived processes (MCP server).
+// Returning from bus_task_complete immediately lets Antigravity finish its turn
+// and replace "停止执行" with "归档对话", after which the retry loop succeeds.
+export function scheduleArchiveTask(bus, taskId, opts = {}) {
+  const check = shouldAutoArchiveTask(bus, taskId, opts);
+  if (!check.eligible) return null;
+  const { row, conversationId } = check;
+  const job = Promise.resolve()
+    .then(() => maybeArchiveTask(bus, row.id, { ...opts, conversationId }))
+    .catch((err) => {
+      process.stderr.write(`[agentbus] background archive error (${row.id}): ${err?.message || err}\n`);
+      return null;
+    });
+  PENDING_ARCHIVES.add(job);
+  job.finally(() => {
+    PENDING_ARCHIVES.delete(job);
+  });
+  return { scheduled: true, task_id: row.id, conversation_id: conversationId, promise: job };
+}
+
+export async function waitForPendingArchives(timeoutMs = 15000) {
+  if (PENDING_ARCHIVES.size === 0) return;
+  const all = Promise.allSettled(Array.from(PENDING_ARCHIVES));
+  if (!timeoutMs || timeoutMs <= 0) {
+    await all;
+    return;
+  }
+  await Promise.race([all, sleep(timeoutMs)]);
+}
+
+// Non-blocking detached handoff for short-lived CLI commands (`agentbus done` / `recover`).
+export async function spawnDetachedArchiveTask(bus, taskId, opts = {}) {
+  const check = shouldAutoArchiveTask(bus, taskId, opts);
+  if (!check.eligible) return null;
+  if (process.env.AGENTBUS_ARCHIVE_SYNC === '1') {
+    return maybeArchiveTask(bus, check.row.id, { ...opts, conversationId: check.conversationId });
+  }
+  try {
+    const busBin = path.join(PKG_ROOT, 'bin', 'bus.js');
+    const child = spawn(
+      process.execPath,
+      [busBin, 'archive-done', check.row.id, '--root', bus.config.rootDir],
+      {
+        cwd: PKG_ROOT,
+        env: process.env,
+        stdio: 'ignore',
+        detached: true,
+        windowsHide: true,
+      }
+    );
+    child.unref();
+    return { scheduled: true, detached: true, pid: child.pid || null, task_id: check.row.id };
+  } catch {
+    return maybeArchiveTask(bus, check.row.id, { ...opts, conversationId: check.conversationId });
+  }
 }
 
 function isLeaseExpiredStalled(task) {

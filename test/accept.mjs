@@ -3938,6 +3938,334 @@ async function main() {
       /已退出|agy-session/.test(deadNoHubErr110) &&
       !deadNoHubErr110.includes('secret-old-tok'),
       `dead=${JSON.stringify({ addr: resDeadPid110.ls_address, r: resDeadPid110.stale_reason })} mismatch=${JSON.stringify({ addr: resMismatch110.ls_address, r: resMismatch110.stale_reason })} err=${deadNoHubErr110}`);
+
+    // 111-114. 自动归档重试/非阻塞/状态闸门/CDP 断开与恢复回归测试（纯本地 mock CDP，绝不触碰真实 Antigravity）
+    const { maybeArchiveTask: maybeArch111, scheduleArchiveTask: schedArch111, waitForPendingArchives: waitArch111 } = await import('../src/dispatch.js');
+    const { setThread: setThread111 } = await import('../src/threads.js');
+    const { completeTask: completeTask111 } = await import('../src/tasks.js');
+    const { handleJsonRpcMessage: handleRpc111 } = await import('../src/mcp.js');
+    const archRoot111 = path.join(RUN_BASE, 'arch_retry_111');
+    const archWork111 = path.join(RUN_BASE, 'arch_work_111');
+    fs.mkdirSync(archRoot111, { recursive: true });
+    fs.mkdirSync(archWork111, { recursive: true });
+    const archAllowed111 = [archRoot111, archWork111].join(path.delimiter);
+    runCli(['init'], { root: archRoot111, allowed: archAllowed111 });
+    fs.writeFileSync(path.join(archRoot111, 'agents.json'), JSON.stringify({
+      conductor: 'hermes',
+      models: { antigravity: 'gemini-4-neon' },
+      archive_on_done: true,
+    }), 'utf8');
+
+    const archMockState = {
+      behavior: 'delayed_appear', // 'delayed_appear' | 'always_miss' | 'multi_page'
+      evalCalls: 0,
+      pageCalls: {},
+      seenConvIds: [],
+      archivedOnce: false,
+    };
+
+    const archMockServer = httpMod.default.createServer((req, res) => {
+      if (req.url === '/json') {
+        const port = archMockServer.address().port;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        if (archMockState.behavior === 'multi_page') {
+          res.end(JSON.stringify([
+            { type: 'page', title: 'Antigravity - EmptyWindow', url: 'https://127.0.0.1:1/empty', webSocketDebuggerUrl: `ws://127.0.0.1:${port}/page/1` },
+            { type: 'page', title: 'Antigravity - MainSidebar', url: 'https://127.0.0.1:1/main', webSocketDebuggerUrl: `ws://127.0.0.1:${port}/page/2` },
+          ]));
+        } else {
+          res.end(JSON.stringify([
+            { type: 'page', title: 'Antigravity - RetryMock', url: 'https://127.0.0.1:1/main', webSocketDebuggerUrl: `ws://127.0.0.1:${port}/page/1` },
+          ]));
+        }
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    archMockServer.on('upgrade', (req, socket) => {
+      socket.on('error', () => {});
+      const pagePath = req.url || '/page/1';
+      const key = req.headers['sec-websocket-key'];
+      const accept = createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64');
+      socket.write(
+        'HTTP/1.1 101 Switching Protocols\r\n'
+        + 'Upgrade: websocket\r\n'
+        + 'Connection: Upgrade\r\n'
+        + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+      );
+      let acc = Buffer.alloc(0);
+      socket.on('data', (chunk) => {
+        acc = Buffer.concat([acc, chunk]);
+        while (acc.length >= 2) {
+          const opcode = acc[0] & 0x0f;
+          const len = acc[1] & 0x7f;
+          let offset = 2;
+          let payloadLen = len;
+          if (len === 126) {
+            if (acc.length < 4) return;
+            payloadLen = acc.readUInt16BE(2);
+            offset = 4;
+          } else if (len === 127) {
+            if (acc.length < 10) return;
+            payloadLen = Number(acc.readBigUInt64BE(2));
+            offset = 10;
+          }
+          const masked = (acc[1] & 0x80) !== 0;
+          const totalLen = offset + (masked ? 4 : 0) + payloadLen;
+          if (acc.length < totalLen) return;
+          const mask = masked ? acc.subarray(offset, offset + 4) : null;
+          const dataStart = masked ? offset + 4 : offset;
+          const data = Buffer.from(acc.subarray(dataStart, dataStart + payloadLen));
+          acc = acc.subarray(totalLen);
+          if (mask) {
+            for (let i = 0; i < data.length; i++) data[i] ^= mask[i % 4];
+          }
+          if (opcode === 0x8) {
+            try { socket.end(); } catch {}
+            return;
+          }
+          let reqMsg;
+          try { reqMsg = JSON.parse(data.toString('utf8')); } catch { continue; }
+          const expr = String(reqMsg?.params?.expression || '');
+          // Hover rect probe (buildTitleRectJs) returns null in mock
+          const isRectProbe = expr.includes('leaf.scrollIntoView') && !expr.includes('const dryRun');
+          let value = null;
+          if (!isRectProbe) {
+            archMockState.evalCalls += 1;
+            archMockState.pageCalls[pagePath] = (archMockState.pageCalls[pagePath] || 0) + 1;
+            const convMatch = expr.match(/const convId = ("[^"]*")/);
+            if (convMatch) {
+              try {
+                const parsedConv = JSON.parse(convMatch[1]);
+                if (parsedConv) archMockState.seenConvIds.push(parsedConv);
+              } catch {}
+            }
+            const tcMatch = expr.match(/const titleContains = ("[^"]*")/);
+            let tc = '';
+            if (tcMatch) {
+              try { tc = JSON.parse(tcMatch[1]); } catch {}
+            }
+            if (archMockState.behavior === 'delayed_appear') {
+              if (archMockState.evalCalls === 1) {
+                value = { ok: false, archived: false, conversation_id: null, reason: 'row_running', row_text: `agentbus 11-26 ${tc}` };
+              } else if (archMockState.evalCalls === 2) {
+                value = { ok: false, archived: false, conversation_id: null, reason: 'row_not_found' };
+              } else if (!archMockState.archivedOnce) {
+                archMockState.archivedOnce = true;
+                value = { ok: true, archived: true, conversation_id: null, row_text: `agentbus 11-26 ${tc}` };
+              } else {
+                value = { ok: false, archived: false, conversation_id: null, reason: 'row_not_found' };
+              }
+            } else if (archMockState.behavior === 'always_miss') {
+              value = { ok: false, archived: false, conversation_id: null, reason: 'row_not_found' };
+            } else if (archMockState.behavior === 'multi_page') {
+              if (pagePath === '/page/1') {
+                value = { ok: false, archived: false, conversation_id: null, reason: 'row_not_found' };
+              } else if (!archMockState.archivedOnce) {
+                archMockState.archivedOnce = true;
+                value = { ok: true, archived: true, conversation_id: null, row_text: `agentbus 11-26 ${tc}` };
+              } else {
+                value = { ok: false, archived: false, conversation_id: null, reason: 'row_not_found' };
+              }
+            }
+          }
+          const respBuf = Buffer.from(JSON.stringify({ id: reqMsg.id, result: { result: { value } } }), 'utf8');
+          const header = respBuf.length < 126
+            ? Buffer.from([0x81, respBuf.length])
+            : Buffer.from([0x81, 126, (respBuf.length >> 8) & 0xff, respBuf.length & 0xff]);
+          socket.write(Buffer.concat([header, respBuf]));
+        }
+      });
+    });
+    await new Promise((r) => archMockServer.listen(0, '127.0.0.1', r));
+    const archMockPort = archMockServer.address().port;
+
+    const prevArchEnv111 = {
+      AGENTBUS_ALLOWED_ROOTS: process.env.AGENTBUS_ALLOWED_ROOTS,
+      AGENTBUS_AGY_CDP_PORT: process.env.AGENTBUS_AGY_CDP_PORT,
+      AGENTBUS_ARCHIVE_LAG_MS: process.env.AGENTBUS_ARCHIVE_LAG_MS,
+      AGENTBUS_ARCHIVE_RETRY_MS: process.env.AGENTBUS_ARCHIVE_RETRY_MS,
+      AGENTBUS_ARCHIVE_TIMEOUT_MS: process.env.AGENTBUS_ARCHIVE_TIMEOUT_MS,
+      AGENTBUS_ARCHIVE_MAX_ATTEMPTS: process.env.AGENTBUS_ARCHIVE_MAX_ATTEMPTS,
+      AGENTBUS_ARCHIVE_CDP_RETRIES: process.env.AGENTBUS_ARCHIVE_CDP_RETRIES,
+    };
+    const bus111 = openBus({ rootOverride: archRoot111 });
+    bus111.config.allowedRoots = [archRoot111, archWork111];
+    try {
+      process.env.AGENTBUS_ALLOWED_ROOTS = archAllowed111;
+      process.env.AGENTBUS_AGY_CDP_PORT = String(archMockPort);
+      process.env.AGENTBUS_ARCHIVE_LAG_MS = '30';
+      process.env.AGENTBUS_ARCHIVE_RETRY_MS = '40';
+      process.env.AGENTBUS_ARCHIVE_TIMEOUT_MS = '3000';
+      process.env.AGENTBUS_ARCHIVE_MAX_ATTEMPTS = '6';
+      process.env.AGENTBUS_ARCHIVE_CDP_RETRIES = '1';
+
+      // 111. 侧栏行先 row_running 后 row_not_found 再延迟出现 -> MCP bus_task_complete 非阻塞返回、后台重试归档成功且保留 conversation_id 快照
+      const t111 = runCli(['new', '--to', 'antigravity', '--from', 'hermes', '--goal', 'archive-delayed-appear'], { root: archRoot111, allowed: archAllowed111 }).json?.id;
+      const c111 = runCli(['claim', t111, '--by', 'antigravity'], { root: archRoot111, allowed: archAllowed111 }).json;
+      setThread111(bus111, 'antigravity', `task:${t111}`, 'conv-snap-111', { cwd: archWork111, model: 'gemini-4-neon', steps: 2, stepSource: 'agy_db' });
+      const resFile111 = path.join(archWork111, 'res_111.json');
+      fs.writeFileSync(resFile111, JSON.stringify({ ok: true }), 'utf8');
+
+      const t111Start = Date.now();
+      const mcpComp111 = await handleRpc111(bus111, {
+        jsonrpc: '2.0',
+        id: 111,
+        method: 'tools/call',
+        params: {
+          name: 'bus_task_complete',
+          arguments: { id: t111, by: 'antigravity', lease_token: c111.lease_token, result_path: resFile111 },
+        },
+      });
+      const completeReturnMs111 = Date.now() - t111Start;
+      await waitArch111(5000);
+
+      const compEvt111 = bus111.db.prepare("SELECT payload_json FROM events WHERE task_id = ? AND event = 'complete' ORDER BY seq DESC LIMIT 1").get(t111);
+      const compPayload111 = compEvt111 ? JSON.parse(compEvt111.payload_json) : null;
+      const archEvt111 = bus111.db.prepare("SELECT payload_json FROM events WHERE task_id = ? AND event = 'archive_on_done' ORDER BY seq DESC LIMIT 1").get(t111);
+      const archPayload111 = archEvt111 ? JSON.parse(archEvt111.payload_json) : null;
+      const threadCleared111 = !bus111.db.prepare('SELECT 1 FROM threads WHERE name = ?').get(`task:${t111}`);
+
+      assertCase(111, '侧栏行延迟出现时 MCP bus_task_complete 非阻塞返回，后台重试最终归档成功并写入 attempts 与 conversation_id',
+        mcpComp111?.result?.structuredContent?.state === 'done' &&
+        completeReturnMs111 < 1000 &&
+        threadCleared111 &&
+        compPayload111?.conversation_id === 'conv-snap-111' &&
+        archPayload111?.ok === true &&
+        archPayload111?.archived_count === 1 &&
+        archPayload111?.attempts >= 3 &&
+        archPayload111?.conversation_id === 'conv-snap-111' &&
+        archMockState.seenConvIds.includes('conv-snap-111'),
+        `returnMs=${completeReturnMs111} comp=${JSON.stringify(compPayload111)} arch=${JSON.stringify(archPayload111)} convs=${JSON.stringify(archMockState.seenConvIds)}`);
+
+      // 112. row_not_found 超过重试上限 -> 事件记录真实 attempts、timed_out=true 与超时原因，绝不伪造成功
+      archMockState.behavior = 'always_miss';
+      archMockState.evalCalls = 0;
+      archMockState.archivedOnce = false;
+      const t112 = runCli(['new', '--to', 'antigravity', '--from', 'hermes', '--goal', 'archive-timeout-miss'], { root: archRoot111, allowed: archAllowed111 }).json?.id;
+      const c112 = runCli(['claim', t112, '--by', 'antigravity'], { root: archRoot111, allowed: archAllowed111 }).json;
+      const resFile112 = path.join(archWork111, 'res_112.json');
+      fs.writeFileSync(resFile112, JSON.stringify({ ok: true }), 'utf8');
+      completeTask111(bus111, { id: t112, by: 'antigravity', lease_token: c112.lease_token, result_path: resFile112 });
+      const missPayload112 = await maybeArch111(bus111, t112, {
+        port: archMockPort,
+        lagMs: 10,
+        retryIntervalMs: 25,
+        maxWaitMs: 3000,
+        maxAttempts: 4,
+      });
+      const missEvt112 = bus111.db.prepare("SELECT payload_json FROM events WHERE task_id = ? AND event = 'archive_on_done' ORDER BY seq DESC LIMIT 1").get(t112);
+      const missEvtPayload112 = missEvt112 ? JSON.parse(missEvt112.payload_json) : null;
+
+      assertCase(112, 'row_not_found 超过上限时 archive_on_done 记录真实 attempts、timed_out=true 和超时原因，不伪造成功',
+        missPayload112?.ok === false &&
+        missPayload112?.archived_count === 0 &&
+        missPayload112?.attempts === 4 &&
+        missPayload112?.timed_out === true &&
+        missPayload112?.reason === 'row_not_found_timeout' &&
+        missEvtPayload112?.ok === false &&
+        missEvtPayload112?.attempts === 4 &&
+        missEvtPayload112?.timed_out === true &&
+        missEvtPayload112?.reason === 'row_not_found_timeout',
+        `payload=${JSON.stringify(missPayload112)} evt=${JSON.stringify(missEvtPayload112)}`);
+
+      // 113. done 任务自动归档（含多 CDP page 回退），open/claimed 任务绝不归档且零 CDP 请求
+      archMockState.behavior = 'multi_page';
+      archMockState.evalCalls = 0;
+      archMockState.pageCalls = {};
+      archMockState.archivedOnce = false;
+      const tOpen113 = runCli(['new', '--to', 'antigravity', '--from', 'hermes', '--goal', 'archive-open-skip'], { root: archRoot111, allowed: archAllowed111 }).json?.id;
+      const tClaimed113 = runCli(['new', '--to', 'antigravity', '--from', 'hermes', '--goal', 'archive-claimed-skip'], { root: archRoot111, allowed: archAllowed111 }).json?.id;
+      runCli(['claim', tClaimed113, '--by', 'antigravity'], { root: archRoot111, allowed: archAllowed111 });
+
+      const openArch113 = await maybeArch111(bus111, tOpen113, { port: archMockPort, lagMs: 0 });
+      const claimedSched113 = schedArch111(bus111, tClaimed113, { port: archMockPort, lagMs: 0 });
+      const evalsAfterNonDone113 = archMockState.evalCalls;
+      const nonDoneEvtCount113 = bus111.db.prepare(
+        "SELECT COUNT(*) AS c FROM events WHERE task_id IN (?, ?) AND event = 'archive_on_done'"
+      ).get(tOpen113, tClaimed113)?.c ?? -1;
+
+      const tDone113 = runCli(['new', '--to', 'antigravity', '--from', 'hermes', '--goal', 'archive-done-multipage'], { root: archRoot111, allowed: archAllowed111 }).json?.id;
+      const cDone113 = runCli(['claim', tDone113, '--by', 'antigravity'], { root: archRoot111, allowed: archAllowed111 }).json;
+      const resFile113 = path.join(archWork111, 'res_113.json');
+      fs.writeFileSync(resFile113, JSON.stringify({ ok: true }), 'utf8');
+      completeTask111(bus111, { id: tDone113, by: 'antigravity', lease_token: cDone113.lease_token, result_path: resFile113 });
+      const donePayload113 = await maybeArch111(bus111, tDone113, { port: archMockPort, lagMs: 10, retryIntervalMs: 25, maxAttempts: 3 });
+
+      assertCase(113, 'done 任务自动归档（支持多 Antigravity CDP page 回退），open/claimed 任务返回 null、零 CDP 请求、零事件',
+        openArch113 === null &&
+        claimedSched113 === null &&
+        evalsAfterNonDone113 === 0 &&
+        nonDoneEvtCount113 === 0 &&
+        donePayload113?.ok === true &&
+        donePayload113?.archived_count === 1 &&
+        (archMockState.pageCalls['/page/1'] || 0) >= 1 &&
+        (archMockState.pageCalls['/page/2'] || 0) >= 1,
+        `open=${openArch113} claimed=${claimedSched113} evals=${evalsAfterNonDone113} evts=${nonDoneEvtCount113} done=${JSON.stringify(donePayload113)} pages=${JSON.stringify(archMockState.pageCalls)}`);
+
+      // 114. CDP 断开时 bus_task_complete 仍成功完成，但 archive_on_done 事件明确失败；CDP 恢复后新任务自动归档成功
+      const deadCdpPort114 = 59879;
+      process.env.AGENTBUS_AGY_CDP_PORT = String(deadCdpPort114);
+      const tDown114 = runCli(['new', '--to', 'antigravity', '--from', 'hermes', '--goal', 'archive-cdp-down'], { root: archRoot111, allowed: archAllowed111 }).json?.id;
+      const cDown114 = runCli(['claim', tDown114, '--by', 'antigravity'], { root: archRoot111, allowed: archAllowed111 }).json;
+      const resFile114a = path.join(archWork111, 'res_114a.json');
+      fs.writeFileSync(resFile114a, JSON.stringify({ ok: true }), 'utf8');
+
+      const mcpDown114 = await handleRpc111(bus111, {
+        jsonrpc: '2.0',
+        id: 114,
+        method: 'tools/call',
+        params: {
+          name: 'bus_task_complete',
+          arguments: { id: tDown114, by: 'antigravity', lease_token: cDown114.lease_token, result_path: resFile114a },
+        },
+      });
+      await waitArch111(5000);
+      const downEvt114 = bus111.db.prepare("SELECT payload_json FROM events WHERE task_id = ? AND event = 'archive_on_done' ORDER BY seq DESC LIMIT 1").get(tDown114);
+      const downPayload114 = downEvt114 ? JSON.parse(downEvt114.payload_json) : null;
+
+      // Simulate CDP recovery -> point back to mock CDP port
+      process.env.AGENTBUS_AGY_CDP_PORT = String(archMockPort);
+      archMockState.behavior = 'delayed_appear';
+      archMockState.evalCalls = 2; // appear immediately on next probe
+      archMockState.archivedOnce = false;
+      const tRecov114 = runCli(['new', '--to', 'antigravity', '--from', 'hermes', '--goal', 'archive-cdp-recovered'], { root: archRoot111, allowed: archAllowed111 }).json?.id;
+      const cRecov114 = runCli(['claim', tRecov114, '--by', 'antigravity'], { root: archRoot111, allowed: archAllowed111 }).json;
+      const resFile114b = path.join(archWork111, 'res_114b.json');
+      fs.writeFileSync(resFile114b, JSON.stringify({ ok: true }), 'utf8');
+      const mcpRecov114 = await handleRpc111(bus111, {
+        jsonrpc: '2.0',
+        id: 115,
+        method: 'tools/call',
+        params: {
+          name: 'bus_task_complete',
+          arguments: { id: tRecov114, by: 'antigravity', lease_token: cRecov114.lease_token, result_path: resFile114b },
+        },
+      });
+      await waitArch111(5000);
+      const recovEvt114 = bus111.db.prepare("SELECT payload_json FROM events WHERE task_id = ? AND event = 'archive_on_done' ORDER BY seq DESC LIMIT 1").get(tRecov114);
+      const recovPayload114 = recovEvt114 ? JSON.parse(recovEvt114.payload_json) : null;
+
+      assertCase(114, 'CDP 断开时任务完成仍成功但 archive_on_done 明确记录 cdp_unavailable 失败；CDP 恢复后自动归档成功',
+        mcpDown114?.result?.structuredContent?.state === 'done' &&
+        downPayload114?.ok === false &&
+        downPayload114?.archived_count === 0 &&
+        downPayload114?.reason === 'cdp_unavailable' &&
+        downPayload114?.attempts >= 1 &&
+        String(downPayload114?.error || '').includes(String(deadCdpPort114)) &&
+        mcpRecov114?.result?.structuredContent?.state === 'done' &&
+        recovPayload114?.ok === true &&
+        recovPayload114?.archived_count === 1,
+        `down=${JSON.stringify(downPayload114)} recov=${JSON.stringify(recovPayload114)}`);
+    } finally {
+      for (const [k, v] of Object.entries(prevArchEnv111)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      bus111.close();
+      archMockServer.close();
+    }
   } finally {
     try { fs.rmSync(RUN_BASE, { recursive: true, force: true }); } catch {}
   }

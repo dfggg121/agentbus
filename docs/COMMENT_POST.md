@@ -12,7 +12,7 @@
 
 这是 **agentbus**（给本机已有 coding agent 用的 MCP + CLI 任务总线，零第三方依赖，基于 `node:sqlite`）。通过 `agentbus setup` 支持 Codex / Claude Code / Gemini CLI / Antigravity / Cursor / OpenCode / DSH / Hermes 等 13 类客户端，另有只读 loopback 模块归属面板（`agentbus ui`）。
 源码与协议：https://github.com/dfggg121/agentbus
-试跑自包含验收（110 项，当前 109 passed / 1 skipped）：`git clone https://github.com/dfggg121/agentbus.git && cd agentbus && node test/accept.mjs`
+试跑自包含验收（114 项，当前 113 passed / 1 skipped）：`git clone https://github.com/dfggg121/agentbus.git && cd agentbus && node test/accept.mjs`
 ```
 
 ---

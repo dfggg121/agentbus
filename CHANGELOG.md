@@ -26,6 +26,7 @@ All notable changes to this project are documented here. Format follows [Keep a 
 - Added an all-Chinese project introduction at `docs/INTRO.zh-CN.md` with Chinese lifecycle/pointer SVGs; `README.zh-CN.md` links to it and uses the Chinese assets. The English README remains unchanged.
 
 ### Fixed
+- Auto-archive no longer blocks task completion on the Antigravity stop button, retries until the finished row exposes archive, snapshots the conversation id before clearing threads, and records attempts/timeouts in `archive_on_done`.
 - Auto-archive clicked the wrong row: the archive button is a sibling of the title node, so searching downward from the title always hit the first row's button in the list. Matching now associates each button with the sidebar title at the same vertical center (buttons are portalled), and archives every duplicate conversation for that task.
 - Auto-archive missed freshly created conversations because the sidebar had not rendered them yet; it now retries up to 6 times before recording `row_not_found`.
 - Auto-archive never fired for long async tasks: it only ran in the dispatcher, which had already exited. It now runs in the process that completes the task (CLI `done` / MCP `bus_task_complete`).

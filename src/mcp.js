@@ -24,7 +24,7 @@ import {
   addTaskMessage,
   listTaskMessages,
 } from './tasks.js';
-import { dispatchTask, dispatchEnabled, waitForTask, maybeArchiveTask } from './dispatch.js';
+import { dispatchTask, dispatchEnabled, waitForTask, scheduleArchiveTask } from './dispatch.js';
 
 const SUPPORTED_PROTOCOL_VERSIONS = new Set(['2025-06-18', '2025-03-26']);
 const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
@@ -421,7 +421,7 @@ async function invokeTool(bus, name, args = {}) {
           result_path: a.result_path,
           fields: a.fields || null,
         });
-        await maybeArchiveTask(bus, res.doneResult?.id || res.id);
+        scheduleArchiveTask(bus, res.doneResult?.id || res.id);
         return toolSuccess(res);
       }
 
@@ -448,7 +448,7 @@ async function invokeTool(bus, name, args = {}) {
           fields: a.fields || null,
         });
         if (res.state === 'done') {
-          await maybeArchiveTask(bus, res.id);
+          scheduleArchiveTask(bus, res.id);
         }
         return toolSuccess(res);
       }
