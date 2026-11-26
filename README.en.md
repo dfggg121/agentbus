@@ -83,6 +83,8 @@ Pick several at once, or set role & dispatch permissions:
 ```bash
 agentbus setup --client codex --client claude --client gemini
 agentbus setup --client codex --role conductor --allow-dispatch
+# Antigravity as conductor: the role lives in Antigravity's client-level MCP config, so every Antigravity conversation shares it.
+agentbus setup --client antigravity --role conductor --allow-dispatch
 agentbus setup --list   # id, label, format, config, installed, optional (read-only)
 agentbus doctor         # show what is configured
 agentbus clients        # ids only

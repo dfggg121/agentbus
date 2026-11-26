@@ -85,6 +85,8 @@ npm install --prefix ./agentbus-local ./agentbus-mcp-0.2.0.tgz
 ```bash
 agentbus setup --client codex --client claude --client gemini
 agentbus setup --client codex --role conductor --allow-dispatch
+# 反重力当主控：角色写在 Antigravity 的客户端级 MCP 配置里，所有反重力对话共享
+agentbus setup --client antigravity --role conductor --allow-dispatch
 agentbus setup --list   # 看 id、label、format、路径、installed、optional；只读不写盘
 agentbus doctor         # 看当前配置状态
 agentbus clients        # 只列 id
