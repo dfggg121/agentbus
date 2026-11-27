@@ -130,7 +130,7 @@ function printHelp() {
       'archive [<conversation-id>] [--port <port>] [--title-prefix <prefix>] [--title-contains <text>] [--dry-run] [--force]',
       'onboard [--conductor <agent>] [--model <agent>=<id>]... [--archive-on-done] [--yes] [--dry-run] [--root <dir>] [--home <dir>] [--allow <dir>]...   # 探测本机 agent 并写好通信配置',
       'agy-session [--out <file>]   # 在 Antigravity 集成终端里运行，导出会话地址与令牌',
-      'ui [--port <n>] [--host 127.0.0.1] [--no-open] [--root <dir>] [--dispatch]   # 启动 loopback 只读模块看板与调度面板',
+      'ui [--port <n>] [--host 127.0.0.1] [--no-open] [--root <dir>] [--home <dir>] [--dispatch]   # 启动 loopback 本地配套客户端（模块看板 + 主从/模型配置）',
       'mcp [--root <dir>] [--http 127.0.0.1:<port>]',
     ],
     exit_codes: { '0': 'success', '1': 'validation/arg/drift or watch failed/blocked/stalled', '2': 'state/lease disallowed or bootstrap command error', '3': 'watch timeout' },
@@ -300,6 +300,7 @@ async function main() {
 
     const ui = await startUiServer({
       rootOverride,
+      home: homeOverride,
       host,
       port,
       dispatch,

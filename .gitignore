@@ -12,6 +12,8 @@ var/
 _*.txt
 *.log
 out/
+.agents/
+AGENTS.md
 node_modules/
 coverage/
 .DS_Store
@@ -19,5 +21,6 @@ Thumbs.db
 
 # build artifacts
 *.tgz
+dist/
 agents.json
 antigravity-session.json

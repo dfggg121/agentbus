@@ -58,14 +58,14 @@ Requires **Node.js ≥ 22.13** (for `node:sqlite` without an experimental flag; 
 The package is not published to npm yet. Build or receive `agentbus-mcp-<version>.tgz`, copy it to the target machine, then:
 
 ```bash
-npm install -g ./agentbus-mcp-0.2.0.tgz
+npm install -g ./agentbus-mcp-0.3.0.tgz
 agentbus setup --client codex
 ```
 
 If you do not want a global install, install into a project-local prefix:
 
 ```bash
-npm install --prefix ./agentbus-local ./agentbus-mcp-0.2.0.tgz
+npm install --prefix ./agentbus-local ./agentbus-mcp-0.3.0.tgz
 ./agentbus-local/node_modules/.bin/agentbus setup --client codex
 ```
 

@@ -4266,6 +4266,2153 @@ async function main() {
       bus111.close();
       archMockServer.close();
     }
+
+    // 115-119. 配套客户端“主从配置”探测、严格校验、预览不写盘、显式应用备份/保留未知字段、失败显式报错
+    const ccBase = path.join(RUN_BASE, 'client_cfg_115');
+    const ccHome = path.join(ccBase, 'home');
+    const ccBinDir = path.join(ccBase, 'bin');
+    const ccRootEmpty = path.join(ccBase, 'root_ro_empty');
+    const ccRoot = path.join(ccBase, 'root_rw');
+    fs.mkdirSync(ccHome, { recursive: true });
+    fs.mkdirSync(ccBinDir, { recursive: true });
+    fs.mkdirSync(ccRoot, { recursive: true });
+
+    const binExt115 = process.platform === 'win32' ? '.cmd' : '';
+    const fakeCodexBin115 = path.join(ccBinDir, `codex${binExt115}`);
+    const fakeAgyBin115 = path.join(ccBinDir, `agentapi${binExt115}`);
+    fs.writeFileSync(fakeCodexBin115, process.platform === 'win32' ? '@echo off\r\n' : '#!/bin/sh\n', 'utf8');
+    fs.writeFileSync(fakeAgyBin115, process.platform === 'win32' ? '@echo off\r\n' : '#!/bin/sh\n', 'utf8');
+    if (process.platform !== 'win32') {
+      fs.chmodSync(fakeCodexBin115, 0o755);
+      fs.chmodSync(fakeAgyBin115, 0o755);
+    }
+
+    // Prepare realistic initial configs for installed clients (codex, antigravity, dsh)
+    const ccCodexCfg = path.join(ccHome, '.codex', 'config.toml');
+    fs.mkdirSync(path.dirname(ccCodexCfg), { recursive: true });
+    const initCodexToml = 'model_provider = "openai"\n';
+    fs.writeFileSync(ccCodexCfg, initCodexToml, 'utf8');
+
+    const ccAgyCfg = path.join(ccHome, '.gemini', 'config', 'mcp_config.json');
+    fs.mkdirSync(path.dirname(ccAgyCfg), { recursive: true });
+    const initAgyJson = JSON.stringify({ mcpServers: { other: { command: 'echo', args: ['hi'] } } }, null, 2) + '\n';
+    fs.writeFileSync(ccAgyCfg, initAgyJson, 'utf8');
+
+    const ccDshCfg = path.join(ccHome, '.dsh', 'profiles', 'desktop', 'cordis.patch.yml');
+    fs.mkdirSync(path.dirname(ccDshCfg), { recursive: true });
+    const initDshYml = '- insert:\n    - id: user-custom-plugin\n      name: "@example/keep-me"\n';
+    fs.writeFileSync(ccDshCfg, initDshYml, 'utf8');
+
+    // Leftover opencode config WITHOUT binary -> must NOT be falsely marked installed
+    const ccOpencodeCfg = path.join(ccHome, '.config', 'opencode', 'opencode.json');
+    fs.mkdirSync(path.dirname(ccOpencodeCfg), { recursive: true });
+    fs.writeFileSync(ccOpencodeCfg, '{}\n', 'utf8');
+
+    const ccEnv = {
+      PATH: ccBinDir,
+      HOME: ccHome,
+      USERPROFILE: ccHome,
+      APPDATA: path.join(ccHome, 'AppData', 'Roaming'),
+      LOCALAPPDATA: path.join(ccHome, 'AppData', 'Local'),
+    };
+
+    // 115. GET /api/client-config 只读探测（不建 root 目录、字段完整、未安装项不伪造）
+    const srvRo115 = await startUiServer({
+      rootOverride: ccRootEmpty,
+      home: ccHome,
+      env: ccEnv,
+      host: '127.0.0.1',
+      port: 0,
+      pkgRoot: PKG_ROOT,
+    });
+    let det115 = null;
+    let html115 = '';
+    let rootCreatedByGet115 = true;
+    try {
+      const rHtml115 = await fetch(`${srvRo115.url}/`);
+      html115 = await rHtml115.text();
+      const rDet115 = await fetch(`${srvRo115.url}/api/client-config`);
+      det115 = await rDet115.json();
+      rootCreatedByGet115 = fs.existsSync(ccRootEmpty);
+    } finally {
+      await srvRo115.close();
+    }
+
+    const byId115 = new Map((det115?.clients || []).map((c) => [c.id, c]));
+    assertCase(115, 'GET /api/client-config 只读探测字段完整、未安装/无二进制项不伪造已安装且不建目录',
+      det115?.ok === true &&
+      !rootCreatedByGet115 &&
+      html115.includes('主从配置') &&
+      html115.includes('agentbus 模块可视化调度面板') &&
+      byId115.get('codex')?.installed === true &&
+      Boolean(byId115.get('codex')?.bin) &&
+      byId115.get('codex')?.config === ccCodexCfg &&
+      byId115.get('antigravity')?.installed === true &&
+      Boolean(byId115.get('antigravity')?.bin) &&
+      byId115.get('dsh')?.installed === true &&
+      byId115.get('opencode')?.installed === false &&
+      byId115.get('claude')?.installed === false &&
+      byId115.get('windsurf')?.installed === false &&
+      byId115.get('windsurf')?.install_status === 'optional_not_installed' &&
+      byId115.get('hermes')?.installed === false &&
+      byId115.get('hermes')?.install_status === 'optional_not_installed' &&
+      byId115.get('codex')?.current_role === 'unconfigured',
+      `ro=${!rootCreatedByGet115} codex=${JSON.stringify(byId115.get('codex')?.installed)} opencode=${JSON.stringify(byId115.get('opencode')?.installed)} windsurf=${JSON.stringify(byId115.get('windsurf')?.install_status)}`);
+
+    // Prepare agents.json with unknown custom fields to verify preservation on apply
+    const ccAgentsFile = path.join(ccRoot, 'agents.json');
+    const initAgentsObj = {
+      conductor: 'antigravity',
+      models: { antigravity: 'gemini-3.8-flash' },
+      thread_limits: { codex: { max_steps: 25 } },
+      custom_keep_field: { tag: 'preserve-me', version: 42 },
+      archive_on_done: false,
+      updated_at: '2026-01-01T00:00:00.000Z',
+    };
+    const initAgentsRaw = JSON.stringify(initAgentsObj, null, 2) + '\n';
+    fs.writeFileSync(ccAgentsFile, initAgentsRaw, 'utf8');
+
+    const srvRw116 = await startUiServer({
+      rootOverride: ccRoot,
+      home: ccHome,
+      env: ccEnv,
+      host: '127.0.0.1',
+      port: 0,
+      pkgRoot: PKG_ROOT,
+    });
+
+    try {
+      // 116. 非法 agent / 未安装 agent / 非法 role / 非法 model / 禁止字段 / 非法方法全被拒
+      const postJson116 = async (pathname, payload) => {
+        const r = await fetch(`${srvRw116.url}${pathname}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        return { status: r.status, json: await r.json() };
+      };
+
+      const badAgent116 = await postJson116('/api/client-config/preview', { conductor: '../evil' });
+      const uninstalled116 = await postJson116('/api/client-config/apply', { conductor: 'claude', clients: ['claude'] });
+      const badRole116 = await postJson116('/api/client-config/preview', { conductor: 'codex', roles: { codex: 'conductor', antigravity: 'superadmin' } });
+      const multiCond116 = await postJson116('/api/client-config/preview', { roles: { codex: 'conductor', antigravity: 'conductor' } });
+      const badModel116 = await postJson116('/api/client-config/preview', { conductor: 'codex', clients: ['codex', 'antigravity'], models: { antigravity: 'fake-injected-model' } });
+      const badField116 = await postJson116('/api/client-config/apply', { conductor: 'codex', home: '/tmp/hijack', command: 'calc.exe' });
+      const wrongMethodPrev116 = await fetch(`${srvRw116.url}/api/client-config/preview`, { method: 'GET' });
+      const wrongMethodApply116 = await fetch(`${srvRw116.url}/api/client-config/apply`, { method: 'GET' });
+      const wrongMethodGet116 = await fetch(`${srvRw116.url}/api/client-config`, { method: 'POST', body: '{}' });
+
+      assertCase(116, '主从配置 POST 严格拒绝非法 agent/未安装/非法 role/多主控/非法 model/路径注入字段与错误方法',
+        badAgent116.status === 400 && badAgent116.json.code === 'invalid_agent' &&
+        uninstalled116.status === 400 && uninstalled116.json.code === 'agent_not_installed' &&
+        badRole116.status === 400 && badRole116.json.code === 'invalid_role' &&
+        multiCond116.status === 400 && multiCond116.json.code === 'invalid_role' &&
+        badModel116.status === 400 && badModel116.json.code === 'invalid_model' &&
+        badField116.status === 400 && badField116.json.code === 'invalid_field' &&
+        wrongMethodPrev116.status === 405 &&
+        wrongMethodApply116.status === 405 &&
+        wrongMethodGet116.status === 405 &&
+        !fs.existsSync(path.join(ccHome, '.claude.json')),
+        `ag=${badAgent116.status}:${badAgent116.json.code} uninst=${uninstalled116.status}:${uninstalled116.json.code} role=${badRole116.status} mdl=${badModel116.status} fld=${badField116.status}`);
+
+      // 117. POST /api/client-config/preview 只预览不写盘、无备份文件生成
+      const applyBody117 = {
+        conductor: 'codex',
+        clients: ['codex', 'antigravity', 'dsh'],
+        roles: { codex: 'conductor', antigravity: 'worker', dsh: 'worker' },
+        models: { codex: '', antigravity: 'gemini-4-neon' },
+        enable_dispatch: true,
+        archive_on_done: true,
+      };
+      const prev117 = await postJson116('/api/client-config/preview', applyBody117);
+      const codexBakAfterPrev = fs.readdirSync(path.dirname(ccCodexCfg)).filter((n) => n.includes('.bak-'));
+      const agentsBakAfterPrev = fs.readdirSync(ccRoot).filter((n) => n.includes('.bak-'));
+
+      assertCase(117, 'POST /api/client-config/preview 返回完整变更与备份计划且严格不写盘',
+        prev117.status === 200 &&
+        prev117.json.ok === true &&
+        prev117.json.dry_run === true &&
+        prev117.json.agents_json?.changed === true &&
+        prev117.json.agents_json?.backup_will_create === true &&
+        prev117.json.summary?.files_to_modify?.includes(ccCodexCfg) &&
+        prev117.json.summary?.files_to_modify?.includes(ccAgyCfg) &&
+        prev117.json.summary?.files_to_modify?.includes(ccDshCfg) &&
+        prev117.json.summary?.model_changes?.some((m) => m.agent === 'antigravity' && m.after === 'gemini-4-neon') &&
+        fs.readFileSync(ccAgentsFile, 'utf8') === initAgentsRaw &&
+        fs.readFileSync(ccCodexCfg, 'utf8') === initCodexToml &&
+        fs.readFileSync(ccAgyCfg, 'utf8') === initAgyJson &&
+        fs.readFileSync(ccDshCfg, 'utf8') === initDshYml &&
+        codexBakAfterPrev.length === 0 &&
+        agentsBakAfterPrev.length === 0,
+        `status=${prev117.status} ok=${prev117.json.ok} files=${JSON.stringify(prev117.json.summary?.files_to_modify)}`);
+
+      // 118. POST /api/client-config/apply 写入 agents.json（保留未知字段+备份）及各客户端 MCP 配置（保留 DSH 原有内容+备份），模块看板同步更新
+      const applied118 = await postJson116('/api/client-config/apply', applyBody117);
+      const writtenAgents118 = JSON.parse(fs.readFileSync(ccAgentsFile, 'utf8'));
+      const writtenCodex118 = fs.readFileSync(ccCodexCfg, 'utf8');
+      const writtenAgy118 = JSON.parse(fs.readFileSync(ccAgyCfg, 'utf8'));
+      const writtenDsh118 = fs.readFileSync(ccDshCfg, 'utf8');
+      const detAfter118 = await (await fetch(`${srvRw116.url}/api/client-config`)).json();
+      const modsAfter118 = await (await fetch(`${srvRw116.url}/api/modules`)).json();
+      const afterById118 = new Map((detAfter118.clients || []).map((c) => [c.id, c]));
+      const appById118 = new Map((applied118.json.clients || []).map((c) => [c.client, c]));
+
+      assertCase(118, 'POST /api/client-config/apply 备份并写入 agents.json（保留未知字段）与 MCP 配置（不覆盖 DSH 原内容），未安装项不被创建',
+        applied118.status === 200 &&
+        applied118.json.ok === true &&
+        applied118.json.applied === true &&
+        Boolean(applied118.json.agents_json?.backup && fs.existsSync(applied118.json.agents_json.backup)) &&
+        writtenAgents118.conductor === 'codex' &&
+        writtenAgents118.models?.antigravity === 'gemini-4-neon' &&
+        writtenAgents118.archive_on_done === true &&
+        writtenAgents118.custom_keep_field?.tag === 'preserve-me' &&
+        writtenAgents118.custom_keep_field?.version === 42 &&
+        writtenAgents118.thread_limits?.codex?.max_steps === 25 &&
+        Boolean(appById118.get('codex')?.changed && appById118.get('codex')?.backup && fs.existsSync(appById118.get('codex').backup)) &&
+        Boolean(appById118.get('antigravity')?.changed && appById118.get('antigravity')?.backup && fs.existsSync(appById118.get('antigravity').backup)) &&
+        Boolean(appById118.get('dsh')?.changed && appById118.get('dsh')?.backup && fs.existsSync(appById118.get('dsh').backup)) &&
+        writtenCodex118.includes('AGENTBUS_ROLE = "conductor"') &&
+        writtenCodex118.includes('AGENTBUS_ENABLE_DISPATCH = "1"') &&
+        writtenAgy118.mcpServers?.other?.command === 'echo' &&
+        writtenAgy118.mcpServers?.agentbus?.env?.AGENTBUS_ROLE === 'worker' &&
+        writtenAgy118.mcpServers?.agentbus?.env?.AGENTBUS_ENABLE_DISPATCH === '0' &&
+        writtenDsh118.includes('user-custom-plugin') &&
+        writtenDsh118.includes('# BEGIN agentbus-managed') &&
+        writtenDsh118.includes('AGENTBUS_ROLE: "worker"') &&
+        afterById118.get('codex')?.current_role === 'conductor' &&
+        afterById118.get('codex')?.mcp_dispatch === true &&
+        afterById118.get('antigravity')?.current_role === 'worker' &&
+        afterById118.get('claude')?.installed === false &&
+        !fs.existsSync(path.join(ccHome, '.claude.json')) &&
+        modsAfter118.ok === true &&
+        modsAfter118.conductor === 'codex' &&
+        modsAfter118.modules?.find((m) => m.id === 'ui')?.owner_model === 'gemini-4-neon',
+        `status=${applied118.status} ok=${applied118.json.ok} cond=${writtenAgents118.conductor} keep=${JSON.stringify(writtenAgents118.custom_keep_field)}`);
+
+      // 119. 损坏配置、缺目录与损坏 agents.json 必须返回明确错误，不覆盖、不部分静默成功
+      const agentsBeforeErr119 = fs.readFileSync(ccAgentsFile, 'utf8');
+      const agyBeforeErr119 = fs.readFileSync(ccAgyCfg, 'utf8');
+      const brokenToml119 = '[mcp_servers.agentbus\ncommand = "unclosed\n';
+      fs.writeFileSync(ccCodexCfg, brokenToml119, 'utf8');
+
+      const detBroken119 = await (await fetch(`${srvRw116.url}/api/client-config`)).json();
+      const applyBrokenToml119 = await postJson116('/api/client-config/apply', {
+        conductor: 'antigravity',
+        clients: ['antigravity', 'codex'],
+        roles: { antigravity: 'conductor', codex: 'worker' },
+        models: { antigravity: 'gemini-3.8-flash' },
+      });
+      const agentsAfterBrokenToml119 = fs.readFileSync(ccAgentsFile, 'utf8');
+      const agyAfterBrokenToml119 = fs.readFileSync(ccAgyCfg, 'utf8');
+
+      // Restore valid codex config, then test missing_config_dir with require_config_dir=true
+      fs.writeFileSync(ccCodexCfg, writtenCodex118, 'utf8');
+      fs.rmSync(path.dirname(ccCodexCfg), { recursive: true, force: true });
+      const applyMissingDir119 = await postJson116('/api/client-config/apply', {
+        conductor: 'codex',
+        clients: ['codex'],
+        require_config_dir: true,
+      });
+
+      // Restore codex dir & corrupt agents.json -> detection must report error and apply must refuse
+      fs.mkdirSync(path.dirname(ccCodexCfg), { recursive: true });
+      fs.writeFileSync(ccCodexCfg, writtenCodex118, 'utf8');
+      fs.writeFileSync(ccAgentsFile, '{broken-json', 'utf8');
+      const detBrokenAgents119 = await (await fetch(`${srvRw116.url}/api/client-config`)).json();
+      const applyBrokenAgents119 = await postJson116('/api/client-config/apply', {
+        conductor: 'codex',
+        clients: ['codex'],
+      });
+
+      assertCase(119, '配置损坏/缺目录/agents.json 损坏均明确报错且拒绝静默部分写入',
+        detBroken119.detection_errors?.some((e) => e.target === 'codex' && e.code === 'corrupted_config') &&
+        applyBrokenToml119.status === 422 &&
+        applyBrokenToml119.json.ok === false &&
+        applyBrokenToml119.json.applied === false &&
+        applyBrokenToml119.json.code === 'corrupted_config' &&
+        agentsAfterBrokenToml119 === agentsBeforeErr119 &&
+        agyAfterBrokenToml119 === agyBeforeErr119 &&
+        applyMissingDir119.status === 422 &&
+        applyMissingDir119.json.ok === false &&
+        applyMissingDir119.json.code === 'missing_config_dir' &&
+        detBrokenAgents119.agents_json?.broken === true &&
+        detBrokenAgents119.detection_errors?.some((e) => e.target === 'agents.json' && e.code === 'corrupted_agents_config') &&
+        applyBrokenAgents119.status === 422 &&
+        applyBrokenAgents119.json.ok === false &&
+        applyBrokenAgents119.json.code === 'corrupted_agents_config',
+        `toml=${applyBrokenToml119.status}:${applyBrokenToml119.json.code} dir=${applyMissingDir119.status}:${applyMissingDir119.json.code} ag=${applyBrokenAgents119.status}:${applyBrokenAgents119.json.code}`);
+    } finally {
+      await srvRw116.close();
+    }
+
+    // 120-124. 项目任务看板：自动拆解直发主 Agent、plan 契约校验与快照保护、自动路由规则、part 分派幂等防重与独立滚动断言
+    const pbBase = path.join(RUN_BASE, 'proj_board_120');
+    const pbHome = path.join(pbBase, 'home');
+    const pbBinDir = path.join(pbBase, 'bin');
+    const pbRootRo = path.join(pbBase, 'root_ro_empty');
+    const pbRoot = path.join(pbBase, 'root_rw');
+    const pbWork = path.join(pbBase, 'workspace');
+    fs.mkdirSync(pbHome, { recursive: true });
+    fs.mkdirSync(pbBinDir, { recursive: true });
+    fs.mkdirSync(pbRoot, { recursive: true });
+    fs.mkdirSync(pbWork, { recursive: true });
+
+    const pbExt = process.platform === 'win32' ? '.cmd' : '';
+    const pbCodexBin = path.join(pbBinDir, `codex${pbExt}`);
+    const pbAgyBin = path.join(pbBinDir, `agentapi${pbExt}`);
+    const pbGeminiBin = path.join(pbBinDir, `gemini${pbExt}`);
+    for (const bf of [pbCodexBin, pbAgyBin, pbGeminiBin]) {
+      fs.writeFileSync(bf, process.platform === 'win32' ? '@echo off\r\n' : '#!/bin/sh\n', 'utf8');
+      if (process.platform !== 'win32') fs.chmodSync(bf, 0o755);
+    }
+    fs.mkdirSync(path.join(pbHome, '.codex'), { recursive: true });
+    fs.writeFileSync(path.join(pbHome, '.codex', 'config.toml'), 'model_provider = "openai"\n', 'utf8');
+    fs.mkdirSync(path.join(pbHome, '.gemini', 'config'), { recursive: true });
+    fs.writeFileSync(path.join(pbHome, '.gemini', 'config', 'mcp_config.json'), '{"mcpServers":{}}\n', 'utf8');
+    fs.writeFileSync(path.join(pbHome, '.gemini', 'settings.json'), '{"mcpServers":{}}\n', 'utf8');
+
+    // Global conductor is codex, while user selects antigravity as project main_agent -> bootstrap to MUST be antigravity!
+    fs.writeFileSync(path.join(pbRoot, 'agents.json'), JSON.stringify({
+      conductor: 'codex',
+      models: {
+        codex: 'gpt-5-codex',
+        antigravity: 'gemini-4-neon',
+        gemini: 'gemini-3.8-flash',
+      },
+    }, null, 2) + '\n', 'utf8');
+
+    const pbEnv = {
+      PATH: pbBinDir,
+      HOME: pbHome,
+      USERPROFILE: pbHome,
+      APPDATA: path.join(pbHome, 'AppData', 'Roaming'),
+      LOCALAPPDATA: path.join(pbHome, 'AppData', 'Local'),
+    };
+    const pbAllowed = [pbRoot, pbWork].join(path.delimiter);
+
+    // 120. GET /api/projects & /api/routing-rules 严格只读不建目录；POST /api/projects 默认直发所选主 Agent 并自动 dispatch（含 adapter 失败保留任务）
+    const srvPbRo120 = await startUiServer({
+      rootOverride: pbRootRo,
+      home: pbHome,
+      env: pbEnv,
+      host: '127.0.0.1',
+      port: 0,
+      pkgRoot: pbWork,
+    });
+    let getProjRo120 = null;
+    let getRouteRo120 = null;
+    let roNotCreated120 = false;
+    try {
+      getProjRo120 = await (await fetch(`${srvPbRo120.url}/api/projects`)).json();
+      getRouteRo120 = await (await fetch(`${srvPbRo120.url}/api/routing-rules`)).json();
+      roNotCreated120 = !fs.existsSync(pbRootRo);
+    } finally {
+      await srvPbRo120.close();
+    }
+
+    const pbDispatchLog = [];
+    let pbDispatchShouldFail = false;
+    const prevAllowed120 = process.env.AGENTBUS_ALLOWED_ROOTS;
+    const prevAgentsCfg120 = process.env.AGENTBUS_AGENTS_CONFIG;
+    process.env.AGENTBUS_ALLOWED_ROOTS = pbAllowed;
+    delete process.env.AGENTBUS_AGENTS_CONFIG;
+
+    const srvPb = await startUiServer({
+      rootOverride: pbRoot,
+      home: pbHome,
+      env: pbEnv,
+      host: '127.0.0.1',
+      port: 0,
+      pkgRoot: pbWork,
+      dispatchFn: async (bus, opts) => {
+        const shown = runCli(['show', opts.id], { root: pbRoot, allowed: pbAllowed }).json;
+        pbDispatchLog.push({ id: opts.id, to: shown?.to, cwd: opts.cwd });
+        if (pbDispatchShouldFail) {
+          throw new Error('simulated adapter offline');
+        }
+        return { id: opts.id, to: shown?.to, state: shown?.state || 'open', dispatched: true };
+      },
+    });
+
+    const pbFetch = async (pathname, method = 'GET', payload = undefined) => {
+      const r = await fetch(`${srvPb.url}${pathname}`, {
+        method,
+        headers: payload !== undefined ? { 'Content-Type': 'application/json' } : undefined,
+        body: payload !== undefined ? JSON.stringify(payload) : undefined,
+      });
+      return { status: r.status, json: await r.json() };
+    };
+
+    try {
+      const createOk120 = await pbFetch('/api/projects', 'POST', {
+        name: '本地通信软件',
+        goal: '实现局域网通信软件，包含前端界面、实时通信协议、本地数据存储和整体性能优化。',
+        main_agent: 'antigravity',
+        main_model: 'gemini-4-neon',
+      });
+      const projId120 = createOk120.json?.project?.id;
+      const bootTaskId120 = createOk120.json?.bootstrap_task?.id;
+      const shownBoot120 = runCli(['show', bootTaskId120], { root: pbRoot, allowed: pbAllowed }).json;
+
+      // Adapter failure keeps project & open task and surfaces explicit dispatch_error
+      pbDispatchShouldFail = true;
+      const createErrDisp120 = await pbFetch('/api/projects', 'POST', {
+        name: '派发失败测试项目',
+        goal: '验证适配器异常时任务保留且报错。',
+        main_agent: 'antigravity',
+      });
+      pbDispatchShouldFail = false;
+
+      // Security rejections: injected field, uninstalled agent, wrong method
+      const badInject120 = await pbFetch('/api/projects', 'POST', { name: 'bad', goal: 'bad', home: '/tmp/x', command: 'calc' });
+      const badUninst120 = await pbFetch('/api/projects', 'POST', { name: 'bad', goal: 'bad', main_agent: 'claude' });
+      const wrongDel120 = await fetch(`${srvPb.url}/api/projects`, { method: 'DELETE' });
+
+      assertCase(120, '项目看板 GET 严格只读；POST /api/projects 直发所选主 Agent (非全局 conductor) 并默认自动 dispatch，异常保留任务且拦截注入/未安装 agent',
+        getProjRo120?.ok === true &&
+        getRouteRo120?.ok === true &&
+        roNotCreated120 &&
+        createOk120.status === 201 &&
+        createOk120.json?.ok === true &&
+        createOk120.json?.bootstrap_task?.to === 'antigravity' &&
+        createOk120.json?.bootstrap_task?.dispatch_requested === true &&
+        createOk120.json?.bootstrap_task?.dispatched === true &&
+        shownBoot120?.to === 'antigravity' &&
+        shownBoot120?.goal?.includes('agentbus/project-plan@1') &&
+        pbDispatchLog[0]?.id === bootTaskId120 &&
+        pbDispatchLog[0]?.to === 'antigravity' &&
+        createErrDisp120.status === 201 &&
+        createErrDisp120.json?.bootstrap_task?.state === 'open' &&
+        createErrDisp120.json?.bootstrap_task?.dispatched === false &&
+        String(createErrDisp120.json?.bootstrap_task?.dispatch_error || '').includes('simulated adapter offline') &&
+        badInject120.status === 400 && badInject120.json?.code === 'invalid_field' &&
+        badUninst120.status === 400 && badUninst120.json?.code === 'agent_not_installed' &&
+        wrongDel120.status === 405,
+        `ro=${roNotCreated120} to=${shownBoot120?.to} disp=${JSON.stringify(createOk120.json?.bootstrap_task?.dispatched)} errDisp=${createErrDisp120.json?.bootstrap_task?.dispatch_error} bad=${badInject120.status}/${badUninst120.status}`);
+
+      // 121. plan 契约校验、完成后自动生成卡片、编辑/新增/删除/排序不覆盖原始 plan.json；blocked/failed/非法 plan 均真实报错
+      const planFile121 = path.join(pbWork, 'out', 'projects', projId120, 'plan.json');
+      fs.mkdirSync(path.dirname(planFile121), { recursive: true });
+      const rawPlanObj121 = {
+        schema: 'agentbus/project-plan@1',
+        project_id: projId120,
+        title: '本地通信软件',
+        summary: '拆分为前端界面、通信内核、本地存储三个部分',
+        parts: [
+          {
+            key: 'frontend',
+            title: '前端界面',
+            category: 'frontend_ui',
+            goal: '构建聊天窗口与联系人列表页面',
+            paths: ['src/web/ui'],
+            acceptance: ['页面可打开并支持发消息'],
+            agent: 'claude', // uninstalled on this machine -> must NOT be falsely accepted as installed
+            model: '',
+            depends_on: ['comm'],
+          },
+          {
+            key: 'comm',
+            title: '实时通信协议',
+            category: 'backend_comm',
+            goal: '实现局域网 WebSocket 消息收发与断线重连',
+            paths: ['src/net/comm.js'],
+            acceptance: ['双端消息收发延迟小于 50ms'],
+            agent: 'antigravity',
+            model: 'gemini-4-neon',
+            depends_on: [],
+          },
+          {
+            key: 'storage',
+            title: '本地数据存储',
+            category: 'data_storage',
+            goal: 'SQLite 聊天记录持久化与全文检索',
+            paths: ['src/db/messages.js'],
+            acceptance: ['重启后历史记录完整恢复'],
+            agent: '',
+            model: '',
+            depends_on: [],
+          },
+        ],
+      };
+      const rawPlanText121 = JSON.stringify(rawPlanObj121, null, 2) + '\n';
+      fs.writeFileSync(planFile121, rawPlanText121, 'utf8');
+
+      // Complete bootstrap task via real agentbus CLI claim + done
+      const cBoot121 = runCli(['claim', bootTaskId120, '--by', 'antigravity'], { root: pbRoot, allowed: pbAllowed }).json;
+      const doneBoot121 = runCli(['done', bootTaskId120, '--by', 'antigravity', '--lease', cBoot121.lease_token, '--result', planFile121], { root: pbRoot, allowed: pbAllowed });
+
+      // GET /api/projects/:id auto-hydrates parts from completed plan!
+      const detailAfterPlan121 = await pbFetch(`/api/projects/${projId120}`);
+      const hydratedParts121 = detailAfterPlan121.json?.project?.parts || [];
+      const fePartBeforeEdit = hydratedParts121.find((p) => p.key === 'frontend');
+
+      // Edit part, add manual part, reorder, delete manual part -> original plan.json MUST stay byte-identical
+      const editPart121 = await pbFetch(`/api/projects/${projId120}/parts/storage`, 'PATCH', {
+        title: '本地数据存储（已人工补充索引）',
+        agent: 'codex',
+        model: 'gpt-5-codex',
+        paths: ['src/db/messages.js', 'src/db/index.js'],
+      });
+      const addPart121 = await pbFetch(`/api/projects/${projId120}/parts`, 'POST', {
+        key: 'perf_opt',
+        title: '整体优化与压测',
+        category: 'optimization',
+        goal: '全链路压测与内存优化',
+        paths: ['test/perf.mjs'],
+        acceptance: ['内存峰值低于 150MB'],
+      });
+      const badPathPart121 = await pbFetch(`/api/projects/${projId120}/parts`, 'POST', {
+        key: 'evil_path',
+        title: '越界路径测试',
+        goal: '不应通过',
+        paths: ['../outside/secret.txt'],
+      });
+      const reorder121 = await pbFetch(`/api/projects/${projId120}/parts/reorder`, 'POST', {
+        keys: ['comm', 'storage', 'frontend', 'perf_opt'],
+      });
+      const planFileAfterEdits121 = fs.readFileSync(planFile121, 'utf8');
+
+      // Verify blocked & failed bootstrap project status displays real error
+      const failProjId121 = createErrDisp120.json?.project?.id;
+      const failTaskId121 = createErrDisp120.json?.bootstrap_task?.id;
+      const cFail121 = runCli(['claim', failTaskId121, '--by', 'antigravity'], { root: pbRoot, allowed: pbAllowed }).json;
+      runCli(['message', failTaskId121, '--by', 'antigravity', '--kind', 'blocked', '--body', '缺少需求文档，拆解阻塞', '--lease', cFail121.lease_token], { root: pbRoot, allowed: pbAllowed });
+      const blockedView121 = await pbFetch(`/api/projects/${failProjId121}`);
+      runCli(['fail', failTaskId121, '--by', 'antigravity', '--lease', cFail121.lease_token, '--reason', '需求不完整无法拆解'], { root: pbRoot, allowed: pbAllowed });
+      const failedView121 = await pbFetch(`/api/projects/${failProjId121}`);
+      // Manual add still works on failed project
+      const manualOnFailed121 = await pbFetch(`/api/projects/${failProjId121}/parts`, 'POST', {
+        key: 'manual_card',
+        title: '人工兜底卡片',
+        goal: '拆解失败时手动补充的任务卡片',
+        paths: ['src/manual.js'],
+      });
+
+      assertCase(121, 'plan 完成后自动出卡片（不伪造未安装建议 agent）、人工改/加/排序不覆盖原始 plan.json、越界路径被拒、blocked/failed 真实报错且支持手动加卡',
+        doneBoot121.rc === 0 &&
+        detailAfterPlan121.status === 200 &&
+        detailAfterPlan121.json?.project?.plan_status === 'loaded' &&
+        hydratedParts121.length === 3 &&
+        fePartBeforeEdit?.agent === '' &&
+        Boolean(fePartBeforeEdit?.agent_warning) &&
+        editPart121.status === 200 &&
+        editPart121.json?.part?.manual_override === true &&
+        addPart121.status === 201 &&
+        badPathPart121.status === 400 && badPathPart121.json?.code === 'invalid_path' &&
+        reorder121.status === 200 &&
+        reorder121.json?.project?.parts?.[0]?.key === 'comm' &&
+        planFileAfterEdits121 === rawPlanText121 &&
+        Boolean(reorder121.json?.project?.plan_snapshot) &&
+        blockedView121.json?.project?.plan_status === 'blocked' &&
+        String(blockedView121.json?.project?.plan_error || '').includes('拆解阻塞') &&
+        failedView121.json?.project?.plan_status === 'failed' &&
+        manualOnFailed121.status === 201,
+        `done=${doneBoot121.rc} planSt=${detailAfterPlan121.json?.project?.plan_status} feWarn=${fePartBeforeEdit?.agent_warning} badPath=${badPathPart121.status} blk=${blockedView121.json?.project?.plan_status} fail=${failedView121.json?.project?.plan_status}`);
+
+      // 122. 自动路由规则：保存/保留未知字段/拒未安装 agent 与非法模型/拒覆盖损坏文件；自动分配命中规则、未命中回退主 Agent、不覆写手动覆盖项
+      const routingFile122 = path.join(pbRoot, 'project-routing.json');
+      fs.writeFileSync(routingFile122, JSON.stringify({
+        schema: 'agentbus/project-routing@1',
+        custom_keep_meta: { owner: 'local-test' },
+        rules: [],
+      }, null, 2) + '\n', 'utf8');
+
+      const badRuleUninst122 = await pbFetch('/api/routing-rules', 'POST', {
+        rules: [{ id: 'r_bad', name: '未安装测试', match_type: 'category', categories: ['frontend_ui'], agent: 'claude', priority: 100, enabled: true }],
+      });
+      const badRuleModel122 = await pbFetch('/api/routing-rules', 'POST', {
+        rules: [{ id: 'r_badm', name: '非法模型', match_type: 'category', categories: ['frontend_ui'], agent: 'gemini', model: 'fake-model-x', priority: 100, enabled: true }],
+      });
+      const saveRules122 = await pbFetch('/api/routing-rules', 'POST', {
+        rules: [
+          {
+            id: 'r_ui',
+            name: '前端界面类',
+            match_type: 'any',
+            categories: ['frontend_ui'],
+            keywords: ['前端', '界面'],
+            agent: 'gemini',
+            model: 'gemini-3.8-flash',
+            priority: 200,
+            enabled: true,
+          },
+          {
+            id: 'r_comm',
+            name: '通信协议类',
+            match_type: 'keyword',
+            categories: [],
+            keywords: ['通信', 'WebSocket'],
+            agent: 'antigravity',
+            model: 'gemini-4-neon',
+            priority: 150,
+            enabled: true,
+          },
+        ],
+      });
+      const savedRoutingRaw122 = JSON.parse(fs.readFileSync(routingFile122, 'utf8'));
+
+      // Run auto-route (overwrite_manual=false):
+      // - frontend -> matches r_ui => gemini / gemini-3.8-flash
+      // - comm -> matches r_comm => antigravity / gemini-4-neon
+      // - storage -> was manually edited to codex => MUST be preserved!
+      // - perf_opt -> no rule matches => falls back to project main_agent (antigravity)
+      const autoRoute122 = await pbFetch(`/api/projects/${projId120}/auto-route`, 'POST', {
+        dry_run: false,
+        overwrite_manual: false,
+      });
+      const partsAfterAuto122 = new Map((autoRoute122.json?.project?.parts || []).map((p) => [p.key, p]));
+
+      // Corrupt routing file -> GET reports broken, POST refuses to overwrite
+      const brokenRoutingText122 = '{broken-routing-json';
+      const routingBackupBeforeCorrupt122 = fs.readFileSync(routingFile122, 'utf8');
+      fs.writeFileSync(routingFile122, brokenRoutingText122, 'utf8');
+      const getBrokenRoute122 = await pbFetch('/api/routing-rules');
+      const saveBrokenRoute122 = await pbFetch('/api/routing-rules', 'POST', { rules: [] });
+      const stillBroken122 = fs.readFileSync(routingFile122, 'utf8') === brokenRoutingText122;
+      fs.writeFileSync(routingFile122, routingBackupBeforeCorrupt122, 'utf8');
+
+      assertCase(122, '自动路由规则校验/保留未知字段/损坏不覆盖；一键自动分配按规则命中、无命中回退主 Agent、人工覆盖项不被悄悄改写',
+        badRuleUninst122.status === 400 && badRuleUninst122.json?.code === 'agent_not_installed' &&
+        badRuleModel122.status === 400 && badRuleModel122.json?.code === 'invalid_model' &&
+        saveRules122.status === 200 &&
+        Boolean(saveRules122.json?.backup && fs.existsSync(saveRules122.json.backup)) &&
+        savedRoutingRaw122.custom_keep_meta?.owner === 'local-test' &&
+        autoRoute122.status === 200 &&
+        partsAfterAuto122.get('frontend')?.agent === 'gemini' &&
+        partsAfterAuto122.get('frontend')?.model === 'gemini-3.8-flash' &&
+        partsAfterAuto122.get('frontend')?.matched_rule_id === 'r_ui' &&
+        partsAfterAuto122.get('comm')?.agent === 'antigravity' &&
+        partsAfterAuto122.get('comm')?.matched_rule_id === 'r_comm' &&
+        partsAfterAuto122.get('storage')?.agent === 'codex' &&
+        partsAfterAuto122.get('storage')?.manual_override === true &&
+        partsAfterAuto122.get('perf_opt')?.agent === 'antigravity' &&
+        partsAfterAuto122.get('perf_opt')?.assignment_source === 'fallback_main' &&
+        getBrokenRoute122.json?.broken === true &&
+        saveBrokenRoute122.status === 422 &&
+        saveBrokenRoute122.json?.code === 'corrupted_routing_config' &&
+        stillBroken122,
+        `fe=${partsAfterAuto122.get('frontend')?.agent} st=${partsAfterAuto122.get('storage')?.agent} perf=${partsAfterAuto122.get('perf_opt')?.agent}/${partsAfterAuto122.get('perf_opt')?.assignment_source} brk=${saveBrokenRoute122.status}`);
+
+      // 123. 分派 part 使用真实 to (非全局 conductor)、默认自动 dispatch、活跃任务防重；模块看板 direct 模式直发目标 agent
+      const dispParts123 = await pbFetch(`/api/projects/${projId120}/dispatch`, 'POST', {
+        part_keys: ['frontend', 'comm'],
+        auto_dispatch: true,
+      });
+      const feDisp123 = (dispParts123.json?.results || []).find((r) => r.part_key === 'frontend');
+      const commDisp123 = (dispParts123.json?.results || []).find((r) => r.part_key === 'comm');
+      const shownFe123 = runCli(['show', feDisp123?.task_id], { root: pbRoot, allowed: pbAllowed }).json;
+      const shownComm123 = runCli(['show', commDisp123?.task_id], { root: pbRoot, allowed: pbAllowed }).json;
+
+      // Second dispatch on same active part MUST skip without creating duplicate active task
+      const dispDup123 = await pbFetch(`/api/projects/${projId120}/dispatch`, 'POST', {
+        part_keys: ['frontend'],
+        auto_dispatch: true,
+      });
+      const feDup123 = (dispDup123.json?.results || []).find((r) => r.part_key === 'frontend');
+
+      // Module board direct mode vs conductor mode semantics
+      const modDirect123 = await pbFetch('/api/requests', 'POST', {
+        module_ids: ['ui'],
+        action: 'inspect',
+        route_mode: 'direct',
+        target_agent: 'antigravity',
+        dispatch: false,
+      });
+      const shownModDirect123 = runCli(['show', modDirect123.json?.task_id], { root: pbRoot, allowed: pbAllowed }).json;
+      const modCond123 = await pbFetch('/api/requests', 'POST', {
+        module_ids: ['ui'],
+        action: 'inspect',
+        route_mode: 'conductor',
+        target_agent: 'antigravity',
+        dispatch: false,
+      });
+
+      assertCase(123, 'part 分派按真实 part.agent 创建并自动 dispatch、活跃任务防重复；模块看板 direct 模式直发目标 agent 而 conductor 模式显式区分接收方与执行方',
+        dispParts123.status === 200 &&
+        dispParts123.json?.ok === true &&
+        feDisp123?.to === 'gemini' &&
+        feDisp123?.dispatched === true &&
+        shownFe123?.to === 'gemini' &&
+        commDisp123?.to === 'antigravity' &&
+        shownComm123?.to === 'antigravity' &&
+        dispDup123.status === 200 &&
+        feDup123?.skipped === true &&
+        feDup123?.reason === 'active_task_exists' &&
+        feDup123?.task_id === feDisp123?.task_id &&
+        modDirect123.status === 201 &&
+        modDirect123.json?.route_mode === 'direct' &&
+        modDirect123.json?.to === 'antigravity' &&
+        shownModDirect123?.to === 'antigravity' &&
+        modCond123.status === 201 &&
+        modCond123.json?.route_mode === 'conductor' &&
+        modCond123.json?.to === 'codex' &&
+        modCond123.json?.target_agent === 'antigravity',
+        `fe=${feDisp123?.to} comm=${commDisp123?.to} dup=${feDup123?.reason} modDir=${modDirect123.json?.to} modCond=${modCond123.json?.to}/${modCond123.json?.target_agent}`);
+    } finally {
+      await srvPb.close();
+      if (prevAllowed120 === undefined) delete process.env.AGENTBUS_ALLOWED_ROOTS;
+      else process.env.AGENTBUS_ALLOWED_ROOTS = prevAllowed120;
+      if (prevAgentsCfg120 === undefined) delete process.env.AGENTBUS_AGENTS_CONFIG;
+      else process.env.AGENTBUS_AGENTS_CONFIG = prevAgentsCfg120;
+    }
+
+    // 124. 独立滚动 CSS/布局静态断言 + 零依赖/无 CDN/无个人模型硬编码校验
+    const html124 = fs.readFileSync(path.join(PKG_ROOT, 'src', 'ui', 'index.html'), 'utf8');
+    const leftPaneCss124 = /\.catalog-pane\s*\{[\s\S]*?\}/.exec(html124)?.[0] || '';
+    const rightPaneCss124 = /\.inspector\s*\{[\s\S]*?\}/.exec(html124)?.[0] || '';
+    const pkg124 = JSON.parse(fs.readFileSync(path.join(PKG_ROOT, 'package.json'), 'utf8'));
+    const noDeps124 = !pkg124.dependencies || Object.keys(pkg124.dependencies).length === 0;
+    const newUiSources124 = [
+      html124,
+      fs.readFileSync(path.join(PKG_ROOT, 'src', 'ui', 'project.js'), 'utf8'),
+      fs.readFileSync(path.join(PKG_ROOT, 'src', 'ui', 'routes.js'), 'utf8'),
+      fs.readFileSync(path.join(PKG_ROOT, 'src', 'ui', 'server.js'), 'utf8'),
+      fs.readFileSync(path.join(PKG_ROOT, 'docs', 'UI.md'), 'utf8'),
+    ].join('\n');
+    const noPersonalLeak124 = !/gpt-?6\.2-?sol|gpt-?6\.1-?terra|Neon\s*高|极高|sk-[A-Za-z0-9]{20,}/i.test(newUiSources124);
+    const noCdn124 = !/https?:\/\/cdn\.|fonts\.googleapis\.com|<script[^>]+src=["']https?:/i.test(html124);
+
+    assertCase(124, '左右双栏独立滚动 CSS 静态断言（.catalog-pane 与 .inspector 均含 min-height:0、overflow-y:auto、overscroll-behavior:contain）+ 零依赖无个人模型硬编码',
+      /min-height\s*:\s*0/.test(leftPaneCss124) &&
+      /overflow-y\s*:\s*auto/.test(leftPaneCss124) &&
+      /overscroll-behavior\s*:\s*contain/.test(leftPaneCss124) &&
+      /min-height\s*:\s*0/.test(rightPaneCss124) &&
+      /overflow-y\s*:\s*auto/.test(rightPaneCss124) &&
+      /overscroll-behavior\s*:\s*contain/.test(rightPaneCss124) &&
+      html124.includes('项目看板') &&
+      html124.includes('自动路由规则') &&
+      noDeps124 &&
+      noPersonalLeak124 &&
+      noCdn124,
+      `leftOk=${/overflow-y\s*:\s*auto/.test(leftPaneCss124)} rightOk=${/overflow-y\s*:\s*auto/.test(rightPaneCss124)} noDeps=${noDeps124} noLeak=${noPersonalLeak124}`);
+
+    // 125-130. 客户端 v3：模块负责人直接编辑、受控文件夹安全边界、读取已有项目扫描 existing/partial/missing、追加卡片与重生成 part、单表单互斥
+    const v3Base = path.join(RUN_BASE, 'ui_v3_125');
+    const v3Home = path.join(v3Base, 'home');
+    const v3BinDir = path.join(v3Base, 'bin');
+    const v3Root = path.join(v3Base, 'root');
+    const v3Work = path.join(v3Base, 'workspace');
+    const v3SampleProj = path.join(v3Work, 'sample_app');
+    const v3OutsideDir = path.join(v3Base, 'outside_secret');
+    fs.mkdirSync(v3Home, { recursive: true });
+    fs.mkdirSync(v3BinDir, { recursive: true });
+    fs.mkdirSync(v3Root, { recursive: true });
+    fs.mkdirSync(path.join(v3SampleProj, 'src', 'web'), { recursive: true });
+    fs.mkdirSync(path.join(v3SampleProj, 'src', 'empty_stub'), { recursive: true });
+    fs.mkdirSync(v3OutsideDir, { recursive: true });
+
+    // Create sample existing project files (existing + partial stub + missing tests/docs/entry)
+    fs.writeFileSync(path.join(v3SampleProj, 'package.json'), JSON.stringify({
+      name: 'sample-lan-app',
+      description: '示例局域网小工具',
+      main: 'src/missing_entry.js',
+    }, null, 2) + '\n', 'utf8');
+    fs.writeFileSync(path.join(v3SampleProj, 'src', 'web', 'index.js'), '// Sample web entry point with enough content for existing detection\nexport function boot() { return true; }\n', 'utf8');
+    fs.writeFileSync(path.join(v3SampleProj, 'src', 'empty_stub', 'todo.js'), '// stub\n', 'utf8');
+    fs.writeFileSync(path.join(v3OutsideDir, 'secret.txt'), 'TOP_SECRET_OUTSIDE_ALLOWED_ROOT', 'utf8');
+
+    // Attempt symlink escape inside workspace -> outside_secret
+    let symlinkCreated126 = false;
+    const v3SymlinkPath = path.join(v3Work, 'escape_link');
+    try {
+      fs.symlinkSync(v3OutsideDir, v3SymlinkPath, process.platform === 'win32' ? 'junction' : 'dir');
+      symlinkCreated126 = true;
+    } catch {}
+
+    const v3Ext = process.platform === 'win32' ? '.cmd' : '';
+    for (const nm of ['codex', 'agentapi', 'gemini']) {
+      const bf = path.join(v3BinDir, `${nm}${v3Ext}`);
+      fs.writeFileSync(bf, process.platform === 'win32' ? '@echo off\r\n' : '#!/bin/sh\n', 'utf8');
+      if (process.platform !== 'win32') fs.chmodSync(bf, 0o755);
+    }
+    fs.mkdirSync(path.join(v3Home, '.codex'), { recursive: true });
+    fs.writeFileSync(path.join(v3Home, '.codex', 'config.toml'), 'model_provider = "openai"\n', 'utf8');
+    fs.mkdirSync(path.join(v3Home, '.gemini', 'config'), { recursive: true });
+    fs.writeFileSync(path.join(v3Home, '.gemini', 'config', 'mcp_config.json'), '{"mcpServers":{}}\n', 'utf8');
+    fs.writeFileSync(path.join(v3Home, '.gemini', 'settings.json'), '{"mcpServers":{}}\n', 'utf8');
+
+    fs.writeFileSync(path.join(v3Root, 'agents.json'), JSON.stringify({
+      conductor: 'codex',
+      models: {
+        codex: 'gpt-5-codex',
+        antigravity: 'gemini-4-neon',
+        gemini: 'gemini-3.8-flash',
+      },
+    }, null, 2) + '\n', 'utf8');
+
+    const v3Env = {
+      PATH: v3BinDir,
+      HOME: v3Home,
+      USERPROFILE: v3Home,
+      APPDATA: path.join(v3Home, 'AppData', 'Roaming'),
+      LOCALAPPDATA: path.join(v3Home, 'AppData', 'Local'),
+    };
+    const v3Allowed = [v3Root, v3Work].join(path.delimiter);
+    const prevAllowed125 = process.env.AGENTBUS_ALLOWED_ROOTS;
+    const prevAgents125 = process.env.AGENTBUS_AGENTS_CONFIG;
+    process.env.AGENTBUS_ALLOWED_ROOTS = v3Allowed;
+    delete process.env.AGENTBUS_AGENTS_CONFIG;
+
+    const v3DispatchLog = [];
+    const srvV3 = await startUiServer({
+      rootOverride: v3Root,
+      home: v3Home,
+      env: v3Env,
+      host: '127.0.0.1',
+      port: 0,
+      pkgRoot: v3Work,
+      dispatchFn: async (_bus, opts) => {
+        const shown = runCli(['show', opts.id], { root: v3Root, allowed: v3Allowed }).json;
+        v3DispatchLog.push({ id: opts.id, to: shown?.to, cwd: opts.cwd });
+        return { id: opts.id, to: shown?.to, state: shown?.state || 'open', dispatched: true };
+      },
+    });
+
+    const v3Fetch = async (pathname, method = 'GET', payload = undefined) => {
+      const r = await fetch(`${srvV3.url}${pathname}`, {
+        method,
+        headers: payload !== undefined ? { 'Content-Type': 'application/json' } : undefined,
+        body: payload !== undefined ? JSON.stringify(payload) : undefined,
+      });
+      return { status: r.status, json: await r.json() };
+    };
+
+    try {
+      // 125. 模块负责人/模型直接编辑、批量修改、本地持久化、恢复默认、不改 modules.json、非法值拒绝
+      const rawModulesBefore125 = fs.readFileSync(path.join(PKG_ROOT, 'src', 'ui', 'modules.json'), 'utf8');
+      const ownersFile125 = path.join(v3Root, 'module-owners.json');
+      fs.writeFileSync(ownersFile125, JSON.stringify({
+        schema: 'agentbus/module-owners@1',
+        custom_keep: 'stay-intact',
+        overrides: {},
+      }, null, 2) + '\n', 'utf8');
+
+      const singleEdit125 = await v3Fetch('/api/modules/owners', 'PATCH', {
+        module_id: 'ui',
+        owner_agent: 'gemini',
+        owner_model: 'gemini-3.8-flash',
+      });
+      const batchEdit125 = await v3Fetch('/api/modules/owners', 'PATCH', {
+        module_ids: ['db', 'store'],
+        owner_agent: 'codex',
+        owner_model: 'gpt-5-codex',
+      });
+      const badAgent125 = await v3Fetch('/api/modules/owners', 'PATCH', {
+        module_id: 'ui',
+        owner_agent: 'claude', // uninstalled
+      });
+      const badModel125 = await v3Fetch('/api/modules/owners', 'PATCH', {
+        module_id: 'ui',
+        owner_agent: 'gemini',
+        owner_model: 'not-a-real-model',
+      });
+      const badField125 = await v3Fetch('/api/modules/owners', 'PATCH', {
+        module_id: 'ui',
+        owner_agent: 'gemini',
+        home: '/tmp/hijack',
+      });
+      const modsAfterEdit125 = await v3Fetch('/api/modules');
+      const ownersWritten125 = JSON.parse(fs.readFileSync(ownersFile125, 'utf8'));
+
+      const resetOne125 = await v3Fetch('/api/modules/owners/reset', 'POST', { module_ids: ['ui'] });
+      const modsAfterReset125 = await v3Fetch('/api/modules');
+      const rawModulesAfter125 = fs.readFileSync(path.join(PKG_ROOT, 'src', 'ui', 'modules.json'), 'utf8');
+
+      // Corrupted module-owners.json must refuse overwrite
+      const savedOwnersBackup125 = fs.readFileSync(ownersFile125, 'utf8');
+      fs.writeFileSync(ownersFile125, '{broken-json', 'utf8');
+      const brokenEdit125 = await v3Fetch('/api/modules/owners', 'PATCH', { module_id: 'db', owner_agent: 'gemini' });
+      fs.writeFileSync(ownersFile125, savedOwnersBackup125, 'utf8');
+
+      const uiModEdit125 = (modsAfterEdit125.json?.modules || []).find((m) => m.id === 'ui');
+      const dbModEdit125 = (modsAfterEdit125.json?.modules || []).find((m) => m.id === 'db');
+      const storeModEdit125 = (modsAfterEdit125.json?.modules || []).find((m) => m.id === 'store');
+      const uiModReset125 = (modsAfterReset125.json?.modules || []).find((m) => m.id === 'ui');
+
+      assertCase(125, '模块看板单卡与批量改负责人/模型持久化到本地 module-owners.json、保留未知字段、支持恢复默认、不改源码且拦截非法值',
+        singleEdit125.status === 200 &&
+        batchEdit125.status === 200 &&
+        uiModEdit125?.owner_agent === 'gemini' &&
+        uiModEdit125?.owner_model === 'gemini-3.8-flash' &&
+        uiModEdit125?.overridden === true &&
+        dbModEdit125?.owner_agent === 'codex' &&
+        storeModEdit125?.owner_agent === 'codex' &&
+        ownersWritten125.custom_keep === 'stay-intact' &&
+        badAgent125.status === 400 && badAgent125.json?.code === 'agent_not_installed' &&
+        badModel125.status === 400 && badModel125.json?.code === 'invalid_model' &&
+        badField125.status === 400 && badField125.json?.code === 'invalid_field' &&
+        resetOne125.status === 200 &&
+        uiModReset125?.owner_agent === 'antigravity' &&
+        uiModReset125?.overridden === false &&
+        brokenEdit125.status === 422 && brokenEdit125.json?.code === 'corrupted_module_owners_config' &&
+        rawModulesAfter125 === rawModulesBefore125,
+        `ui=${uiModEdit125?.owner_agent}/${uiModEdit125?.owner_model} db=${dbModEdit125?.owner_agent} bad=${badAgent125.status}/${badModel125.status} brk=${brokenEdit125.status}`);
+
+      // 126. 受控文件夹浏览与扫描安全边界：正常目录可读；拒绝 ..、整盘根、allowed_roots 外目录与符号链接逃逸
+      const browseOk126 = await v3Fetch(`/api/workspace/browse?dir=${encodeURIComponent(v3Work)}`);
+      const inspectOk126 = await v3Fetch('/api/workspace/inspect', 'POST', { workspace_dir: v3SampleProj });
+      const badDotDot126 = await v3Fetch('/api/workspace/inspect', 'POST', { workspace_dir: `${v3SampleProj}/../outside_secret` });
+      const badDrive126 = await v3Fetch('/api/workspace/inspect', 'POST', { workspace_dir: process.platform === 'win32' ? 'C:\\' : '/' });
+      const badOutside126 = await v3Fetch('/api/workspace/inspect', 'POST', { workspace_dir: v3OutsideDir });
+      const badSymlink126 = symlinkCreated126
+        ? await v3Fetch('/api/workspace/inspect', 'POST', { workspace_dir: v3SymlinkPath })
+        : { status: 403, json: { code: 'symlink_escape' } };
+
+      assertCase(126, '受控文件夹选择与读取严格守住 allowed_roots 边界，拒绝 ..、整盘扫描、根外目录与符号链接逃逸',
+        browseOk126.status === 200 &&
+        browseOk126.json?.subdirs?.some((d) => d.name === 'sample_app') &&
+        !browseOk126.json?.subdirs?.some((d) => d.name === 'escape_link') &&
+        inspectOk126.status === 200 &&
+        inspectOk126.json?.file_count === 3 &&
+        inspectOk126.json?.files?.every((f) => !path.isAbsolute(f.rel_path) && !f.rel_path.includes('..')) &&
+        badDotDot126.status === 400 && badDotDot126.json?.code === 'path_traversal_denied' &&
+        badDrive126.status === 403 && badDrive126.json?.code === 'drive_root_denied' &&
+        badOutside126.status === 403 && badOutside126.json?.code === 'path_outside_allowed_roots' &&
+        badSymlink126.status === 403 &&
+        (badSymlink126.json?.code === 'symlink_escape' || badSymlink126.json?.code === 'path_outside_allowed_roots'),
+        `browse=${browseOk126.status} files=${inspectOk126.json?.file_count} dotdot=${badDotDot126.status} drive=${badDrive126.status} out=${badOutside126.status} sym=${badSymlink126.status}:${badSymlink126.json?.code}`);
+
+      // 127. 读取已有项目并扫描生成 existing / partial / missing 卡片，不伪造未实现功能，直发主 Agent，支持重扫目录
+      const readExist127 = await v3Fetch('/api/projects/read-existing', 'POST', {
+        workspace_dir: v3SampleProj,
+        main_agent: 'antigravity',
+        scan_with_agent: true,
+        auto_dispatch: true,
+      });
+      const readProjId127 = readExist127.json?.project?.id;
+      const readParts127 = readExist127.json?.project?.parts || [];
+      const hasExisting127 = readParts127.some((p) => p.implementation_status === 'existing');
+      const hasPartial127 = readParts127.some((p) => p.implementation_status === 'partial');
+      const hasMissing127 = readParts127.some((p) => p.implementation_status === 'missing');
+      const manifestFile127 = readExist127.json?.project?.workspace_scan?.manifest_file;
+      const shownScanTask127 = runCli(['show', readExist127.json?.bootstrap_task?.id], { root: v3Root, allowed: v3Allowed }).json;
+
+      // Add a test file and rescan -> missing_tests should update cleanly
+      fs.mkdirSync(path.join(v3SampleProj, 'test'), { recursive: true });
+      fs.writeFileSync(path.join(v3SampleProj, 'test', 'basic.test.js'), 'console.log("ok");\n', 'utf8');
+      const rescan127 = await v3Fetch(`/api/projects/${readProjId127}/rescan`, 'POST');
+
+      assertCase(127, '读取已有项目扫描准确区分 existing / partial / missing 卡片，紧凑清单落盘 bus root 且直发所选主 Agent',
+        readExist127.status === 201 &&
+        readExist127.json?.ok === true &&
+        hasExisting127 &&
+        hasPartial127 &&
+        hasMissing127 &&
+        readExist127.json?.bootstrap_task?.to === 'antigravity' &&
+        readExist127.json?.bootstrap_task?.dispatched === true &&
+        shownScanTask127?.to === 'antigravity' &&
+        Boolean(manifestFile127 && fs.existsSync(manifestFile127) && manifestFile127.startsWith(v3Root)) &&
+        rescan127.status === 200 &&
+        rescan127.json?.workspace_scan?.file_count === 4,
+        `st=${readExist127.status} ex=${hasExisting127} pa=${hasPartial127} mi=${hasMissing127} to=${shownScanTask127?.to} rescanFiles=${rescan127.json?.workspace_scan?.file_count}`);
+
+      // 128. 向主 Agent 追加卡片（ask-cards）-> delta 自动合并、保护用户手工覆盖卡片、原始 plan.json 不被修改
+      const planProj128 = await v3Fetch('/api/projects', 'POST', {
+        name: '追加与重生成测试项目',
+        goal: '测试主 Agent 追加卡片与重生成',
+        workspace_dir: v3SampleProj,
+        main_agent: 'antigravity',
+        auto_dispatch: true,
+      });
+      const pid128 = planProj128.json?.project?.id;
+      const bootId128 = planProj128.json?.bootstrap_task?.id;
+      const planFile128 = path.join(v3SampleProj, 'out', 'projects', pid128, 'plan.json');
+      fs.mkdirSync(path.dirname(planFile128), { recursive: true });
+      const origPlanText128 = JSON.stringify({
+        schema: 'agentbus/project-plan@1',
+        project_id: pid128,
+        title: '追加与重生成测试项目',
+        summary: '初始拆解',
+        parts: [
+          {
+            key: 'web_ui',
+            title: '前端界面',
+            category: 'frontend_ui',
+            status: 'existing',
+            goal: '维护前端模块',
+            paths: ['src/web/index.js'],
+            acceptance: ['页面可用'],
+            agent: 'antigravity',
+            model: '',
+            depends_on: [],
+          },
+        ],
+      }, null, 2) + '\n';
+      fs.writeFileSync(planFile128, origPlanText128, 'utf8');
+      const cBoot128 = runCli(['claim', bootId128, '--by', 'antigravity'], { root: v3Root, allowed: v3Allowed }).json;
+      runCli(['done', bootId128, '--by', 'antigravity', '--lease', cBoot128.lease_token, '--result', planFile128], { root: v3Root, allowed: v3Allowed });
+
+      // Manually edit web_ui -> sets manual_override = true
+      await v3Fetch(`/api/projects/${pid128}/parts/web_ui`, 'PATCH', {
+        title: '前端界面（用户手工微调）',
+        agent: 'codex',
+        manual_override: true,
+      });
+
+      // Ask main agent to add notify_center and also propose touching web_ui
+      const ask128 = await v3Fetch(`/api/projects/${pid128}/ask-cards`, 'POST', {
+        prompt: '增加通知中心模块，并顺便调整前端标题',
+        auto_dispatch: true,
+      });
+      const reqId128 = ask128.json?.request?.id;
+      const askTaskId128 = ask128.json?.task?.id;
+      const deltaFile128 = path.join(v3SampleProj, ask128.json?.request?.delta_rel_path);
+      fs.mkdirSync(path.dirname(deltaFile128), { recursive: true });
+      fs.writeFileSync(deltaFile128, JSON.stringify({
+        schema: 'agentbus/project-plan-delta@1',
+        project_id: pid128,
+        title: '追加通知中心',
+        parts: [
+          {
+            key: 'web_ui',
+            title: '尝试覆盖手工卡片',
+            category: 'frontend_ui',
+            goal: '不应静默覆盖',
+            paths: ['src/web/index.js'],
+            acceptance: ['ok'],
+            agent: 'gemini',
+          },
+          {
+            key: 'notify_center',
+            title: '通知中心',
+            category: 'backend_api',
+            status: 'missing',
+            goal: '实现消息推送与通知历史',
+            paths: ['src/notify/index.js'],
+            acceptance: ['通知可收发'],
+            agent: 'antigravity',
+          },
+        ],
+      }, null, 2) + '\n', 'utf8');
+
+      const cAsk128 = runCli(['claim', askTaskId128, '--by', 'antigravity'], { root: v3Root, allowed: v3Allowed }).json;
+      runCli(['done', askTaskId128, '--by', 'antigravity', '--lease', cAsk128.lease_token, '--result', deltaFile128], { root: v3Root, allowed: v3Allowed });
+
+      // Merge without confirm_overwrite_manual -> adds notify_center, protects web_ui!
+      const mergeSafe128 = await v3Fetch(`/api/projects/${pid128}/apply-delta`, 'POST', {
+        request_id: reqId128,
+        confirm_overwrite_manual: false,
+      });
+      const webAfterSafe128 = (mergeSafe128.json?.project?.parts || []).find((p) => p.key === 'web_ui');
+      const notifyAfterSafe128 = (mergeSafe128.json?.project?.parts || []).find((p) => p.key === 'notify_center');
+
+      assertCase(128, '向主 Agent 追加卡片创建真实任务并自动派发；合并新增卡片时保护用户手工修改项且不改原始 plan.json',
+        ask128.status === 201 &&
+        ask128.json?.task?.to === 'antigravity' &&
+        ask128.json?.task?.dispatched === true &&
+        mergeSafe128.status === 200 &&
+        mergeSafe128.json?.added_keys?.includes('notify_center') &&
+        mergeSafe128.json?.skipped_manual_keys?.includes('web_ui') &&
+        mergeSafe128.json?.needs_confirmation === true &&
+        webAfterSafe128?.title === '前端界面（用户手工微调）' &&
+        webAfterSafe128?.agent === 'codex' &&
+        Boolean(notifyAfterSafe128) &&
+        fs.readFileSync(planFile128, 'utf8') === origPlanText128,
+        `ask=${ask128.status} added=${JSON.stringify(mergeSafe128.json?.added_keys)} skipped=${JSON.stringify(mergeSafe128.json?.skipped_manual_keys)}`);
+
+      // 129. 重生成已完成/已有 part：保留历史 task_id、携带上下文与实现摘要、不改 plan.json、活跃任务防重 409
+      const dispFirst129 = await v3Fetch(`/api/projects/${pid128}/dispatch`, 'POST', { part_keys: ['web_ui'], auto_dispatch: true });
+      const firstTaskId129 = dispFirst129.json?.results?.[0]?.task_id;
+      // While first task is still open -> regenerate MUST be rejected with 409 active_task_exists!
+      const regenBlocked129 = await v3Fetch(`/api/projects/${pid128}/parts/web_ui/regenerate`, 'POST', {
+        agent: 'gemini',
+        notes: '活跃期不应重复触发',
+      });
+      // Finish first task -> regenerate succeeds with new agent (gemini), preserves firstTaskId129 in task_history!
+      const cFirst129 = runCli(['claim', firstTaskId129, '--by', 'codex'], { root: v3Root, allowed: v3Allowed }).json;
+      const doneResFile129 = path.join(v3Root, 'web_ui_done_129.json');
+      fs.writeFileSync(doneResFile129, JSON.stringify({ ok: true }), 'utf8');
+      runCli(['done', firstTaskId129, '--by', 'codex', '--lease', cFirst129.lease_token, '--result', doneResFile129], { root: v3Root, allowed: v3Allowed });
+
+      const regenOk129 = await v3Fetch(`/api/projects/${pid128}/parts/web_ui/regenerate`, 'POST', {
+        agent: 'gemini',
+        model: 'gemini-3.8-flash',
+        notes: '重构交互并补充错误提示',
+        auto_dispatch: true,
+      });
+      const regenTaskId129 = regenOk129.json?.task?.id;
+      const shownRegen129 = runCli(['show', regenTaskId129], { root: v3Root, allowed: v3Allowed }).json;
+      const histIds129 = (regenOk129.json?.part?.task_history || []).map((h) => h.task_id);
+
+      assertCase(129, '重生成已完成 part 创建新任务并自动派发、保留历史 task_id、携带实现摘要、不改 plan.json 且活跃期 409 防重',
+        regenBlocked129.status === 409 &&
+        regenBlocked129.json?.code === 'active_task_exists' &&
+        regenOk129.status === 201 &&
+        regenOk129.json?.ok === true &&
+        regenOk129.json?.task?.to === 'gemini' &&
+        regenOk129.json?.task?.dispatched === true &&
+        regenTaskId129 !== firstTaskId129 &&
+        histIds129.includes(firstTaskId129) &&
+        histIds129.includes(regenTaskId129) &&
+        shownRegen129?.goal?.includes('src/web/index.js') &&
+        shownRegen129?.goal?.includes('重构交互并补充错误提示') &&
+        fs.readFileSync(planFile128, 'utf8') === origPlanText128,
+        `blk=${regenBlocked129.status}:${regenBlocked129.json?.code} ok=${regenOk129.status} to=${regenOk129.json?.task?.to} hist=${JSON.stringify(histIds129)}`);
+
+      // 130. 表单互斥可见性静态/结构校验 + 无 em-dash / 无 CDN / 零依赖 + 无适配器 agent 快速报错
+      const html130 = fs.readFileSync(path.join(PKG_ROOT, 'src', 'ui', 'index.html'), 'utf8');
+      const newFormHiddenInit130 = /<section id="newProjectView"[^>]*\bhidden\b/.test(html130);
+      const readFormHiddenInit130 = /<section id="readProjectView"[^>]*\bhidden\b/.test(html130);
+      const partFormHiddenInit130 = /<section id="partEditorView"[^>]*\bhidden\b/.test(html130);
+      const hasSingleViewSwitcher130 = html130.includes('function setProjectViewMode(');
+      const noEmDash130 = !html130.includes('—');
+      const noTransitionAll130 = !/transition\s*:\s*all\b/i.test(html130);
+      const hasReducedMotion130 = html130.includes('prefers-reduced-motion');
+      const hasInlineModSelect130 = html130.includes('data-mod-owner-agent') && html130.includes('data-mod-owner-model');
+      const hasBatchOwner130 = html130.includes('btnApplyBatchOwner');
+
+      assertCase(130, 'v3 UI 三表单默认隐藏互斥、模块看板行内与批量负责人控件完整、符合设计约束（无 em-dash / 无 transition:all / 支持 reduced-motion）',
+        newFormHiddenInit130 &&
+        readFormHiddenInit130 &&
+        partFormHiddenInit130 &&
+        hasSingleViewSwitcher130 &&
+        noEmDash130 &&
+        noTransitionAll130 &&
+        hasReducedMotion130 &&
+        hasInlineModSelect130 &&
+        hasBatchOwner130,
+        `hidden=${newFormHiddenInit130}/${readFormHiddenInit130}/${partFormHiddenInit130} noEm=${noEmDash130} noTrAll=${noTransitionAll130} modInline=${hasInlineModSelect130}`);
+
+      // 131. v3 返工：part 卡片可见标签/aria、明确下拉占位与解析默认值、立即保存与撤销/恢复默认（真实持久化）
+      const hasPartAgentLabel131 = /<label class="part-control-label"[^>]*>负责 Agent<\/label>/.test(html130) &&
+        html130.includes('aria-label="${escapeHtml(part.title)} 负责 Agent"');
+      const hasPartModelLabel131 = /<label class="part-control-label"[^>]*>模型<\/label>/.test(html130) &&
+        html130.includes('aria-label="${escapeHtml(part.title)} 模型"');
+      const hasClearPlaceholders131 = html130.includes('请选择负责 Agent') &&
+        html130.includes('沿用 Agent 默认模型');
+      const hasPartSaveUndoReset131 = html130.includes('data-part-save-state') &&
+        html130.includes('data-part-action="undo-assign"') &&
+        html130.includes('data-part-action="reset-assign"');
+
+      // Verify real backend persistence for part manual override -> reset to default (manual_override=false)
+      const partPatchAssign131 = await v3Fetch(`/api/projects/${pid128}/parts/notify_center`, 'PATCH', {
+        agent: 'codex',
+        model: 'gpt-5-codex',
+        manual_override: true,
+      });
+      const partResetDefault131 = await v3Fetch(`/api/projects/${pid128}/parts/notify_center`, 'PATCH', {
+        agent: 'antigravity',
+        model: '',
+        manual_override: false,
+      });
+      assertCase(131, 'part 卡片具备可见负责 Agent/模型标签与 aria、明确默认模型语义，并支持立即保存、撤销与恢复默认持久化',
+        hasPartAgentLabel131 &&
+        hasPartModelLabel131 &&
+        hasClearPlaceholders131 &&
+        hasPartSaveUndoReset131 &&
+        partPatchAssign131.status === 200 &&
+        partPatchAssign131.json?.part?.agent === 'codex' &&
+        partPatchAssign131.json?.part?.model === 'gpt-5-codex' &&
+        partPatchAssign131.json?.part?.manual_override === true &&
+        partResetDefault131.status === 200 &&
+        partResetDefault131.json?.part?.agent === 'antigravity' &&
+        partResetDefault131.json?.part?.model === '' &&
+        partResetDefault131.json?.part?.manual_override === false,
+        `labels=${hasPartAgentLabel131}/${hasPartModelLabel131} ph=${hasClearPlaceholders131} fb=${hasPartSaveUndoReset131} reset=${partResetDefault131.status}:${partResetDefault131.json?.part?.manual_override}`);
+
+      // 132. v3 返工：模块看板列头与行内标签、清晰两字段批量表单与预览、混合值不伪造、仅改模型批量持久化与解析默认模型
+      const hasModColHead132 = html130.includes('class="mod-col-head"') &&
+        html130.includes('<div>负责 Agent</div>') &&
+        html130.includes('<div>负责模型</div>');
+      const hasClearBatchUi132 = !html130.includes('批量改负责人') &&
+        html130.includes('批量设置负责 Agent') &&
+        html130.includes('批量设置负责模型') &&
+        html130.includes('应用到所选') &&
+        html130.includes('id="moduleBatchPreview"') &&
+        html130.includes('混合/多个值') &&
+        html130.includes('保持各自当前');
+
+      // Backend: set two modules to same agent then batch-update ONLY owner_model (keep agent), verify agent_default_model returned
+      const batchPrep132 = await v3Fetch('/api/modules/owners', 'PATCH', {
+        module_ids: ['db', 'store'],
+        owner_agent: 'gemini',
+        owner_model: '',
+      });
+      const batchModelOnly132 = await v3Fetch('/api/modules/owners', 'PATCH', {
+        module_ids: ['db', 'store'],
+        owner_model: 'gemini-3.8-flash',
+      });
+      const modsAfter132 = await v3Fetch('/api/modules');
+      const db132 = (modsAfter132.json?.modules || []).find((m) => m.id === 'db');
+      const store132 = (modsAfter132.json?.modules || []).find((m) => m.id === 'store');
+      const ui132 = (modsAfter132.json?.modules || []).find((m) => m.id === 'ui');
+
+      assertCase(132, '模块看板标注负责 Agent/模型、批量表单明确字段与影响预览且处理混合值，后端支持仅批量改模型并返回解析默认模型',
+        hasModColHead132 &&
+        hasClearBatchUi132 &&
+        batchPrep132.status === 200 &&
+        batchModelOnly132.status === 200 &&
+        db132?.owner_agent === 'gemini' &&
+        db132?.owner_model === 'gemini-3.8-flash' &&
+        store132?.owner_agent === 'gemini' &&
+        store132?.owner_model === 'gemini-3.8-flash' &&
+        typeof db132?.agent_default_model === 'string' &&
+        ui132?.agent_default_model === 'gemini-4-neon' &&
+        ui132?.agent_default_model_configured === true,
+        `head=${hasModColHead132} batchUi=${hasClearBatchUi132} db=${db132?.owner_agent}/${db132?.owner_model} uiDef=${ui132?.agent_default_model}`);
+
+      // 133. v3 返工：状态术语统一（已有 / 部分实现 / 缺失，非纯颜色表达）且核心控件在空状态/项目详情/添加卡片下互斥可见
+      const noPartialMismatch133 = !/部分 \$\{/.test(html130) && !/>部分 \$\{/.test(html130);
+      const hasUnifiedStateTerms133 = html130.includes("existing: { text: '已有', mark: '✓'") &&
+        html130.includes("partial: { text: '部分实现', mark: '◐'") &&
+        html130.includes("missing: { text: '缺失', mark: '×'") &&
+        html130.includes('部分实现 ${c.partial || 0}');
+      const hasExclusiveViews133 = html130.includes("el.projectEmptyView.hidden = resolved !== 'empty';") &&
+        html130.includes("el.projectDetailView.hidden = resolved !== 'detail';") &&
+        html130.includes("el.partEditorView.hidden = resolved !== 'part-editor';") &&
+        html130.includes("el.newProjectView.hidden = resolved !== 'create';") &&
+        html130.includes("el.readProjectView.hidden = resolved !== 'read';");
+      const coreControlsDirect133 = html130.includes('id="btnEmptyNewProject"') &&
+        html130.includes('id="btnEmptyReadProject"') &&
+        html130.includes('data-proj-action="open-add-part"') &&
+        html130.includes('data-proj-action="auto-route"') &&
+        html130.includes('data-proj-action="dispatch-all"') &&
+        html130.includes('id="askMainAgentInput"');
+
+      assertCase(133, '状态术语在汇总/扫描/卡片全链路统一为已有/部分实现/缺失（含非颜色符号），且核心控件在三态下直接可见并互斥',
+        noPartialMismatch133 &&
+        hasUnifiedStateTerms133 &&
+        hasExclusiveViews133 &&
+        coreControlsDirect133,
+        `noMismatch=${noPartialMismatch133} unified=${hasUnifiedStateTerms133} excl=${hasExclusiveViews133} core=${coreControlsDirect133}`);
+
+      // 134. v3 终轮可读性修补：模块表归属状态与操作分列、part 卡标签字号>=14px且高对比、混合模型列出具体去重模型值
+      const hasSeparatedCols134 = html130.includes('<div>归属状态</div>') &&
+        html130.includes('<div>操作</div>') &&
+        html130.includes('class="mod-status-cell"') &&
+        html130.includes('class="mod-act-cell"');
+      const statusCellMatch134 = html130.match(/<div class="mod-status-cell"[\s\S]*?<\/div>/);
+      const actCellMatch134 = html130.match(/<div class="mod-act-cell"[\s\S]*?<\/div>/);
+      const statusOnlyState134 = Boolean(statusCellMatch134) &&
+        statusCellMatch134[0].includes('已改') &&
+        statusCellMatch134[0].includes('默认') &&
+        !statusCellMatch134[0].includes('<button') &&
+        !statusCellMatch134[0].includes('data-mod-reset');
+      const actHasResetBtn134 = Boolean(actCellMatch134) &&
+        actCellMatch134[0].includes('<button') &&
+        actCellMatch134[0].includes('data-mod-reset') &&
+        actCellMatch134[0].includes('恢复默认');
+
+      const textBaseMatch134 = html130.match(/--text-base\s*:\s*(\d+(?:\.\d+)?)px/);
+      const partLabelCssMatch134 = html130.match(/\.part-control-label\s*\{([\s\S]*?)\}/);
+      const textBasePx134 = textBaseMatch134 ? Number(textBaseMatch134[1]) : 0;
+      const partLabelCss134 = partLabelCssMatch134 ? partLabelCssMatch134[1] : '';
+      const partLabelDirectPxMatch134 = partLabelCss134.match(/font-size\s*:\s*(\d+(?:\.\d+)?)px/);
+      const partLabelEffectivePx134 = /font-size\s*:\s*var\(--text-base\)/.test(partLabelCss134)
+        ? textBasePx134
+        : (partLabelDirectPxMatch134 ? Number(partLabelDirectPxMatch134[1]) : 0);
+      const partLabelHighContrast134 = /color\s*:\s*var\(--ink\)/.test(partLabelCss134);
+
+      const hasMixedModelExplicit134 = html130.includes('function resolveModuleActualModel(') &&
+        html130.includes('当前负责模型：混合/多个值 (${mixedModelValuesText})') &&
+        html130.includes('保持各自当前模型（混合/多个值：${mixedModelValuesText}）') &&
+        html130.includes("if (draft.model === '__DEFAULT__')") &&
+        html130.includes("else if (draft.model && draft.model !== '__KEEP__')");
+
+      // Backend check: two modules with distinct effective models (explicit override vs agent default) expose distinct model values
+      await v3Fetch('/api/modules/owners', 'PATCH', { module_id: 'db', owner_agent: 'gemini', owner_model: 'gemini-3.8-flash' });
+      await v3Fetch('/api/modules/owners', 'PATCH', { module_id: 'store', owner_agent: 'codex', owner_model: '' });
+      const modsMixed134 = await v3Fetch('/api/modules');
+      const db134 = (modsMixed134.json?.modules || []).find((m) => m.id === 'db');
+      const store134 = (modsMixed134.json?.modules || []).find((m) => m.id === 'store');
+      const mixedActualSet134 = Array.from(new Set([
+        db134?.owner_model_override || db134?.agent_default_model,
+        store134?.owner_model_override || store134?.agent_default_model,
+      ].filter(Boolean)));
+
+      assertCase(134, 'v3 终轮可读性修补：模块表状态/操作分列、part 卡标签 >=14px 且高对比、混合模型摘要列出具体去重模型值',
+        hasSeparatedCols134 &&
+        statusOnlyState134 &&
+        actHasResetBtn134 &&
+        partLabelEffectivePx134 >= 14 &&
+        partLabelHighContrast134 &&
+        hasMixedModelExplicit134 &&
+        mixedActualSet134.length === 2 &&
+        mixedActualSet134.includes('gemini-3.8-flash') &&
+        mixedActualSet134.includes('gpt-5-codex'),
+        `cols=${hasSeparatedCols134} stOnly=${statusOnlyState134} actReset=${actHasResetBtn134} labelPx=${partLabelEffectivePx134} ink=${partLabelHighContrast134} mixed=${hasMixedModelExplicit134}:${JSON.stringify(mixedActualSet134)}`);
+
+      // 135. 项目看板 v4：旧项目无 group/groups 时 API 返回默认研发组与调试组顺序，part 不丢失且不改写磁盘旧数据
+      const projectsFile135 = path.join(v3Root, 'projects.json');
+      const curStore135 = JSON.parse(fs.readFileSync(projectsFile135, 'utf8'));
+      const legacyProjId135 = 'p_legacy_v4_compat';
+      const legacyProjRecord135 = {
+        id: legacyProjId135,
+        name: 'v3遗留兼容项目',
+        goal: '验证无 group/groups 字段的旧项目兼容',
+        summary: '旧项目数据',
+        source_mode: 'new',
+        workspace_dir: null,
+        main_agent: 'antigravity',
+        main_model: '',
+        plan_rel_path: `out/projects/${legacyProjId135}/plan.json`,
+        parts_initialized: true,
+        parts: [
+          {
+            key: 'legacy_a',
+            title: '遗留模块 A',
+            category: 'core',
+            goal: '保持研发组归属',
+            paths: ['src/a.js'],
+            acceptance: ['运行正常'],
+            agent: 'antigravity',
+            model: '',
+            depends_on: [],
+            implementation_status: 'existing',
+          },
+          {
+            key: 'legacy_b',
+            title: '遗留模块 B',
+            category: 'general',
+            goal: '保持无 group 兼容',
+            paths: ['src/b.js'],
+            acceptance: ['运行正常'],
+            agent: '',
+            model: '',
+            depends_on: [],
+            implementation_status: 'planned',
+          },
+        ],
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+      curStore135.projects.push(legacyProjRecord135);
+      const rawBeforeLegacyGet135 = JSON.stringify(curStore135, null, 2) + '\n';
+      fs.writeFileSync(projectsFile135, rawBeforeLegacyGet135, 'utf8');
+
+      const legacyDetail135 = await v3Fetch(`/api/projects/${legacyProjId135}`);
+      const legacyGroups135 = legacyDetail135.json?.project?.groups || [];
+      const legacyParts135 = legacyDetail135.json?.project?.parts || [];
+      const rawAfterLegacyGet135 = fs.readFileSync(projectsFile135, 'utf8');
+
+      assertCase(135, 'v4 旧项目无 group/groups 时 API 返回默认分组顺序（dev 后 debug），所有 part 自动归入 dev 且不改写磁盘旧数据',
+        legacyDetail135.status === 200 &&
+        legacyGroups135.length === 2 &&
+        legacyGroups135[0]?.key === 'dev' &&
+        legacyGroups135[0]?.title === '研发组' &&
+        legacyGroups135[0]?.order === 0 &&
+        legacyGroups135[1]?.key === 'debug' &&
+        legacyGroups135[1]?.title === '调试组' &&
+        legacyGroups135[1]?.order === 1 &&
+        legacyParts135.length === 2 &&
+        legacyParts135.every((pt) => pt.group === 'dev') &&
+        rawAfterLegacyGet135 === rawBeforeLegacyGet135,
+        `st=${legacyDetail135.status} groups=${JSON.stringify(legacyGroups135)} partGroups=${JSON.stringify(legacyParts135.map((x) => x.group))}`);
+
+      // 136. 项目看板 v4：plan 中 parts[].group 可被接受、缺失按规则推断/落到 dev、非法值拒绝，且拆解 prompt 包含分组要求
+      const { validateProjectPlan: validatePlan136 } = await import('../src/ui/project.js');
+      const v4ProjCreate136 = await v3Fetch('/api/projects', 'POST', {
+        name: '看板v4分组项目',
+        goal: '实现共享项目指针并排查是否回传失败',
+        workspace_dir: v3SampleProj,
+        main_agent: 'antigravity',
+        auto_dispatch: true,
+      });
+      const v4ProjId136 = v4ProjCreate136.json?.project?.id;
+      const v4BootId136 = v4ProjCreate136.json?.bootstrap_task?.id;
+      const shownV4Boot136 = runCli(['show', v4BootId136], { root: v3Root, allowed: v3Allowed }).json;
+      const v4PlanFile136 = path.join(v3SampleProj, 'out', 'projects', v4ProjId136, 'plan.json');
+      fs.mkdirSync(path.dirname(v4PlanFile136), { recursive: true });
+      fs.writeFileSync(v4PlanFile136, JSON.stringify({
+        schema: 'agentbus/project-plan@1',
+        project_id: v4ProjId136,
+        title: '看板v4分组项目',
+        summary: '拆分为研发组与调试组',
+        parts: [
+          {
+            key: 'shared_ptr',
+            title: '共享项目指针',
+            category: 'core',
+            group: 'dev',
+            goal: '实现项目指针跨组件共享',
+            paths: ['src/web/index.js'],
+            acceptance: ['指针同步正常'],
+            agent: 'antigravity',
+          },
+          {
+            key: 'ui_card_view',
+            title: '看板卡片布局',
+            category: 'frontend_ui',
+            goal: '渲染分组卡片与紧凑网格',
+            paths: ['src/ui/index.html'],
+            acceptance: ['布局切换正常'],
+            agent: 'gemini',
+          },
+          {
+            key: 'reply_check',
+            title: '排查是否回传失败',
+            category: 'debug',
+            group: 'debug',
+            goal: '定位并修复任务回传偶发失败问题',
+            paths: ['src/mcp.js'],
+            acceptance: ['回传稳定性 100%'],
+            agent: 'codex',
+          },
+          {
+            key: 'regression_probe',
+            title: '回归测试与报错排查',
+            category: 'general',
+            goal: '对回传超时进行回归调试',
+            paths: ['test/accept.mjs'],
+            acceptance: ['回归全绿'],
+            agent: '',
+          },
+        ],
+      }, null, 2) + '\n', 'utf8');
+
+      const cV4Boot136 = runCli(['claim', v4BootId136, '--by', 'antigravity'], { root: v3Root, allowed: v3Allowed }).json;
+      runCli(['done', v4BootId136, '--by', 'antigravity', '--lease', cV4Boot136.lease_token, '--result', v4PlanFile136], { root: v3Root, allowed: v3Allowed });
+      const v4Hydrated136 = await v3Fetch(`/api/projects/${v4ProjId136}`);
+      const v4PartsByKey136 = new Map((v4Hydrated136.json?.project?.parts || []).map((pt) => [pt.key, pt]));
+
+      const badPlanGroup136 = validatePlan136({
+        schema: 'agentbus/project-plan@1',
+        project_id: v4ProjId136,
+        title: '非法分组测试',
+        parts: [
+          {
+            key: 'bad_g',
+            title: '非法环节',
+            group: 'ops_invalid',
+            goal: '应被拒绝',
+          },
+        ],
+      }, v4ProjId136);
+
+      assertCase(136, 'v4 拆解 prompt 含分组要求；plan.json 支持 group（dev/debug）、缺省按规则推断/落到 dev、非法 group 拒绝',
+        v4ProjCreate136.status === 201 &&
+        shownV4Boot136?.goal?.includes('"dev"') &&
+        shownV4Boot136?.goal?.includes('"debug"') &&
+        v4Hydrated136.status === 200 &&
+        v4Hydrated136.json?.project?.groups?.[0]?.key === 'dev' &&
+        v4Hydrated136.json?.project?.groups?.[1]?.key === 'debug' &&
+        v4PartsByKey136.get('shared_ptr')?.group === 'dev' &&
+        v4PartsByKey136.get('ui_card_view')?.group === 'dev' &&
+        v4PartsByKey136.get('reply_check')?.group === 'debug' &&
+        v4PartsByKey136.get('regression_probe')?.group === 'debug' &&
+        badPlanGroup136.ok === false &&
+        badPlanGroup136.code === 'invalid_part_group',
+        `sp=${v4PartsByKey136.get('shared_ptr')?.group} ui=${v4PartsByKey136.get('ui_card_view')?.group} rc=${v4PartsByKey136.get('reply_check')?.group} rp=${v4PartsByKey136.get('regression_probe')?.group} bad=${badPlanGroup136.code}`);
+
+      // 137. 项目看板 v4：新增/编辑 part 可写入 group:"debug" 并 GET 读回，缺省落到 dev，非法 group 被 400 拒绝
+      const addDebug137 = await v3Fetch(`/api/projects/${v4ProjId136}/parts`, 'POST', {
+        key: 'extra_debug_5',
+        title: '日志追踪与告警调试',
+        category: 'debug',
+        group: 'debug',
+        goal: '补齐调试日志与告警回传检查',
+        paths: ['src/debug.js'],
+        acceptance: ['日志可检索'],
+        agent: 'codex',
+      });
+      const addDefaultDev137 = await v3Fetch(`/api/projects/${v4ProjId136}/parts`, 'POST', {
+        key: 'extra_dev_6',
+        title: '快捷键支持',
+        category: 'frontend_ui',
+        goal: '为卡片网格补充键盘导航',
+        paths: ['src/ui/index.html'],
+      });
+      const addBadGroup137 = await v3Fetch(`/api/projects/${v4ProjId136}/parts`, 'POST', {
+        key: 'bad_group_add',
+        title: '非法分组新增',
+        goal: '应返回 400',
+        group: 'qa_unknown',
+      });
+      const patchToDebug137 = await v3Fetch(`/api/projects/${v4ProjId136}/parts/extra_dev_6`, 'PATCH', {
+        group: 'debug',
+      });
+      const patchBadGroup137 = await v3Fetch(`/api/projects/${v4ProjId136}/parts/extra_dev_6`, 'PATCH', {
+        group: 'invalid_stage',
+      });
+      const getAfterMut137 = await v3Fetch(`/api/projects/${v4ProjId136}`);
+      const partsMap137 = new Map((getAfterMut137.json?.project?.parts || []).map((pt) => [pt.key, pt]));
+
+      assertCase(137, 'v4 新增/编辑 part 可持久化 group:"debug" 并 GET 读回，缺省落到 dev，非法 group 返回 400 invalid_part_group',
+        addDebug137.status === 201 &&
+        addDebug137.json?.part?.group === 'debug' &&
+        addDefaultDev137.status === 201 &&
+        addDefaultDev137.json?.part?.group === 'dev' &&
+        addBadGroup137.status === 400 &&
+        addBadGroup137.json?.code === 'invalid_part_group' &&
+        patchToDebug137.status === 200 &&
+        patchToDebug137.json?.part?.group === 'debug' &&
+        patchBadGroup137.status === 400 &&
+        patchBadGroup137.json?.code === 'invalid_part_group' &&
+        partsMap137.get('extra_debug_5')?.group === 'debug' &&
+        partsMap137.get('extra_dev_6')?.group === 'debug',
+        `addDbg=${addDebug137.status}:${addDebug137.json?.part?.group} addDef=${addDefaultDev137.json?.part?.group} badAdd=${addBadGroup137.status}:${addBadGroup137.json?.code} patch=${patchToDebug137.status}:${partsMap137.get('extra_dev_6')?.group} badPatch=${patchBadGroup137.status}`);
+
+      // 138. 项目看板 v4：UI 源码静态断言（紧凑阈值>=5、分组渲染、小卡仅标题+Agent、点击顶部展开并下推、收起入口、新增表单所属环节选择、零依赖）
+      const html138 = fs.readFileSync(path.join(PKG_ROOT, 'src', 'ui', 'index.html'), 'utf8');
+      const hasCompactThreshold138 = /COMPACT_CARD_THRESHOLD\s*=\s*5/.test(html138) &&
+        html138.includes('parts.length >= COMPACT_CARD_THRESHOLD');
+      const hasGroupRender138 = html138.includes('data-part-group=') &&
+        html138.includes('class="part-group-head"') &&
+        html138.includes('class="part-group-empty"');
+      const hasCompactGrid138 = html138.includes('class="part-compact-grid"') &&
+        html138.includes('data-compact-select=') &&
+        html138.includes('class="part-compact-title"') &&
+        html138.includes('class="part-compact-agent"') &&
+        html138.includes("'未分配'");
+      const hasTopExpandedPush138 = html138.includes('id="compactExpandedPanel"') &&
+        html138.includes('data-part-action="close-expanded"') &&
+        html138.includes('return `${expandedHtml}${groupsHtml}`;');
+      const hasPartGroupForm138 = html138.includes('id="partGroupSelect"') &&
+        html138.includes('<option value="dev">') &&
+        html138.includes('<option value="debug">') &&
+        html138.includes('group: el.partGroupSelect.value');
+      const noDeps138 = !JSON.parse(fs.readFileSync(path.join(PKG_ROOT, 'package.json'), 'utf8')).dependencies;
+
+      assertCase(138, 'v4 UI 源码含紧凑阈值(>=5)、分组渲染、小卡仅功能名+Agent、顶部展开并向下推挤与收起入口、表单所属环节选择且零依赖',
+        hasCompactThreshold138 &&
+        hasGroupRender138 &&
+        hasCompactGrid138 &&
+        hasTopExpandedPush138 &&
+        hasPartGroupForm138 &&
+        noDeps138 &&
+        !html138.includes('—') &&
+        !/transition\s*:\s*all\b/i.test(html138),
+        `thresh=${hasCompactThreshold138} grp=${hasGroupRender138} grid=${hasCompactGrid138} exp=${hasTopExpandedPush138} form=${hasPartGroupForm138} noDeps=${noDeps138}`);
+
+      // 139. 模块代号 code 读写与项目内唯一性校验、旧卡片默认代号稳定不报错、默认开发资料目录与越界校验
+      const legacyCodesOk139 = legacyParts135.every((pt) => typeof pt.code === 'string' && pt.code.length >= 1 && pt.code === pt.key.toUpperCase());
+      const patchCode139 = await v3Fetch(`/api/projects/${v4ProjId136}/parts/shared_ptr`, 'PATCH', { code: 'FE_01' });
+      const dupAddCode139 = await v3Fetch(`/api/projects/${v4ProjId136}/parts`, 'POST', {
+        key: 'dup_code_add',
+        title: '重复代号拦截',
+        goal: '不应允许重复代号',
+        code: 'FE_01',
+      });
+      const dupPatchCode139 = await v3Fetch(`/api/projects/${v4ProjId136}/parts/ui_card_view`, 'PATCH', {
+        code: 'FE_01',
+      });
+      const badCode139 = await v3Fetch(`/api/projects/${v4ProjId136}/parts/ui_card_view`, 'PATCH', {
+        code: 'invalid code!',
+      });
+      const getAfterCode139 = await v3Fetch(`/api/projects/${v4ProjId136}`);
+      const sharedAfterCode139 = (getAfterCode139.json?.project?.parts || []).find((pt) => pt.key === 'shared_ptr');
+      const expectedDefaultMaterials139 = path.join(fs.realpathSync(v3SampleProj), '.agentbus', 'dev-materials');
+      const badMatFormal139 = await v3Fetch('/api/projects', 'POST', {
+        name: '非法资料目录测试',
+        goal: '不应允许把资料目录设在 src/',
+        workspace_dir: v3SampleProj,
+        dev_materials_dir: 'src/evil_materials',
+        auto_dispatch: false,
+      });
+      const badMatOutside139 = await v3Fetch('/api/projects', 'POST', {
+        name: '越界资料目录测试',
+        goal: '不应允许把资料目录设在 allowed_roots 外',
+        workspace_dir: v3SampleProj,
+        dev_materials_dir: v3OutsideDir,
+        auto_dispatch: false,
+      });
+
+      assertCase(139, 'v4 模块代号 code 读写与项目内唯一性校验（重复/非法返回 400）、旧卡片默认代号稳定、默认开发资料目录正确且越界/正式目录被拒',
+        legacyCodesOk139 &&
+        patchCode139.status === 200 &&
+        patchCode139.json?.part?.code === 'FE_01' &&
+        sharedAfterCode139?.code === 'FE_01' &&
+        dupAddCode139.status === 400 && dupAddCode139.json?.code === 'duplicate_part_code' &&
+        dupPatchCode139.status === 400 && dupPatchCode139.json?.code === 'duplicate_part_code' &&
+        badCode139.status === 400 && badCode139.json?.code === 'invalid_part_code' &&
+        path.resolve(getAfterCode139.json?.project?.dev_materials_dir || '') === path.resolve(expectedDefaultMaterials139) &&
+        badMatFormal139.status === 400 && badMatFormal139.json?.code === 'invalid_dev_materials_dir' &&
+        badMatOutside139.status === 403 && badMatOutside139.json?.code === 'path_outside_allowed_roots',
+        `legacy=${legacyCodesOk139} code=${sharedAfterCode139?.code} dupAdd=${dupAddCode139.status}:${dupAddCode139.json?.code} dupPatch=${dupPatchCode139.status} mat=${getAfterCode139.json?.project?.dev_materials_dir} badMat=${badMatFormal139.status}/${badMatOutside139.status}`);
+
+      // 140. 模块完成按钮 API：创建 to=main_agent 任务、重复幂等、hermes 保持 open 与待主 Agent 处理、资料归档 manifest 与正式文件不移动、done/failed 真实状态
+      const compFirst140 = await v3Fetch(`/api/projects/${v4ProjId136}/parts/shared_ptr/complete`, 'POST', { auto_dispatch: true });
+      const compRepeat140 = await v3Fetch(`/api/projects/${v4ProjId136}/parts/shared_ptr/complete`, 'POST', { auto_dispatch: true });
+      const compTaskId140 = compFirst140.json?.completion_task_id;
+      const shownCompTask140 = runCli(['show', compTaskId140], { root: v3Root, allowed: v3Allowed }).json;
+
+      // Simulate safe archive execution for shared_ptr (move temp log, copy bus task record without deleting, leave formal src untouched)
+      const formalWebBefore140 = fs.readFileSync(path.join(v3SampleProj, 'src', 'web', 'index.js'), 'utf8');
+      const tempLogDir140 = path.join(v3SampleProj, 'tmp');
+      fs.mkdirSync(tempLogDir140, { recursive: true });
+      const tempLogFile140 = path.join(tempLogDir140, 'dev_debug.log');
+      fs.writeFileSync(tempLogFile140, 'debug trace FE_01\n', 'utf8');
+
+      const matDir140 = compFirst140.json?.materials_dir;
+      const envDir140 = path.join(compFirst140.json?.dev_materials_dir, 'envelopes');
+      fs.mkdirSync(matDir140, { recursive: true });
+      fs.mkdirSync(envDir140, { recursive: true });
+      const movedLogDest140 = path.join(matDir140, 'dev_debug.log');
+      fs.renameSync(tempLogFile140, movedLogDest140);
+      const busEnvelopeSrc140 = path.join(v3Root, 'tasks', `${compTaskId140}.json`);
+      const busEnvelopeExists140 = fs.existsSync(busEnvelopeSrc140);
+      if (busEnvelopeExists140) {
+        fs.copyFileSync(busEnvelopeSrc140, path.join(envDir140, `${compTaskId140}.json`));
+      }
+      const manifestPath140 = path.join(matDir140, 'manifest.json');
+      const manifestObj140 = {
+        module_code: 'FE_01',
+        task_id: compTaskId140,
+        entries: [
+          {
+            source: 'tmp/dev_debug.log',
+            destination: path.relative(v3SampleProj, movedLogDest140).replace(/\\/g, '/'),
+            sha256: createHash('sha256').update(fs.readFileSync(movedLogDest140)).digest('hex'),
+            bytes: fs.statSync(movedLogDest140).size,
+            action: 'moved',
+          },
+          ...(busEnvelopeExists140 ? [{
+            source: busEnvelopeSrc140,
+            destination: path.join(envDir140, `${compTaskId140}.json`),
+            sha256: createHash('sha256').update(fs.readFileSync(busEnvelopeSrc140)).digest('hex'),
+            bytes: fs.statSync(busEnvelopeSrc140).size,
+            action: 'copied',
+          }] : []),
+        ],
+      };
+      fs.writeFileSync(manifestPath140, JSON.stringify(manifestObj140, null, 2) + '\n', 'utf8');
+      const compResFile140 = path.join(matDir140, 'result.json');
+      fs.writeFileSync(compResFile140, JSON.stringify({
+        module_code: 'FE_01',
+        task_id: compTaskId140,
+        materials_dir: matDir140,
+        moved_count: 1,
+        copied_count: busEnvelopeExists140 ? 1 : 0,
+        formal_files_unchanged: true,
+        manifest_path: manifestPath140,
+        tests_rc: 0,
+      }, null, 2) + '\n', 'utf8');
+
+      const cComp140 = runCli(['claim', compTaskId140, '--by', 'antigravity'], { root: v3Root, allowed: v3Allowed }).json;
+      runCli(['done', compTaskId140, '--by', 'antigravity', '--lease', cComp140.lease_token, '--result', compResFile140], { root: v3Root, allowed: v3Allowed });
+      const getAfterDone140 = await v3Fetch(`/api/projects/${v4ProjId136}`);
+      const sharedDone140 = (getAfterDone140.json?.project?.parts || []).find((pt) => pt.key === 'shared_ptr');
+
+      // Test failed completion task surfaces real failed status (no fake done)
+      const compFailPart140 = await v3Fetch(`/api/projects/${v4ProjId136}/parts/ui_card_view/complete`, 'POST', { auto_dispatch: false });
+      const failCompTaskId140 = compFailPart140.json?.completion_task_id;
+      const cFailComp140 = runCli(['claim', failCompTaskId140, '--by', 'antigravity'], { root: v3Root, allowed: v3Allowed }).json;
+      runCli(['fail', failCompTaskId140, '--by', 'antigravity', '--lease', cFailComp140.lease_token, '--reason', '归档权限测试失败'], { root: v3Root, allowed: v3Allowed });
+      const getAfterFail140 = await v3Fetch(`/api/projects/${v4ProjId136}`);
+      const uiCardFail140 = (getAfterFail140.json?.project?.parts || []).find((pt) => pt.key === 'ui_card_view');
+
+      // Test hermes main_agent (non-dispatchable): task remains open & awaiting_main_agent=true
+      const hermesHomeDir140 = path.join(v3Home, '.hermes');
+      fs.mkdirSync(hermesHomeDir140, { recursive: true });
+      const hermesBin140 = path.join(v3BinDir, `hermes${v3Ext}`);
+      fs.writeFileSync(hermesBin140, process.platform === 'win32' ? '@echo off\r\n' : '#!/bin/sh\n', 'utf8');
+      if (process.platform !== 'win32') fs.chmodSync(hermesBin140, 0o755);
+
+      const hermesProj140 = await v3Fetch('/api/projects', 'POST', {
+        name: 'Hermes主控完成测试',
+        goal: '验证不可 dispatch 的 hermes 保持 open 并显示待主 Agent 处理',
+        workspace_dir: v3SampleProj,
+        main_agent: 'hermes',
+        auto_dispatch: false,
+      });
+      const hPid140 = hermesProj140.json?.project?.id;
+      await v3Fetch(`/api/projects/${hPid140}/parts`, 'POST', {
+        key: 'h_mod',
+        code: 'H001',
+        title: 'Hermes 归档模块',
+        goal: '测试 hermes 完成任务',
+      });
+      const hComp140 = await v3Fetch(`/api/projects/${hPid140}/parts/h_mod/complete`, 'POST', { auto_dispatch: true });
+      const hCompShown140 = runCli(['show', hComp140.json?.completion_task_id], { root: v3Root, allowed: v3Allowed }).json;
+
+      assertCase(140, 'v4 完成按钮创建 to=main_agent 真实任务、重复请求幂等、hermes 保持 open 且标待主 Agent 处理、归档 manifest 落地且正式文件/总线记录不被删移',
+        compFirst140.status === 201 &&
+        compFirst140.json?.created === true &&
+        compFirst140.json?.module_code === 'FE_01' &&
+        compFirst140.json?.completion_status === 'pending' &&
+        compRepeat140.status === 200 &&
+        compRepeat140.json?.idempotent === true &&
+        compRepeat140.json?.created === false &&
+        compRepeat140.json?.completion_task_id === compTaskId140 &&
+        shownCompTask140?.to === 'antigravity' &&
+        shownCompTask140?.goal?.includes('FE_01') &&
+        shownCompTask140?.goal?.includes('manifest.json') &&
+        shownCompTask140?.goal?.includes('test/accept.mjs') &&
+        fs.readFileSync(path.join(v3SampleProj, 'src', 'web', 'index.js'), 'utf8') === formalWebBefore140 &&
+        (!busEnvelopeExists140 || fs.existsSync(busEnvelopeSrc140)) &&
+        fs.existsSync(manifestPath140) &&
+        sharedDone140?.completion_status === 'done' &&
+        Boolean(sharedDone140?.completed_at) &&
+        uiCardFail140?.completion_status === 'failed' &&
+        String(uiCardFail140?.completion_task?.error || '').includes('归档权限测试失败') &&
+        hComp140.status === 201 &&
+        hComp140.json?.awaiting_main_agent === true &&
+        hComp140.json?.task?.state === 'open' &&
+        hComp140.json?.task?.dispatched === false &&
+        hCompShown140?.to === 'hermes' &&
+        hCompShown140?.state === 'open',
+        `first=${compFirst140.status}:${compTaskId140} rep=${compRepeat140.status}:${compRepeat140.json?.idempotent} done=${sharedDone140?.completion_status} fail=${uiCardFail140?.completion_status} hermes=${hCompShown140?.to}/${hCompShown140?.state}/await=${hComp140.json?.awaiting_main_agent}`);
+
+      // 141. v4 追加需求 UI 源码静态断言：模块代号输入与完整卡片代号展示、完成按钮与待主 Agent 处理/失败状态展示
+      const html141 = fs.readFileSync(path.join(PKG_ROOT, 'src', 'ui', 'index.html'), 'utf8');
+      const hasCodeUi141 = html141.includes('id="partCodeInput"') &&
+        html141.includes('data-part-code=') &&
+        html141.includes('代号 ${escapeHtml(partCodeDisplay)}');
+      const hasCompleteBtnUi141 = html141.includes('data-part-action="complete-part"') &&
+        html141.includes('/complete`') &&
+        html141.includes('待主 Agent 处理') &&
+        html141.includes('完成任务失败') &&
+        html141.includes('已完成归档') &&
+        html141.includes('资料归档');
+
+      assertCase(141, 'v4 UI 源码含模块代号输入框与卡片醒目代号、完成按钮及待主 Agent 处理/完成失败/完成归档状态展示',
+        hasCodeUi141 && hasCompleteBtnUi141,
+        `codeUi=${hasCodeUi141} compUi=${hasCompleteBtnUi141}`);
+
+      // 142. 项目看板 v5：手动新增只给标题时先落占位卡（稳定代号+关键字推断分组），自动创建 to=main_agent 幂等补全任务；auto_enrich:false 跳过
+      const v5Proj142 = await v3Fetch('/api/projects', 'POST', {
+        name: '看板v5自动补全项目',
+        goal: '验证新增任务组件自动补全流程',
+        workspace_dir: v3SampleProj,
+        main_agent: 'antigravity',
+        auto_dispatch: false,
+      });
+      const v5Pid142 = v5Proj142.json?.project?.id;
+      const addTitleDebug142 = await v3Fetch(`/api/projects/${v5Pid142}/parts`, 'POST', {
+        title: '排查登录回调报错',
+      });
+      const addTitleDev142 = await v3Fetch(`/api/projects/${v5Pid142}/parts`, 'POST', {
+        title: '导出报表组件',
+      });
+      const addSkipped142 = await v3Fetch(`/api/projects/${v5Pid142}/parts`, 'POST', {
+        key: 'skip_mod',
+        title: '跳过补全模块',
+        auto_enrich: false,
+      });
+      const dbgPart142 = addTitleDebug142.json?.part;
+      const devPart142 = addTitleDev142.json?.part;
+      const skipPart142 = addTitleSkipped142(addSkipped142.json?.part);
+      function addTitleSkipped142(p) { return p; }
+      const shownEnrichDbg142 = runCli(['show', dbgPart142?.enrichment_task_id], { root: v3Root, allowed: v3Allowed }).json;
+
+      assertCase(142, 'v5 仅填标题新增卡片立即落占位（稳定短代号 + 关键字推断分组），创建 to=main_agent 补全任务，auto_enrich:false 跳过',
+        v5Proj142.status === 201 &&
+        v5Proj142.json?.project?.auto_enrich === true &&
+        addTitleDebug142.status === 201 &&
+        Boolean(dbgPart142?.code) &&
+        dbgPart142?.group === 'debug' &&
+        dbgPart142?.enrichment_status === 'pending' &&
+        Boolean(dbgPart142?.enrichment_task_id) &&
+        shownEnrichDbg142?.to === 'antigravity' &&
+        shownEnrichDbg142?.idempotency_key === `enrich:${v5Pid142}:${dbgPart142.key}` &&
+        shownEnrichDbg142?.goal?.includes(v5Pid142) &&
+        shownEnrichDbg142?.goal?.includes(dbgPart142.key) &&
+        shownEnrichDbg142?.goal?.includes('agentbus/part-enrich@1') &&
+        shownEnrichDbg142?.goal?.includes('code') &&
+        shownEnrichDbg142?.goal?.includes('paths') &&
+        shownEnrichDbg142?.goal?.includes('acceptance') &&
+        addTitleDev142.status === 201 &&
+        devPart142?.group === 'dev' &&
+        devPart142?.enrichment_task?.dispatched === true &&
+        addSkipped142.status === 201 &&
+        skipPart142?.enrichment_status === 'skipped' &&
+        skipPart142?.enrichment_task_id === null,
+        `dbg=${dbgPart142?.group}/${dbgPart142?.code}/${dbgPart142?.enrichment_task_id} dev=${devPart142?.group}/disp=${devPart142?.enrichment_task?.dispatched} skip=${skipPart142?.enrichment_status}`);
+
+      // 143. v5 补全任务幂等：重复 /enrich、重复 idempotency_key 新增、重复 key 409 均不产生第二个活跃任务
+      const tasksBeforeIdemp143 = runCli(['list', '--limit', '200'], { root: v3Root, allowed: v3Allowed }).json;
+      const enrichFirst143 = await v3Fetch(`/api/projects/${v5Pid142}/parts/${dbgPart142.key}/enrich`, 'POST', { auto_dispatch: true });
+      const enrichRepeat143 = await v3Fetch(`/api/projects/${v5Pid142}/parts/${dbgPart142.key}/enrich`, 'POST', { auto_dispatch: true });
+      const addIdempFirst143 = await v3Fetch(`/api/projects/${v5Pid142}/parts`, 'POST', {
+        key: 'idemp_card',
+        title: '幂等防重测试卡',
+        idempotency_key: 'ui-add-idemp-143',
+      });
+      const addIdempSecond143 = await v3Fetch(`/api/projects/${v5Pid142}/parts`, 'POST', {
+        key: 'idemp_card',
+        title: '幂等防重测试卡',
+        idempotency_key: 'ui-add-idemp-143',
+      });
+      const dupKeyAdd143 = await v3Fetch(`/api/projects/${v5Pid142}/parts`, 'POST', {
+        key: 'idemp_card',
+        title: '同 key 重复提交',
+      });
+      const tasksAfterIdemp143 = runCli(['list', '--limit', '200'], { root: v3Root, allowed: v3Allowed }).json;
+      const shownIdempCardTask143 = runCli(['show', addIdempFirst143.json?.enrichment_task_id], { root: v3Root, allowed: v3Allowed }).json;
+      const activeForDbg143 = (tasksAfterIdemp143 || []).filter((t) =>
+        t.id === dbgPart142.enrichment_task_id && (t.state === 'open' || t.state === 'claimed')
+      );
+      const activeForIdempCard143 = (tasksAfterIdemp143 || []).filter((t) =>
+        t.id === addIdempFirst143.json?.enrichment_task_id && (t.state === 'open' || t.state === 'claimed')
+      );
+
+      assertCase(143, 'v5 补全任务严格幂等：重复请求不产生第二个活跃补全任务',
+        enrichFirst143.status === 200 &&
+        enrichFirst143.json?.idempotent === true &&
+        enrichFirst143.json?.enrichment_task_id === dbgPart142.enrichment_task_id &&
+        enrichRepeat143.status === 200 &&
+        enrichRepeat143.json?.enrichment_task_id === dbgPart142.enrichment_task_id &&
+        addIdempFirst143.status === 201 &&
+        addIdempSecond143.status === 200 &&
+        addIdempSecond143.json?.idempotent === true &&
+        addIdempSecond143.json?.enrichment_task_id === addIdempFirst143.json?.enrichment_task_id &&
+        dupKeyAdd143.status === 409 &&
+        shownIdempCardTask143?.idempotency_key === `enrich:${v5Pid142}:idemp_card` &&
+        activeForDbg143.length === 1 &&
+        activeForIdempCard143.length === 1 &&
+        tasksAfterIdemp143.length === tasksBeforeIdemp143.length + 1,
+        `e1=${enrichFirst143.status}:${enrichFirst143.json?.idempotent} idemp2=${addIdempSecond143.status}:${addIdempSecond143.json?.idempotent} actDbg=${activeForDbg143.length} actCard=${activeForIdempCard143.length} totalDelta=${tasksAfterIdemp143.length - tasksBeforeIdemp143.length}`);
+
+      // 144. v5 主 Agent 为 hermes（不可 dispatch）时补全任务保持 open 并标 awaiting_main_agent=true，不伪造派发
+      const hEnrichAdd144 = await v3Fetch(`/api/projects/${hPid140}/parts`, 'POST', {
+        key: 'h_enrich_only_title',
+        title: 'Hermes 仅标题补全卡',
+      });
+      const hEnrichTaskId144 = hEnrichAdd144.json?.enrichment_task_id;
+      const hEnrichShown144 = runCli(['show', hEnrichTaskId144], { root: v3Root, allowed: v3Allowed }).json;
+
+      assertCase(144, 'v5 hermes 作为主 Agent 时补全任务保持 open、dispatched=false 且 awaiting_main_agent=true',
+        hEnrichAdd144.status === 201 &&
+        hEnrichAdd144.json?.awaiting_main_agent === true &&
+        hEnrichAdd144.json?.part?.enrichment_status === 'pending' &&
+        hEnrichAdd144.json?.enrichment_task?.state === 'open' &&
+        hEnrichAdd144.json?.enrichment_task?.dispatched === false &&
+        hEnrichAdd144.json?.enrichment_task?.awaiting_main_agent === true &&
+        hEnrichShown144?.to === 'hermes' &&
+        hEnrichShown144?.state === 'open',
+        `st=${hEnrichAdd144.status} await=${hEnrichAdd144.json?.awaiting_main_agent} task=${hEnrichShown144?.to}/${hEnrichShown144?.state}`);
+
+      // 145. v5 补全结果只补空/占位字段，绝不覆盖手动字段；任务 fail 后展示真实错误且支持重试补全
+      const manualPreservedAdd145 = await v3Fetch(`/api/projects/${v5Pid142}/parts`, 'POST', {
+        key: 'manual_keep_145',
+        title: '鉴权模块',
+        goal: '用户手写目标（严禁被补全覆盖）',
+        agent: 'codex',
+        manual_override: true,
+      });
+      const enrichTaskId145 = manualPreservedAdd145.json?.enrichment_task_id;
+      const enrichJson145 = path.join(v3SampleProj, 'out', 'projects', v5Pid142, 'enrich_manual_keep_145.json');
+      fs.mkdirSync(path.dirname(enrichJson145), { recursive: true });
+      fs.writeFileSync(enrichJson145, JSON.stringify({
+        schema: 'agentbus/part-enrich@1',
+        project_id: v5Pid142,
+        part_key: 'manual_keep_145',
+        code: 'AUTH_V5',
+        group: 'debug',
+        goal: 'AI 试图覆盖手动目标',
+        paths: ['src/auth/login.js'],
+        acceptance: ['登录校验通过'],
+        agent: 'gemini',
+        model: 'gemini-3.8-flash',
+      }, null, 2) + '\n', 'utf8');
+      const cEnrich145 = runCli(['claim', enrichTaskId145, '--by', 'antigravity'], { root: v3Root, allowed: v3Allowed }).json;
+      runCli(['done', enrichTaskId145, '--by', 'antigravity', '--lease', cEnrich145.lease_token, '--result', enrichJson145], { root: v3Root, allowed: v3Allowed });
+      const getAfterEnrich145 = await v3Fetch(`/api/projects/${v5Pid142}`);
+      const partDone145 = (getAfterEnrich145.json?.project?.parts || []).find((pt) => pt.key === 'manual_keep_145');
+
+      // Test fail -> real error surfaced -> retry -> done
+      const failTaskId145 = devPart142.enrichment_task_id;
+      const cFailEnrich145 = runCli(['claim', failTaskId145, '--by', 'antigravity'], { root: v3Root, allowed: v3Allowed }).json;
+      runCli(['fail', failTaskId145, '--by', 'antigravity', '--lease', cFailEnrich145.lease_token, '--reason', '补全上下文不足测试失败'], { root: v3Root, allowed: v3Allowed });
+      const getAfterFail145 = await v3Fetch(`/api/projects/${v5Pid142}`);
+      const partFailed145 = (getAfterFail145.json?.project?.parts || []).find((pt) => pt.key === devPart142.key);
+      const retryEnrich145 = await v3Fetch(`/api/projects/${v5Pid142}/parts/${devPart142.key}/enrich`, 'POST', { auto_dispatch: true });
+      const retryTaskId145 = retryEnrich145.json?.enrichment_task_id;
+      const retryJson145 = path.join(v3SampleProj, 'out', 'projects', v5Pid142, `enrich_${devPart142.key}.json`);
+      fs.writeFileSync(retryJson145, JSON.stringify({
+        schema: 'agentbus/part-enrich@1',
+        project_id: v5Pid142,
+        part_key: devPart142.key,
+        code: 'EXPORT_V5',
+        group: 'dev',
+        goal: '实现 CSV 与 JSON 报表导出',
+        paths: ['src/export.js'],
+        acceptance: ['导出文件校验通过'],
+        agent: 'gemini',
+        model: 'gemini-3.8-flash',
+      }, null, 2) + '\n', 'utf8');
+      const cRetry145 = runCli(['claim', retryTaskId145, '--by', 'antigravity'], { root: v3Root, allowed: v3Allowed }).json;
+      runCli(['done', retryTaskId145, '--by', 'antigravity', '--lease', cRetry145.lease_token, '--result', retryJson145], { root: v3Root, allowed: v3Allowed });
+      const getAfterRetryDone145 = await v3Fetch(`/api/projects/${v5Pid142}`);
+      const partRetriedDone145 = (getAfterRetryDone145.json?.project?.parts || []).find((pt) => pt.key === devPart142.key);
+
+      assertCase(145, 'v5 补全结果只填充空/占位字段且不覆盖手动字段；失败保留卡片与真实错误并支持重试补全到 done',
+        partDone145?.enrichment_status === 'done' &&
+        partDone145?.goal === '用户手写目标（严禁被补全覆盖）' &&
+        partDone145?.agent === 'codex' &&
+        partDone145?.model === '' &&
+        partDone145?.code === 'AUTH_V5' &&
+        partDone145?.group === 'debug' &&
+        partDone145?.paths?.[0] === 'src/auth/login.js' &&
+        partDone145?.acceptance?.[0] === '登录校验通过' &&
+        partFailed145?.enrichment_status === 'failed' &&
+        String(partFailed145?.enrichment_error || '').includes('补全上下文不足测试失败') &&
+        retryEnrich145.status === 201 &&
+        retryTaskId145 !== failTaskId145 &&
+        partRetriedDone145?.enrichment_status === 'done' &&
+        partRetriedDone145?.code === 'EXPORT_V5' &&
+        partRetriedDone145?.goal === '实现 CSV 与 JSON 报表导出' &&
+        partRetriedDone145?.agent === 'gemini' &&
+        partRetriedDone145?.model === 'gemini-3.8-flash',
+        `done=${partDone145?.enrichment_status} goal=${partDone145?.goal} agent=${partDone145?.agent} fail=${partFailed145?.enrichment_status}:${partFailed145?.enrichment_error} retry=${partRetriedDone145?.enrichment_status}:${partRetriedDone145?.code}`);
+
+      // 146. v5 主 Agent 拆解新卡自动出现在面板（无需再手动合并），且缺字段拆解卡自动触发补全
+      const askV5146 = await v3Fetch(`/api/projects/${v5Pid142}/ask-cards`, 'POST', {
+        prompt: '拆解通知服务与排查导出报错卡片',
+        auto_dispatch: true,
+      });
+      const askTaskId146 = askV5146.json?.task?.id;
+      const deltaFile146 = path.join(v3SampleProj, askV5146.json?.request?.delta_rel_path);
+      fs.mkdirSync(path.dirname(deltaFile146), { recursive: true });
+      fs.writeFileSync(deltaFile146, JSON.stringify({
+        schema: 'agentbus/project-plan-delta@1',
+        project_id: v5Pid142,
+        title: '拆解新卡自动入板测试',
+        parts: [
+          {
+            key: 'notify_v5',
+            title: '站内通知服务',
+            group: 'dev',
+            goal: '实现消息提醒投递',
+            paths: ['src/notify.js'],
+            acceptance: ['投递成功'],
+            agent: 'antigravity',
+          },
+          {
+            key: 'partial_v5',
+            title: '排查导出超时报错',
+          },
+        ],
+      }, null, 2) + '\n', 'utf8');
+      const cAsk146 = runCli(['claim', askTaskId146, '--by', 'antigravity'], { root: v3Root, allowed: v3Allowed }).json;
+      runCli(['done', askTaskId146, '--by', 'antigravity', '--lease', cAsk146.lease_token, '--result', deltaFile146], { root: v3Root, allowed: v3Allowed });
+
+      // Without manual apply-delta click/call: GET /api/projects/:id MUST already show both decomposed cards!
+      const getAutoBoard146 = await v3Fetch(`/api/projects/${v5Pid142}`);
+      const autoBoardParts146 = new Map((getAutoBoard146.json?.project?.parts || []).map((pt) => [pt.key, pt]));
+      // Trigger auto-reconcile (as UI polling does) -> creates enrichment task ONLY for partial_v5, NOT notify_v5
+      const reconcile146 = await v3Fetch(`/api/projects/${v5Pid142}/enrich-pending`, 'POST', { auto_dispatch: true });
+      const partialAfterRec146 = (reconcile146.json?.project?.parts || []).find((pt) => pt.key === 'partial_v5');
+      const notifyAfterRec146 = (reconcile146.json?.project?.parts || []).find((pt) => pt.key === 'notify_v5');
+
+      assertCase(146, 'v5 主 Agent 拆解新卡自动进入面板（无需再点合并）且缺字段新卡自动触发补全任务',
+        getAutoBoard146.status === 200 &&
+        Boolean(autoBoardParts146.get('notify_v5')) &&
+        autoBoardParts146.get('notify_v5')?.group === 'dev' &&
+        Boolean(autoBoardParts146.get('partial_v5')) &&
+        autoBoardParts146.get('partial_v5')?.group === 'debug' &&
+        autoBoardParts146.get('partial_v5')?.enrichment_needed === true &&
+        reconcile146.status === 200 &&
+        reconcile146.json?.triggered_keys?.includes('partial_v5') &&
+        !reconcile146.json?.triggered_keys?.includes('notify_v5') &&
+        Boolean(partialAfterRec146?.enrichment_task_id) &&
+        partialAfterRec146?.enrichment_status === 'pending' &&
+        notifyAfterRec146?.enrichment_task_id === null,
+        `notify=${Boolean(autoBoardParts146.get('notify_v5'))} partial=${autoBoardParts146.get('partial_v5')?.group}/need=${autoBoardParts146.get('partial_v5')?.enrichment_needed} trig=${JSON.stringify(reconcile146.json?.triggered_keys)}`);
+
+      // 147. v5 UI 源码静态断言：可只填标题、自动推断分组、补全状态展示与重试补全按钮、自动同步新卡、无 em-dash / 无 transition:all
+      const html147 = fs.readFileSync(path.join(PKG_ROOT, 'src', 'ui', 'index.html'), 'utf8');
+      const goalInputMatch147 = html147.match(/<textarea[^>]*id="partGoalInput"[^>]*>/);
+      const goalNotRequired147 = Boolean(goalInputMatch147) && !/\brequired\b/.test(goalInputMatch147[0]);
+      const hasEnrichUi147 = html147.includes('id="partAutoEnrichCheck"') &&
+        html147.includes('id="projAutoEnrichCheck"') &&
+        html147.includes('主 Agent 补全中') &&
+        html147.includes('待主 Agent 处理') &&
+        html147.includes('已自动补全') &&
+        html147.includes('补全失败') &&
+        html147.includes('data-part-action="retry-enrich"') &&
+        html147.includes('重试补全') &&
+        html147.includes('/enrich-pending') &&
+        html147.includes('/sync-plan');
+
+      assertCase(147, 'v5 UI 源码支持仅填标题新增、自动补全状态与重试按钮、自动入板同步，且无 em-dash / 无 transition:all',
+        goalNotRequired147 &&
+        hasEnrichUi147 &&
+        !html147.includes('—') &&
+        !/transition\s*:\s*all\b/i.test(html147),
+        `goalNotReq=${goalNotRequired147} enrichUi=${hasEnrichUi147} noEm=${!html147.includes('—')}`);
+
+      // 148. hermes 主 Agent（不可 dispatch）在 createProject / retryBootstrap / readExistingProject / askMainAgentAddCards 均走 awaiting_main_agent=true，不报错
+      const hCreate148 = await v3Fetch('/api/projects', 'POST', {
+        name: 'Hermes新建一致性项目',
+        goal: '验证不可 dispatch 的 hermes 在新建/重试/读取/追加卡片均走 awaiting_main_agent',
+        main_agent: 'hermes',
+        auto_dispatch: true,
+      });
+      const hPid148 = hCreate148.json?.project?.id;
+      const hRetry148 = await v3Fetch(`/api/projects/${hPid148}/retry-bootstrap`, 'POST', {
+        auto_dispatch: true,
+        force_new: true,
+      });
+      const hRead148 = await v3Fetch('/api/projects/read-existing', 'POST', {
+        workspace_dir: v3SampleProj,
+        name: 'Hermes读取已有项目',
+        main_agent: 'hermes',
+        scan_with_agent: true,
+        auto_dispatch: true,
+      });
+      const hAsk148 = await v3Fetch(`/api/projects/${hPid148}/ask-cards`, 'POST', {
+        prompt: '补充通知与告警卡片',
+        auto_dispatch: true,
+      });
+
+      assertCase(148, 'hermes 作为主 Agent 且 auto_dispatch=true 时，create/retry/read-existing/ask-cards 均不伪造派发也不产生 dispatch_error，统一标 awaiting_main_agent=true',
+        hCreate148.status === 201 &&
+        hCreate148.json?.awaiting_main_agent === true &&
+        hCreate148.json?.bootstrap_task?.state === 'open' &&
+        hCreate148.json?.bootstrap_task?.dispatched === false &&
+        hCreate148.json?.bootstrap_task?.dispatch_error === null &&
+        hCreate148.json?.bootstrap_task?.awaiting_main_agent === true &&
+        hCreate148.json?.project?.plan_status === 'pending' &&
+        hCreate148.json?.project?.plan_error === null &&
+        hRetry148.status === 200 &&
+        hRetry148.json?.awaiting_main_agent === true &&
+        hRetry148.json?.bootstrap_task?.state === 'open' &&
+        hRetry148.json?.bootstrap_task?.dispatched === false &&
+        hRetry148.json?.bootstrap_task?.dispatch_error === null &&
+        hRetry148.json?.bootstrap_task?.awaiting_main_agent === true &&
+        hRead148.status === 201 &&
+        hRead148.json?.awaiting_main_agent === true &&
+        hRead148.json?.bootstrap_task?.state === 'open' &&
+        hRead148.json?.bootstrap_task?.dispatched === false &&
+        hRead148.json?.bootstrap_task?.dispatch_error === null &&
+        hRead148.json?.bootstrap_task?.awaiting_main_agent === true &&
+        hRead148.json?.project?.plan_status === 'pending' &&
+        hAsk148.status === 201 &&
+        hAsk148.json?.awaiting_main_agent === true &&
+        hAsk148.json?.task?.state === 'open' &&
+        hAsk148.json?.task?.dispatched === false &&
+        hAsk148.json?.task?.dispatch_error === null &&
+        hAsk148.json?.task?.awaiting_main_agent === true &&
+        hAsk148.json?.request?.delta_status === 'pending' &&
+        hAsk148.json?.request?.delta_error === null &&
+        hAsk148.json?.request?.awaiting_main_agent === true,
+        `create=${hCreate148.json?.bootstrap_task?.dispatch_error}/${hCreate148.json?.awaiting_main_agent} retry=${hRetry148.json?.bootstrap_task?.dispatch_error} read=${hRead148.json?.bootstrap_task?.dispatch_error} ask=${hAsk148.json?.task?.dispatch_error}`);
+
+      // 149. 回归断言：env 透传至 hydrateProjectRecord、applyProjectCardDelta 保留非手动卡 enrichment_* 字段、index.html 手动卡元信息显示“手动添加”
+      const env149 = { ...v3Env, AGENTBUS_ADAPTER_HERMES: 'echo hermes-adapter' };
+      const srvEnv149 = await startUiServer({
+        rootOverride: v3Root,
+        home: v3Home,
+        env: env149,
+        host: '127.0.0.1',
+        port: 0,
+        pkgRoot: v3Work,
+        dispatchFn: async (_bus, opts) => {
+          const shown = runCli(['show', opts.id], { root: v3Root, allowed: v3Allowed }).json;
+          return { id: opts.id, to: shown?.to, state: shown?.state || 'open', dispatched: true };
+        },
+      });
+      const envFetch149 = async (pathname, method = 'GET', payload = undefined) => {
+        const r = await fetch(`${srvEnv149.url}${pathname}`, {
+          method,
+          headers: payload !== undefined ? { 'Content-Type': 'application/json' } : undefined,
+          body: payload !== undefined ? JSON.stringify(payload) : undefined,
+        });
+        return { status: r.status, json: await r.json() };
+      };
+      let envPassOk149 = false;
+      let envPassDiag149 = '';
+      try {
+        const ec149 = await envFetch149('/api/projects', 'POST', {
+          name: 'Env透传验证项目',
+          goal: '验证自定义 env 透传至 hydrateProjectRecord',
+          workspace_dir: v3SampleProj,
+          main_agent: 'hermes',
+          auto_dispatch: true,
+        });
+        const epId149 = ec149.json?.project?.id;
+        const eAddA149 = await envFetch149(`/api/projects/${epId149}/parts`, 'POST', { key: 'env_a', title: '模块A' });
+        const eAddB149 = await envFetch149(`/api/projects/${epId149}/parts`, 'POST', { key: 'env_b', title: '模块B' });
+        const eReord149 = await envFetch149(`/api/projects/${epId149}/parts/reorder`, 'POST', { keys: ['env_b', 'env_a'] });
+        const eAutoDry149 = await envFetch149(`/api/projects/${epId149}/auto-route`, 'POST', { dry_run: true });
+        const eAuto149 = await envFetch149(`/api/projects/${epId149}/auto-route`, 'POST', { dry_run: false });
+        const eDel149 = await envFetch149(`/api/projects/${epId149}/parts/env_b/delete`, 'POST');
+        const eAsk149 = await envFetch149(`/api/projects/${epId149}/ask-cards`, 'POST', { prompt: '测试env透传', auto_dispatch: true });
+        const eRead149 = await envFetch149('/api/projects/read-existing', 'POST', {
+          workspace_dir: v3SampleProj,
+          name: 'Env透传读取',
+          main_agent: 'hermes',
+          scan_with_agent: true,
+          auto_dispatch: true,
+        });
+        const eRescan149 = await envFetch149(`/api/projects/${eRead149.json?.project?.id}/rescan`, 'POST');
+        envPassOk149 = Boolean(
+          ec149.status === 201 &&
+          ec149.json?.awaiting_main_agent === false &&
+          ec149.json?.bootstrap_task?.dispatched === true &&
+          ec149.json?.project?.bootstrap_task?.awaiting_main_agent === false &&
+          eAddA149.status === 201 &&
+          eAddB149.status === 201 &&
+          eReord149.json?.project?.bootstrap_task?.awaiting_main_agent === false &&
+          eAutoDry149.json?.project?.bootstrap_task?.awaiting_main_agent === false &&
+          eAuto149.json?.project?.bootstrap_task?.awaiting_main_agent === false &&
+          eDel149.json?.project?.bootstrap_task?.awaiting_main_agent === false &&
+          eAsk149.json?.awaiting_main_agent === false &&
+          eAsk149.json?.task?.dispatched === true &&
+          eAsk149.json?.project?.card_requests?.[0]?.awaiting_main_agent === false &&
+          eRead149.json?.awaiting_main_agent === false &&
+          eRead149.json?.bootstrap_task?.dispatched === true &&
+          eRescan149.json?.project?.bootstrap_task?.awaiting_main_agent === false
+        );
+        envPassDiag149 = `ec=${ec149.json?.project?.bootstrap_task?.awaiting_main_agent} reord=${eReord149.json?.project?.bootstrap_task?.awaiting_main_agent} ask=${eAsk149.json?.awaiting_main_agent} read=${eRead149.json?.awaiting_main_agent} rescan=${eRescan149.json?.project?.bootstrap_task?.awaiting_main_agent}`;
+      } finally {
+        await srvEnv149.close();
+      }
+
+      // applyProjectCardDelta preserves enrichment_* on non-manual card overwrite
+      const deltaAdd149 = await v3Fetch(`/api/projects/${v5Pid142}/parts`, 'POST', {
+        key: 'delta_keep_enrich',
+        title: '待delta覆盖的非手动卡',
+        auto_enrich: true,
+      });
+      const origEnrichTaskId149 = deltaAdd149.json?.enrichment_task_id;
+      const askDelta149 = await v3Fetch(`/api/projects/${v5Pid142}/ask-cards`, 'POST', {
+        prompt: '更新 delta_keep_enrich 的描述与路径',
+        auto_dispatch: false,
+      });
+      const reqId149 = askDelta149.json?.request?.id;
+      const askTaskId149 = askDelta149.json?.task?.id;
+      const deltaFile149 = path.join(v3SampleProj, askDelta149.json?.request?.delta_rel_path);
+      fs.mkdirSync(path.dirname(deltaFile149), { recursive: true });
+      fs.writeFileSync(deltaFile149, JSON.stringify({
+        schema: 'agentbus/project-plan-delta@1',
+        project_id: v5Pid142,
+        title: '覆盖非手动卡测试',
+        parts: [
+          {
+            key: 'delta_keep_enrich',
+            title: 'delta更新后的标题',
+            category: 'backend_api',
+            group: 'dev',
+            goal: '由 delta 补充的精确目标',
+            paths: ['src/delta_kept.js'],
+            acceptance: ['delta 更新后仍保留 enrichment 元数据'],
+            agent: 'antigravity',
+          },
+        ],
+      }, null, 2) + '\n', 'utf8');
+      const cAsk149 = runCli(['claim', askTaskId149, '--by', 'antigravity'], { root: v3Root, allowed: v3Allowed }).json;
+      runCli(['done', askTaskId149, '--by', 'antigravity', '--lease', cAsk149.lease_token, '--result', deltaFile149], { root: v3Root, allowed: v3Allowed });
+      const applyDelta149 = await v3Fetch(`/api/projects/${v5Pid142}/apply-delta`, 'POST', {
+        request_id: reqId149,
+        confirm_overwrite_manual: false,
+      });
+      const updatedPart149 = (applyDelta149.json?.project?.parts || []).find((p) => p.key === 'delta_keep_enrich');
+      const manualLabelMatch149 = html147.match(/const sourceNote =[\s\S]*?;\r?\n/);
+      const manualLabelOk149 = Boolean(
+        manualLabelMatch149 &&
+        manualLabelMatch149[0].includes("part.source === 'manual' ? '手动添加' : '拆解计划'")
+      );
+
+      assertCase(149, 'env 透传至全部 hydrateProjectRecord 路径，applyProjectCardDelta 覆盖非手动卡保留 enrichment_* 字段，且手动加卡元信息显示“手动添加”',
+        envPassOk149 &&
+        Boolean(origEnrichTaskId149) &&
+        applyDelta149.status === 200 &&
+        applyDelta149.json?.updated_keys?.includes('delta_keep_enrich') &&
+        updatedPart149?.title === 'delta更新后的标题' &&
+        updatedPart149?.enrichment_task_id === origEnrichTaskId149 &&
+        updatedPart149?.enrichment_status === 'pending' &&
+        Boolean(updatedPart149?.enrichment_dispatch) &&
+        manualLabelOk149,
+        `env=(${envPassDiag149}) delta=${applyDelta149.status}/enrich=${updatedPart149?.enrichment_task_id === origEnrichTaskId149}/${updatedPart149?.enrichment_status} manualLabel=${manualLabelOk149}`);
+    } finally {
+      await srvV3.close();
+      if (prevAllowed125 === undefined) delete process.env.AGENTBUS_ALLOWED_ROOTS;
+      else process.env.AGENTBUS_ALLOWED_ROOTS = prevAllowed125;
+      if (prevAgents125 === undefined) delete process.env.AGENTBUS_AGENTS_CONFIG;
+      else process.env.AGENTBUS_AGENTS_CONFIG = prevAgents125;
+    }
   } finally {
     try { fs.rmSync(RUN_BASE, { recursive: true, force: true }); } catch {}
   }

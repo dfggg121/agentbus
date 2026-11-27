@@ -41,7 +41,7 @@
 当前版本通过离线 tarball 分发（暂未发布到 npm）。安装并接入客户端后，重启客户端即可加载 MCP 服务：
 
 ```bash
-npm install -g ./agentbus-mcp-0.2.0.tgz
+npm install -g ./agentbus-mcp-0.3.0.tgz
 agentbus setup --client codex --root ~/.agentbus --allow ~/projects/my-app
 ```
 

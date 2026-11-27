@@ -60,14 +60,14 @@
 包暂未发布到 npm。先在源机器执行 `npm pack` 得到 `agentbus-mcp-<version>.tgz`，拷到目标机器后：
 
 ```bash
-npm install -g ./agentbus-mcp-0.2.0.tgz
+npm install -g ./agentbus-mcp-0.3.0.tgz
 agentbus setup --client codex
 ```
 
 不想全局安装时，用项目内前缀：
 
 ```bash
-npm install --prefix ./agentbus-local ./agentbus-mcp-0.2.0.tgz
+npm install --prefix ./agentbus-local ./agentbus-mcp-0.3.0.tgz
 ./agentbus-local/node_modules/.bin/agentbus setup --client codex
 ```
 

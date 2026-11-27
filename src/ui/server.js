@@ -1,8 +1,9 @@
-// agentbus: Loopback-only HTTP UI server & module dashboard API.
-// Zero third-party dependencies. GET endpoints are strictly read-only; only POST /api/requests writes to DB.
+// agentbus: Loopback-only HTTP UI server, project/module dashboard & companion client config API.
+// Zero third-party dependencies. GET endpoints are strictly read-only; writes require explicit POST/PATCH.
 
 import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -10,6 +11,38 @@ import { KNOWN_MODELS, agentConfigPath, readAgentConfig } from '../agents.js';
 import { PKG_ROOT, loadConfig, openBus, openBusReadOnly } from '../db.js';
 import { dispatchTask, listAdapters } from '../dispatch.js';
 import { createTask, listTasksReadOnly } from '../tasks.js';
+import { applyClientConfig, detectClientSetup, previewClientConfig } from './client.js';
+import {
+  buildSelectableModuleAgents,
+  readModuleOwners,
+  resetModuleOwners,
+  updateModuleOwners,
+} from './module-owners.js';
+import {
+  addProjectPart,
+  applyProjectCardDelta,
+  askMainAgentAddCards,
+  autoRouteProjectParts,
+  completeProjectPart,
+  createProject,
+  deleteProjectPart,
+  dispatchProjectParts,
+  enrichProjectPart,
+  getProjectHydrated,
+  isAgentDispatchable,
+  listProjectsHydrated,
+  readExistingProject,
+  reconcileProjectEnrichment,
+  regenerateProjectPart,
+  reorderProjectParts,
+  rescanProjectWorkspace,
+  retryProjectBootstrap,
+  runUiDispatch,
+  syncProjectPlan,
+  updateProjectPart,
+} from './project.js';
+import { getRoutingPayload, saveRoutingConfig } from './routes.js';
+import { browseWorkspaceDir, scanWorkspaceDirectory } from './workspace.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const MODULES_JSON_PATH = path.join(HERE, 'modules.json');
@@ -65,17 +98,38 @@ function resolveConfiguredModel(cfg, agentId) {
   return { model: '未配置', configured: false, source: 'unconfigured' };
 }
 
-export function loadModulesCatalog({ rootDir, pkgRoot = PKG_ROOT } = {}) {
+export function loadModulesCatalog({
+  rootDir,
+  pkgRoot = PKG_ROOT,
+  home = os.homedir(),
+  platform = process.platform,
+  env = process.env,
+} = {}) {
   const rawModules = readRawModulesCatalog();
   const cfg = rootDir ? readAgentConfig(rootDir) : { conductor: null, models: {} };
   const cfgFile = rootDir ? agentConfigPath(rootDir) : null;
   const cfgExists = cfgFile ? fs.existsSync(cfgFile) : false;
+  const ownersState = readModuleOwners(rootDir);
+  const { agents: selectableAgents } = buildSelectableModuleAgents({ rootDir, home, platform, env });
 
   const layerMap = new Map();
+  let overrideCount = 0;
   const modules = rawModules.map((m) => {
-    const ownerAgent = String(m.owner_agent || '').trim() || '未配置';
+    const modId = String(m.id);
+    const defaultOwner = String(m.owner_agent || '').trim() || '未配置';
+    const ov = ownersState.overrides?.[modId] || null;
+    const ownerAgent = (ov && ov.owner_agent) ? ov.owner_agent : defaultOwner;
     const resolvedOwner = ownerAgent === 'conductor' && cfg.conductor ? cfg.conductor : ownerAgent;
-    const modelInfo = resolveConfiguredModel(cfg, resolvedOwner);
+    const defaultModelInfo = resolveConfiguredModel(cfg, resolvedOwner);
+    let modelInfo;
+    if (ov && ov.owner_model) {
+      modelInfo = { model: ov.owner_model, configured: true, source: 'module-owners.json' };
+    } else {
+      modelInfo = defaultModelInfo;
+    }
+    const overridden = Boolean(ov && (ov.owner_agent !== defaultOwner || Boolean(ov.owner_model)));
+    if (overridden) overrideCount += 1;
+
     const paths = Array.isArray(m.paths) ? m.paths.map(String) : [];
     const existingFiles = paths.filter((p) => fs.existsSync(path.resolve(pkgRoot, p))).length;
     const layer = String(m.layer || 'other');
@@ -86,14 +140,19 @@ export function loadModulesCatalog({ rootDir, pkgRoot = PKG_ROOT } = {}) {
     layerMap.get(layer).count += 1;
 
     return {
-      id: String(m.id),
-      label: String(m.label || m.id),
+      id: modId,
+      label: String(m.label || modId),
       layer,
       layer_label: layerLabel,
       paths,
       files_existing: existingFiles,
+      default_owner_agent: defaultOwner,
       owner_agent: ownerAgent,
       owner_model: modelInfo.model,
+      owner_model_override: ov?.owner_model || '',
+      agent_default_model: defaultModelInfo.model,
+      agent_default_model_configured: defaultModelInfo.configured,
+      overridden,
       model_configured: modelInfo.configured,
       model_source: modelInfo.source,
       summary: String(m.summary || ''),
@@ -108,13 +167,19 @@ export function loadModulesCatalog({ rootDir, pkgRoot = PKG_ROOT } = {}) {
     conductor_configured: Boolean(cfg.conductor),
     agents_config_exists: cfgExists,
     agents_config_broken: Boolean(cfg.broken),
+    module_owners_file: ownersState.file,
+    module_owners_exists: ownersState.exists,
+    module_owners_broken: ownersState.broken,
+    module_owners_error: ownersState.error,
+    override_count: overrideCount,
+    selectable_agents: selectableAgents,
     module_count: modules.length,
     layers: Array.from(layerMap.values()),
     modules,
   };
 }
 
-export function getAgentsPayload({ rootDir } = {}) {
+export function getAgentsPayload({ rootDir, env = process.env } = {}) {
   const cfg = rootDir ? readAgentConfig(rootDir) : { conductor: null, models: {} };
   const cfgFile = rootDir ? agentConfigPath(rootDir) : null;
   const cfgExists = cfgFile ? fs.existsSync(cfgFile) : false;
@@ -139,6 +204,7 @@ export function getAgentsPayload({ rootDir } = {}) {
       id,
       configured,
       is_conductor: id === cfg.conductor,
+      dispatchable: isAgentDispatchable(id, env),
       model: cfgModel || '未配置',
       model_configured: Boolean(cfgModel),
       known_models: known,
@@ -162,7 +228,14 @@ function makeHttpError(status, code, message) {
   return Object.assign(new Error(message), { status, errorCode: code });
 }
 
-export function validateAndBuildConductorRequest({ rootDir, body, pkgRoot = PKG_ROOT }) {
+export function validateAndBuildConductorRequest({
+  rootDir,
+  body,
+  pkgRoot = PKG_ROOT,
+  home = os.homedir(),
+  platform = process.platform,
+  env = process.env,
+}) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     throw makeHttpError(400, 'invalid_body', '请求体必须是 JSON 对象');
   }
@@ -207,13 +280,15 @@ export function validateAndBuildConductorRequest({ rootDir, body, pkgRoot = PKG_
   const cfg = readAgentConfig(rootDir);
   const cfgFile = agentConfigPath(rootDir);
   const hasExplicitCfg = fs.existsSync(cfgFile) && !cfg.broken && (Boolean(cfg.conductor) || Object.keys(cfg.models || {}).length > 0);
+  const setup = detectClientSetup({ rootDir, home, platform, env });
+  const installedIds = (setup.clients || []).filter((c) => c.installed).map((c) => c.id);
 
   const configuredAgents = new Set(
-    [cfg.conductor, ...Object.keys(cfg.models || {})].filter((v) => typeof v === 'string' && v.trim())
+    [cfg.conductor, ...Object.keys(cfg.models || {}), ...installedIds].filter((v) => typeof v === 'string' && v.trim())
   );
   const allowedAgents = hasExplicitCfg
     ? new Set([...configuredAgents, ...(cfg.conductor ? ['conductor'] : [])])
-    : new Set(['conductor', ...Object.keys(KNOWN_MODELS)]);
+    : new Set(['conductor', ...Object.keys(KNOWN_MODELS), ...installedIds]);
 
   const rawTargetAgent = typeof body.target_agent === 'string' ? body.target_agent.trim() : '';
   const targetAgent = rawTargetAgent || (cfg.conductor || 'conductor');
@@ -249,9 +324,21 @@ export function validateAndBuildConductorRequest({ rootDir, body, pkgRoot = PKG_
     }
   }
 
+  const rawRouteMode = body.route_mode === undefined || body.route_mode === null
+    ? 'conductor'
+    : String(body.route_mode).trim().toLowerCase();
+  if (rawRouteMode !== 'direct' && rawRouteMode !== 'conductor') {
+    throw makeHttpError(400, 'invalid_route_mode', `非法 route_mode: ${rawRouteMode}（可选: direct, conductor）`);
+  }
+  const routeMode = rawRouteMode;
+
   const conductorAgent = cfg.conductor || 'conductor';
+  const recipientAgent = routeMode === 'direct' ? effectiveTargetAgent : conductorAgent;
   const actionLabel = UI_ACTIONS[action];
   const targetModelDisplay = rawTargetModel || '未指定（沿用当前配置）';
+  const routeModeDesc = routeMode === 'direct'
+    ? `直接发送给执行 Agent (接收方=${recipientAgent}, 执行方=${effectiveTargetAgent})`
+    : `经 Conductor 转派 (接收方=${recipientAgent}, 执行方=${effectiveTargetAgent})`;
   const moduleLines = selectedModules.map((m) =>
     `- ${m.id} (${m.label}) | layer=${m.layer} | paths=${m.paths.join(', ')} | 当前负责人=${m.owner_agent} | 当前模型=${m.owner_model}`
   );
@@ -264,7 +351,9 @@ export function validateAndBuildConductorRequest({ rootDir, body, pkgRoot = PKG_
     '',
     '## 调整要求',
     `- 动作：${actionLabel} (${action})`,
-    `- 目标 agent：${effectiveTargetAgent}`,
+    `- 路由模式：${routeModeDesc}`,
+    `- 任务接收方 (to)：${recipientAgent}`,
+    `- 执行 Agent (目标)：${effectiveTargetAgent}`,
     `- 目标模型：${targetModelDisplay}`,
     `- 用户备注：${notes || '无'}`,
     '',
@@ -278,12 +367,14 @@ export function validateAndBuildConductorRequest({ rootDir, body, pkgRoot = PKG_
     selectedModules,
     action,
     actionLabel,
+    routeMode,
+    recipientAgent,
     targetAgent: effectiveTargetAgent,
     targetModel: rawTargetModel || null,
     notes,
     conductorAgent,
     taskInput: {
-      to: conductorAgent,
+      to: recipientAgent,
       from: 'ui',
       goal,
       refs: [],
@@ -307,7 +398,7 @@ function sendJson(res, status, payload) {
   res.end(body);
 }
 
-function readJsonBody(req, maxBytes = MAX_REQUEST_BODY_BYTES) {
+function readJsonBody(req, maxBytes = MAX_REQUEST_BODY_BYTES, { allowEmpty = false } = {}) {
   return new Promise((resolve, reject) => {
     const declaredLen = Number(req.headers['content-length']);
     if (Number.isFinite(declaredLen) && declaredLen > maxBytes) {
@@ -343,6 +434,10 @@ function readJsonBody(req, maxBytes = MAX_REQUEST_BODY_BYTES) {
       settled = true;
       const raw = Buffer.concat(chunks).toString('utf8').trim();
       if (!raw) {
+        if (allowEmpty) {
+          resolve({});
+          return;
+        }
         fail(makeHttpError(400, 'empty_body', '请求体不能为空'));
         return;
       }
@@ -376,12 +471,21 @@ export function createUiRequestHandler({
   dispatch = false,
   dispatchFn = dispatchTask,
   pkgRoot = PKG_ROOT,
+  home = os.homedir(),
+  platform = process.platform,
+  env = process.env,
 } = {}) {
   return async (req, res) => {
     try {
       const urlObj = new URL(req.url || '/', 'http://127.0.0.1');
       const pathname = urlObj.pathname;
       const method = String(req.method || 'GET').toUpperCase();
+
+      if (method === 'GET' && pathname === '/favicon.ico') {
+        res.writeHead(204, { 'Cache-Control': 'no-store' });
+        res.end();
+        return;
+      }
 
       if (method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
         const html = fs.readFileSync(INDEX_HTML_PATH, 'utf8');
@@ -404,7 +508,7 @@ export function createUiRequestHandler({
       }
 
       if (method === 'GET' && pathname === '/api/modules') {
-        const catalog = loadModulesCatalog({ rootDir: config.rootDir, pkgRoot });
+        const catalog = loadModulesCatalog({ rootDir: config.rootDir, pkgRoot, home, platform, env });
         sendJson(res, 200, {
           ...catalog,
           db_exists: fs.existsSync(config.dbPath),
@@ -413,9 +517,128 @@ export function createUiRequestHandler({
         return;
       }
 
+      if (pathname === '/api/modules/owners') {
+        if (method !== 'PATCH' && method !== 'POST') {
+          sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 PATCH / POST /api/modules/owners' });
+          return;
+        }
+        const body = await readJsonBody(req, MAX_REQUEST_BODY_BYTES);
+        const rawModules = readRawModulesCatalog();
+        const saved = updateModuleOwners({
+          body,
+          rootDir: config.rootDir,
+          rawModules,
+          home,
+          platform,
+          env,
+        });
+        const catalog = loadModulesCatalog({ rootDir: config.rootDir, pkgRoot, home, platform, env });
+        sendJson(res, 200, {
+          ...saved,
+          modules: catalog.modules,
+          override_count: catalog.override_count,
+        });
+        return;
+      }
+
+      if (pathname === '/api/modules/owners/reset') {
+        if (method !== 'POST') {
+          sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 POST /api/modules/owners/reset' });
+          return;
+        }
+        const body = await readJsonBody(req, MAX_REQUEST_BODY_BYTES, { allowEmpty: true });
+        const rawModules = readRawModulesCatalog();
+        const reset = resetModuleOwners({ body, rootDir: config.rootDir, rawModules });
+        const catalog = loadModulesCatalog({ rootDir: config.rootDir, pkgRoot, home, platform, env });
+        sendJson(res, 200, {
+          ...reset,
+          modules: catalog.modules,
+          override_count: catalog.override_count,
+        });
+        return;
+      }
+
       if (method === 'GET' && pathname === '/api/agents') {
-        const payload = getAgentsPayload({ rootDir: config.rootDir });
+        const payload = getAgentsPayload({ rootDir: config.rootDir, env });
         sendJson(res, 200, payload);
+        return;
+      }
+
+      /* ---------- 受控工作区文件夹浏览与扫描 API ---------- */
+      if (pathname === '/api/workspace/browse') {
+        if (method !== 'GET') {
+          sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 GET /api/workspace/browse' });
+          return;
+        }
+        const rawDir = urlObj.searchParams.get('dir') || '';
+        const payload = browseWorkspaceDir({ rawDir, config, pkgRoot });
+        sendJson(res, 200, payload);
+        return;
+      }
+
+      if (pathname === '/api/workspace/inspect') {
+        if (method !== 'POST') {
+          sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 POST /api/workspace/inspect' });
+          return;
+        }
+        const body = await readJsonBody(req, MAX_REQUEST_BODY_BYTES);
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+          throw makeHttpError(400, 'invalid_body', '请求体必须是 JSON 对象');
+        }
+        for (const k of Object.keys(body)) {
+          if (k !== 'workspace_dir') {
+            throw makeHttpError(400, 'invalid_field', `不允许的字段: ${k}`);
+          }
+        }
+        const payload = scanWorkspaceDirectory(body.workspace_dir, { config, pkgRoot });
+        sendJson(res, 200, payload);
+        return;
+      }
+
+      if (method === 'GET' && pathname === '/api/client-config') {
+        const payload = detectClientSetup({
+          rootDir: config.rootDir,
+          home,
+          platform,
+          env,
+        });
+        sendJson(res, 200, payload);
+        return;
+      }
+
+      if (pathname === '/api/client-config/preview') {
+        if (method !== 'POST') {
+          sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 POST /api/client-config/preview' });
+          return;
+        }
+        const body = await readJsonBody(req, MAX_REQUEST_BODY_BYTES);
+        const preview = previewClientConfig({
+          body,
+          rootDir: config.rootDir,
+          allowedRoots: config.allowedRoots,
+          home,
+          platform,
+          env,
+        });
+        sendJson(res, 200, preview);
+        return;
+      }
+
+      if (pathname === '/api/client-config/apply') {
+        if (method !== 'POST') {
+          sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 POST /api/client-config/apply' });
+          return;
+        }
+        const body = await readJsonBody(req, MAX_REQUEST_BODY_BYTES);
+        const applied = applyClientConfig({
+          body,
+          rootDir: config.rootDir,
+          allowedRoots: config.allowedRoots,
+          home,
+          platform,
+          env,
+        });
+        sendJson(res, applied.status, applied.payload);
         return;
       }
 
@@ -433,43 +656,53 @@ export function createUiRequestHandler({
           return;
         }
         const body = await readJsonBody(req, MAX_REQUEST_BODY_BYTES);
-        const built = validateAndBuildConductorRequest({ rootDir: config.rootDir, body, pkgRoot });
+        const built = validateAndBuildConductorRequest({ rootDir: config.rootDir, body, pkgRoot, home, platform, env });
 
         const bus = openBus({ config });
         let created;
         let dispatchResult = null;
         let dispatchError = null;
         const shouldDispatch = body.dispatch === true || (dispatch === true && body.dispatch !== false);
+        const explicitWaitS = body.wait_s !== undefined && body.wait_s !== null && Number.isFinite(Number(body.wait_s));
+        const waitS = explicitWaitS ? Math.max(1, Math.min(600, Number(body.wait_s))) : 3;
         try {
           created = createTask(bus, built.taskInput);
           if (shouldDispatch) {
-            try {
-              dispatchResult = await dispatchFn(bus, {
-                id: created.id,
-                cwd: pkgRoot,
-                wait_s: Number.isFinite(Number(body.wait_s)) ? Math.max(1, Math.min(30, Number(body.wait_s))) : 3,
-              });
-            } catch (err) {
-              dispatchError = String(err?.message || err);
-            }
+            const disp = await runUiDispatch({
+              bus,
+              config,
+              dispatchFn,
+              taskId: created.id,
+              toAgent: built.recipientAgent,
+              cwd: pkgRoot,
+              waitS,
+              explicitWaitS,
+              env,
+            });
+            dispatchResult = disp.dispatchResult;
+            dispatchError = disp.dispatchError;
           }
         } finally {
           bus.close();
         }
 
         const cmdLine = `node bin/bus.js dispatch ${created.id} --allow-dispatch --root "${config.rootDir}"`;
+        const dispatchedOk = Boolean(dispatchResult && !dispatchError && dispatchResult.dispatched !== false);
         sendJson(res, 201, {
           ok: true,
           task_id: created.id,
           state: dispatchResult?.state || created.state,
-          to: built.conductorAgent,
+          to: built.recipientAgent,
+          recipient_agent: built.recipientAgent,
+          route_mode: built.routeMode,
+          conductor_agent: built.conductorAgent,
           uri: created.uri,
           dedup: created.dedup,
           module_ids: built.selectedModules.map((m) => m.id),
           action: built.action,
           target_agent: built.targetAgent,
           target_model: built.targetModel,
-          dispatched: Boolean(dispatchResult && !dispatchError),
+          dispatched: dispatchedOk,
           dispatch_requested: shouldDispatch,
           dispatch_command: cmdLine,
           ...(dispatchResult ? { dispatch_result: dispatchResult } : {}),
@@ -478,7 +711,283 @@ export function createUiRequestHandler({
         return;
       }
 
-      if (pathname === '/api/modules' || pathname === '/api/agents' || pathname === '/api/tasks' || pathname === '/api/health') {
+      /* ---------- 自动路由规则 API ---------- */
+      if (pathname === '/api/routing-rules') {
+        if (method === 'GET') {
+          const payload = getRoutingPayload({ rootDir: config.rootDir, home, platform, env });
+          sendJson(res, 200, payload);
+          return;
+        }
+        if (method === 'POST' || method === 'PATCH') {
+          const body = await readJsonBody(req, MAX_REQUEST_BODY_BYTES);
+          const saved = saveRoutingConfig({ body, rootDir: config.rootDir, home, platform, env });
+          sendJson(res, 200, saved);
+          return;
+        }
+        sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 GET / POST / PATCH /api/routing-rules' });
+        return;
+      }
+
+      /* ---------- 项目任务看板 API ---------- */
+      if (pathname === '/api/projects') {
+        if (method === 'GET') {
+          const payload = listProjectsHydrated({ config, pkgRoot, home, platform, env });
+          sendJson(res, 200, payload);
+          return;
+        }
+        if (method === 'POST') {
+          const body = await readJsonBody(req, MAX_REQUEST_BODY_BYTES);
+          const created = await createProject({ body, config, pkgRoot, home, platform, env, dispatchFn });
+          sendJson(res, 201, created);
+          return;
+        }
+        sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 GET / POST /api/projects' });
+        return;
+      }
+
+      if (pathname === '/api/projects/read-existing') {
+        if (method !== 'POST') {
+          sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 POST /api/projects/read-existing' });
+          return;
+        }
+        const body = await readJsonBody(req, MAX_REQUEST_BODY_BYTES);
+        const imported = await readExistingProject({ body, config, pkgRoot, home, platform, env, dispatchFn });
+        sendJson(res, 201, imported);
+        return;
+      }
+
+      const projSubMatch = /^\/api\/projects\/([^/]+)(?:\/(.*))?$/.exec(pathname);
+      if (projSubMatch) {
+        let projectId;
+        try {
+          projectId = decodeURIComponent(projSubMatch[1]);
+        } catch {
+          sendJson(res, 400, { ok: false, code: 'invalid_project_id', error: '非法项目 id 编码' });
+          return;
+        }
+        const tail = projSubMatch[2] || '';
+
+        if (!tail) {
+          if (method === 'GET') {
+            const payload = getProjectHydrated(projectId, { config, pkgRoot, home, platform, env });
+            sendJson(res, 200, payload);
+            return;
+          }
+          sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 GET /api/projects/:id' });
+          return;
+        }
+
+        if (tail === 'retry-bootstrap') {
+          if (method !== 'POST') {
+            sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 POST /api/projects/:id/retry-bootstrap' });
+            return;
+          }
+          const body = await readJsonBody(req, MAX_REQUEST_BODY_BYTES, { allowEmpty: true });
+          const retried = await retryProjectBootstrap({ projectId, body, config, pkgRoot, home, platform, env, dispatchFn });
+          sendJson(res, 200, retried);
+          return;
+        }
+
+        if (tail === 'sync-plan') {
+          if (method !== 'POST') {
+            sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 POST /api/projects/:id/sync-plan' });
+            return;
+          }
+          const body = await readJsonBody(req, MAX_REQUEST_BODY_BYTES, { allowEmpty: true });
+          const synced = await syncProjectPlan({ projectId, body, config, pkgRoot, home, platform, env, dispatchFn });
+          sendJson(res, 200, synced);
+          return;
+        }
+
+        if (tail === 'enrich-pending') {
+          if (method !== 'POST') {
+            sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 POST /api/projects/:id/enrich-pending' });
+            return;
+          }
+          const body = await readJsonBody(req, MAX_REQUEST_BODY_BYTES, { allowEmpty: true });
+          const reconciled = await reconcileProjectEnrichment({ projectId, body, config, pkgRoot, home, platform, env, dispatchFn });
+          sendJson(res, 200, reconciled);
+          return;
+        }
+
+        if (tail === 'auto-route') {
+          if (method !== 'POST') {
+            sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 POST /api/projects/:id/auto-route' });
+            return;
+          }
+          const body = await readJsonBody(req, MAX_REQUEST_BODY_BYTES, { allowEmpty: true });
+          const routed = autoRouteProjectParts({ projectId, body, config, pkgRoot, home, platform, env });
+          sendJson(res, 200, routed);
+          return;
+        }
+
+        if (tail === 'dispatch') {
+          if (method !== 'POST') {
+            sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 POST /api/projects/:id/dispatch' });
+            return;
+          }
+          const body = await readJsonBody(req, MAX_REQUEST_BODY_BYTES, { allowEmpty: true });
+          const dispatched = await dispatchProjectParts({ projectId, body, config, pkgRoot, home, platform, env, dispatchFn });
+          sendJson(res, 200, dispatched);
+          return;
+        }
+
+        if (tail === 'rescan') {
+          if (method !== 'POST') {
+            sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 POST /api/projects/:id/rescan' });
+            return;
+          }
+          const rescanned = rescanProjectWorkspace({ projectId, config, pkgRoot, home, platform, env });
+          sendJson(res, 200, rescanned);
+          return;
+        }
+
+        if (tail === 'ask-cards') {
+          if (method !== 'POST') {
+            sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 POST /api/projects/:id/ask-cards' });
+            return;
+          }
+          const body = await readJsonBody(req, MAX_REQUEST_BODY_BYTES);
+          const asked = await askMainAgentAddCards({ projectId, body, config, pkgRoot, home, platform, env, dispatchFn });
+          sendJson(res, 201, asked);
+          return;
+        }
+
+        if (tail === 'apply-delta') {
+          if (method !== 'POST') {
+            sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 POST /api/projects/:id/apply-delta' });
+            return;
+          }
+          const body = await readJsonBody(req, MAX_REQUEST_BODY_BYTES, { allowEmpty: true });
+          const applied = await applyProjectCardDelta({ projectId, body, config, pkgRoot, home, platform, env, dispatchFn });
+          sendJson(res, 200, applied);
+          return;
+        }
+
+        const partEnrichMatch = /^parts\/([^/]+)\/enrich$/.exec(tail);
+        if (partEnrichMatch) {
+          if (method !== 'POST') {
+            sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 POST /api/projects/:id/parts/:key/enrich' });
+            return;
+          }
+          let partKey;
+          try {
+            partKey = decodeURIComponent(partEnrichMatch[1]);
+          } catch {
+            sendJson(res, 400, { ok: false, code: 'invalid_part_key', error: '非法 part key 编码' });
+            return;
+          }
+          const body = await readJsonBody(req, MAX_REQUEST_BODY_BYTES, { allowEmpty: true });
+          const enriched = await enrichProjectPart({ projectId, partKey, body, config, pkgRoot, home, platform, env, dispatchFn });
+          sendJson(res, enriched.created ? 201 : 200, enriched);
+          return;
+        }
+
+        const partRegenMatch = /^parts\/([^/]+)\/regenerate$/.exec(tail);
+        if (partRegenMatch) {
+          if (method !== 'POST') {
+            sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 POST /api/projects/:id/parts/:key/regenerate' });
+            return;
+          }
+          let partKey;
+          try {
+            partKey = decodeURIComponent(partRegenMatch[1]);
+          } catch {
+            sendJson(res, 400, { ok: false, code: 'invalid_part_key', error: '非法 part key 编码' });
+            return;
+          }
+          const body = await readJsonBody(req, MAX_REQUEST_BODY_BYTES, { allowEmpty: true });
+          const regen = await regenerateProjectPart({ projectId, partKey, body, config, pkgRoot, home, platform, env, dispatchFn });
+          sendJson(res, 201, regen);
+          return;
+        }
+
+        const partCompleteMatch = /^parts\/([^/]+)\/complete$/.exec(tail);
+        if (partCompleteMatch) {
+          if (method !== 'POST') {
+            sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 POST /api/projects/:id/parts/:key/complete' });
+            return;
+          }
+          let partKey;
+          try {
+            partKey = decodeURIComponent(partCompleteMatch[1]);
+          } catch {
+            sendJson(res, 400, { ok: false, code: 'invalid_part_key', error: '非法 part key 编码' });
+            return;
+          }
+          const body = await readJsonBody(req, MAX_REQUEST_BODY_BYTES, { allowEmpty: true });
+          const completed = await completeProjectPart({ projectId, partKey, body, config, pkgRoot, home, platform, env, dispatchFn });
+          sendJson(res, completed.created ? 201 : 200, completed);
+          return;
+        }
+
+        if (tail === 'parts') {
+          if (method !== 'POST') {
+            sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 POST /api/projects/:id/parts' });
+            return;
+          }
+          const body = await readJsonBody(req, MAX_REQUEST_BODY_BYTES);
+          const added = await addProjectPart({ projectId, body, config, pkgRoot, home, platform, env, dispatchFn });
+          sendJson(res, added.created === false ? 200 : 201, added);
+          return;
+        }
+
+        if (tail === 'parts/reorder') {
+          if (method !== 'POST' && method !== 'PATCH') {
+            sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 POST / PATCH /api/projects/:id/parts/reorder' });
+            return;
+          }
+          const body = await readJsonBody(req, MAX_REQUEST_BODY_BYTES);
+          const reordered = reorderProjectParts({ projectId, body, config, pkgRoot, home, platform, env });
+          sendJson(res, 200, reordered);
+          return;
+        }
+
+        const partDelMatch = /^parts\/([^/]+)\/delete$/.exec(tail);
+        if (partDelMatch) {
+          if (method !== 'POST') {
+            sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 POST /api/projects/:id/parts/:key/delete' });
+            return;
+          }
+          let partKey;
+          try {
+            partKey = decodeURIComponent(partDelMatch[1]);
+          } catch {
+            sendJson(res, 400, { ok: false, code: 'invalid_part_key', error: '非法 part key 编码' });
+            return;
+          }
+          const deleted = deleteProjectPart({ projectId, partKey, config, pkgRoot, home, platform, env });
+          sendJson(res, 200, deleted);
+          return;
+        }
+
+        const partPatchMatch = /^parts\/([^/]+)$/.exec(tail);
+        if (partPatchMatch) {
+          if (method !== 'PATCH' && method !== 'POST') {
+            sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: '仅支持 PATCH / POST /api/projects/:id/parts/:key' });
+            return;
+          }
+          let partKey;
+          try {
+            partKey = decodeURIComponent(partPatchMatch[1]);
+          } catch {
+            sendJson(res, 400, { ok: false, code: 'invalid_part_key', error: '非法 part key 编码' });
+            return;
+          }
+          const body = await readJsonBody(req, MAX_REQUEST_BODY_BYTES);
+          const updated = updateProjectPart({ projectId, partKey, body, config, pkgRoot, home, platform, env });
+          sendJson(res, 200, updated);
+          return;
+        }
+      }
+
+      if (
+        pathname === '/api/modules' ||
+        pathname === '/api/agents' ||
+        pathname === '/api/client-config' ||
+        pathname === '/api/tasks' ||
+        pathname === '/api/health'
+      ) {
         sendJson(res, 405, { ok: false, code: 'method_not_allowed', error: `不允许的方法 ${method}` });
         return;
       }
@@ -503,6 +1012,9 @@ export async function startUiServer({
   dispatch = false,
   dispatchFn = dispatchTask,
   pkgRoot = PKG_ROOT,
+  home = os.homedir(),
+  platform = process.platform,
+  env = process.env,
 } = {}) {
   const bindHost = normalizeBindHost(host);
   if (!isLoopbackHost(bindHost)) {
@@ -517,7 +1029,7 @@ export async function startUiServer({
   }
 
   const config = loadConfig({ rootOverride });
-  const handler = createUiRequestHandler({ config, dispatch, dispatchFn, pkgRoot });
+  const handler = createUiRequestHandler({ config, dispatch, dispatchFn, pkgRoot, home, platform, env });
   const server = http.createServer((req, res) => {
     Promise.resolve(handler(req, res)).catch((err) => {
       if (!res.headersSent) {

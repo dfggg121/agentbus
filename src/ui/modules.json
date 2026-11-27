@@ -144,17 +144,20 @@
   },
   {
     "id": "ui",
-    "label": "可视化模块面板",
+    "label": "可视化模块与项目看板",
     "layer": "interface",
     "layer_label": "接口与配置层",
     "paths": [
       "src/ui/server.js",
+      "src/ui/client.js",
+      "src/ui/project.js",
+      "src/ui/routes.js",
       "src/ui/index.html",
       "src/ui/modules.json"
     ],
     "owner_agent": "antigravity",
     "owner_model": "未配置",
-    "summary": "零依赖 loopback 只读模块看板、模型归属解析与 conductor 任务提交界面。",
+    "summary": "零依赖 loopback 本地配套客户端：项目任务看板与自动拆解路由、只读模块看板、本机 agent 探测与主从/模型配置。",
     "status": "active"
   },
   {

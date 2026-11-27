@@ -1,6 +1,6 @@
 {
   "name": "agentbus-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Pointer-based handoff bus for multi-agent workflows: pass references + SHA-256 instead of copying payloads. MCP stdio server + CLI, zero dependencies.",
   "type": "module",
   "license": "MIT",
