@@ -145,6 +145,8 @@ node bin/bus.js ui --port 0 --no-open --root var/test-root --home var/test-home
 | `POST /api/meetings/:id/debate` | 写本地与任务库 | 开展最多一轮基于指针信封的答辩（`start` / `critique` / `summarize` / `timeout`） |
 | `POST /api/meetings/:id/decide` | 写本地与任务库 | 持久化 `agentbus/decision@1`，执行 `human_approved` 门控，批准后生成胜者实现任务并归档记录到 `dev-materials/meetings/<id>/` |
 
+> **方案擂台状态（2026-11-28）**：`agentbus/meeting@1` 的后端模块与以上 API 契约已存在，但当前 `src/ui/server.js` 尚未挂载 `/api/meetings*` 路由，项目看板也没有“方案会议”页面；以上条目是后续接入契约，不应作为当前已上线界面宣传。
+
 ### 项目拆解契约 (`agentbus/project-plan@1`)
 
 主 Agent 完成项目拆解任务后，应将合法 JSON 写入 `out/projects/<project_id>/plan.json` 并作为 `bus_task_complete` 的 `result_path`：
