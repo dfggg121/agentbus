@@ -10,6 +10,11 @@ All notable changes to this project are documented here. Format follows [Keep a 
 ### Tests
 - Acceptance case 156 covers serial project dispatch ordering and the non-concurrent response summary.
 
+### Docs
+- Rewrite the Chinese project intro around two primary workflows: multi-agent discussion/collaboration through task messages and proposal cards, and the current project-board front end (`agentbus ui`).
+- Add `docs/TASK_CARDS.md`: every new idea or structure lands as a card; unrelated ideas get an independent card first; later merge requests update the original card’s R&D fields (`goal` + `acceptance` + `paths`), with pointer summaries instead of copied conversations.
+- Add a sanitized project-board screenshot (`docs/assets/agentbus-project-board.zh.png`) for the compact-card layout.
+
 ## [0.4.0] — 2026-11-28
 
 ### Added

@@ -151,6 +151,7 @@
       "src/ui/server.js",
       "src/ui/client.js",
       "src/ui/project.js",
+      "src/ui/meetings.js",
       "src/ui/routes.js",
       "src/ui/index.html",
       "src/ui/modules.json"

@@ -2,12 +2,24 @@
 
 > 完整版全中文项目简介见 [`docs/INTRO.zh-CN.md`](docs/INTRO.zh-CN.md)。
 
-`agentbus` 是给本机已有 coding agent 使用的轻量任务总线。发活方先把资料就地登记，交出去的是一份很小的 JSON 信封（`tasks/<id>.json`），里面只写 `uri`、`sha256`、`goal` 和 `acceptance` 验收条款。领取方拿到租约后自己按地址读盘，卡住时可在任务内提问等待回复，交回产物后由总线重算哈希并逐条验收再关闭任务。
+`agentbus` 是给**同一台电脑**上已有 coding agent 使用的轻量任务与指针总线，而非新的 agent 编排框架。它重点覆盖两类日常协作场景：一是**多 Agent 讨论与协作**——主控（`conductor`）拆卡建任务，执行方（`worker`）持租约按 `uri + sha256` 指针读盘，卡住时在任务内发 `question` / `blocked` 由主控 `answer` 解阻（`bus_task_wait` 等待），复杂方案可拆成多张并行提案卡各自产出指针后由主控按验收条款汇总；二是**项目看板前端**（`agentbus ui`），提供项目看板（研发组 `dev` / 调试组 `debug`、模块代号、≤4 张完整卡 / ≥5 张紧凑网格、自动补全、向主 Agent 提要求、默认串行派发与完成归档）、模块看板、自动路由规则与主从配置四个页签。
 
 - 零第三方依赖，持久化使用 Node 内置的 `node:sqlite`。
 - 一个 MCP stdio 服务端（`conductor` 角色 15 个工具，`worker` 最小权限 9 个工具）外加同能力 CLI。
 - 通过 `agentbus setup` 接入 Codex、Claude Code、Gemini CLI、Antigravity、Cursor、OpenCode、Claude Desktop、Windsurf、Kiro、LM Studio、Cline、DeepSeek Harness (DSH) 与 Hermes Agent，保留各客户端原本的界面；未手测客户端可按预设自动适配 WorkBuddy、CodeBuddy、VS Code、Trae、Qoder、OpenClaw、Zed。
 - 不复制资料正文：登记一个 4 MB 文件，SQLite 只增约 48 KB，任务信封体积 2,025 B。
+
+## 详细简介与想法入卡规则
+
+- **中文完整简介**：[`docs/INTRO.zh-CN.md`](docs/INTRO.zh-CN.md)（重点介绍多 Agent 讨论、项目看板前端、指针信封与生命周期）。
+- **想法入卡规则**：[`docs/TASK_CARDS.md`](docs/TASK_CARDS.md)。
+
+想法入卡的硬规则：
+
+1. 对话里每提出一个新想法、新结构或新方案，立即在当前项目看板落一张卡，不能只留在聊天记录里。
+2. 与当前项目无关的技术/想法，先建独立项目或独立卡，不要塞进原项目。
+3. 后续用户要求并入原任务时，更新原卡的研发项（`goal` + `acceptance` + `paths`），保留来源指针，不新建重复卡。
+4. 每条想法只写一句摘要 + 来源指针（任务 id 或 `uri + sha256`）；不复制整段对话、不重读全仓、不为建卡启动新的 agent 会话。
 
 ## 一条任务的生命周期
 
@@ -24,12 +36,12 @@
 | 遇阻沟通 | 靠日志猜测或重开一轮 | `bus_task_message` 发 `question` / `blocked` / `error`（置 `blocked_at`），主控 `answer` 清阻塞并唤醒 `bus_task_wait` |
 | 成果验收 | 默认相信 agent 嘴上说完成了 | `bus_task_complete` 重算每份引用哈希（`drift` 默认拒收），并核对 `json`、`must_contain`、`min_bytes`、`fields` |
 | 工具接入 | 需要套进特定框架或改写入口 | 通过 `agentbus setup` 写入 13 类现有 MCP 客户端配置，并用 `AGENTBUS_ROLE` 限制 worker 权限 |
-| 模块归属 | 散落在长对话历史里 | `agentbus ui` 提供仅绑 loopback 的 14 模块归属面板，勾选后先生成 conductor 任务（默认不自动派发） |
+| 模块与项目看板 | 散落在长对话历史里 | `agentbus ui` 提供仅绑 loopback 的四页签工作台（项目看板、模块看板、自动路由规则、主从配置）；模块看板默认只建任务，项目看板新建项目按表单默认直发主 Agent 拆解 |
 | 运行依赖 | 依赖外部服务或框架包 | 本机 `file://` 地址 + SQLite WAL，零第三方运行时依赖 |
 
-## 模块归属面板（`agentbus ui`）
+## 本机工作台（`agentbus ui`）
 
-执行 `agentbus ui --port 0 --no-open --root <bus-root>` 会启动一个只监听 loopback 的只读面板，按技术分层列出 14 个模块的负责人与本地 `agents.json` 解析出的工作模型。勾选模块并在右侧选定动作（重做、深度优化、调整工作模型、只检查）后，默认只把调度任务写入总线；需要立即派发时再加 `--dispatch` 或勾选页面开关（详见 [`docs/UI.md`](docs/UI.md)）。
+执行 `agentbus ui --port 0 --no-open --root <bus-root>` 会启动仅监听本机 loopback 的本地工作台，包含**项目看板**（建项/读已有项目、研发组/调试组分组、紧凑模式、默认串行派发与完成归档）、**模块看板**（按分层查看 14 个模块并生成调度任务，默认只建任务，需加 `--dispatch` 或勾选页面开关）、**自动路由规则**与**主从配置**四个页签（详见 [`docs/UI.md`](docs/UI.md)）。
 
 ![agentbus 本机模块归属面板真实截图，左侧展示分层模块与负责人模型，已勾选 store 与 tasks 两个模块，右侧展示 Conductor 调度任务摘要预览](docs/assets/agentbus-ui.png)
 

@@ -4,6 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { execFileSync } from 'node:child_process';
 
 // Product model lists are public knowledge; per-machine choices live in agents.json.
 export const KNOWN_MODELS = {
@@ -207,6 +208,46 @@ function resolveBinInDir(dir, name, platform) {
     const full = path.join(cleanDir, cand);
     if (isRunnableFile(full, platform)) return full;
   }
+  return null;
+}
+
+let codexDesktopBinCache = null;
+let codexDesktopBinCacheKey = null;
+
+function findCodexDesktopBin(env, platform) {
+  if (platform !== 'win32') return null;
+  if (env.AGENTBUS_CODEX_PREFER_DESKTOP === '0') return null;
+  const explicit = env.AGENTBUS_CODEX_DESKTOP_BIN;
+  const cacheKey = `${process.platform}|${explicit || ''}|${env.ProgramFiles || ''}`;
+  if (codexDesktopBinCacheKey === cacheKey) return codexDesktopBinCache;
+
+  const candidates = [];
+  if (explicit) candidates.push(explicit);
+  try {
+    const ps = execFileSync('powershell.exe', [
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      '(Get-AppxPackage -Name OpenAI.Codex).InstallLocation',
+    ], { encoding: 'utf8', windowsHide: true, timeout: 5000 });
+    const install = String(ps || '').trim().split(/\r?\n/).find((line) => line.trim());
+    if (install) candidates.push(path.join(install.trim(), 'app', 'resources', 'codex.exe'));
+  } catch {}
+  candidates.push(
+    path.join(env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'Programs', 'Codex', 'resources', 'codex.exe'),
+    path.join(env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'Programs', 'Codex', 'codex.exe'),
+  );
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const resolved = path.resolve(stripQuotes(candidate));
+    if (isRunnableFile(resolved, platform)) {
+      codexDesktopBinCache = resolved;
+      codexDesktopBinCacheKey = cacheKey;
+      return resolved;
+    }
+  }
+  codexDesktopBinCache = null;
+  codexDesktopBinCacheKey = cacheKey;
   return null;
 }
 
@@ -423,6 +464,24 @@ export function resolveAgentBin(agentId, opts = {}) {
       message: `${def.envVar} 指向的可执行文件不存在或不可执行: ${val}`,
       next: `检查 ${def.envVar} 路径是否正确，或取消覆盖后重装: ${envCmd}`,
     };
+  }
+
+  // 1b. Codex Desktop bundles its own CLI binary. Prefer it over a possibly
+  // stale npm CLI: it supports the models configured in agents.json and its
+  // threads are the ones the Desktop app can show under a project.
+  if (agentId === 'codex') {
+    const desktop = findCodexDesktopBin(env, platform);
+    if (desktop) {
+      return {
+        bin: desktop,
+        source: 'desktop_app',
+        envVar: def.envVar,
+        envValue: null,
+        error: null,
+        message: null,
+        next: null,
+      };
+    }
   }
 
   // 2. PATH

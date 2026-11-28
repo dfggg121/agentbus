@@ -16,6 +16,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { showTask, listTaskMessages, latestTaskMessageSeq, ATTENTION_MESSAGE_KINDS } from './tasks.js';
 import { defaultAgySessionPath, detectAgentApi, resolveAgySession, archiveTaskConversations } from './agy.js';
 import { modelFor, KNOWN_MODELS, readAgentConfig, resolveAgentBin } from './agents.js';
+import { linkCodexThreadToApp } from './codex-app.js';
 import { appendEvent, openBus, openBusReadOnly, withImmediateTx, PKG_ROOT } from './db.js';
 import {
   threadUsable,
@@ -1050,6 +1051,18 @@ export async function dispatchTask(bus, {
       })
     : { steps: 0, stepSource: 'unknown' };
 
+  // Codex exec threads are invisible in the Desktop project until they are
+  // attached to a project and re-labelled. Do it after the CLI has written the
+  // thread, before returning the dispatch result. Best-effort and non-fatal.
+  let codexAppLink = null;
+  if (task.to === 'codex' && effectiveSession) {
+    codexAppLink = linkCodexThreadToApp({
+      threadId: effectiveSession,
+      cwd: workdir,
+      taskId: task.id,
+    });
+  }
+
   const persist = shouldPersistThread({
     latest,
     adapterResult: lastRun,
@@ -1162,6 +1175,7 @@ export async function dispatchTask(bus, {
       steps: stepInfo.steps,
       step_source: stepInfo.stepSource,
     },
+    codex_app: codexAppLink || undefined,
     adapter: lastSpec
       ? { command: lastSpec.command, exit: lastRun?.exit ?? null, seconds: lastRun?.seconds ?? null }
       : undefined,
