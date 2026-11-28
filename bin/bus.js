@@ -21,6 +21,7 @@ import {
 } from '../src/tasks.js';
 import { startMcpStdio, startMcpHttp } from '../src/mcp.js';
 import { setupClients, doctor, doctorFix, doctorBootstrap, listClients, describeClients, defaultRoot } from '../src/setup.js';
+import { adaptPresets, listPresets, PRESET_FORMATS } from '../src/presets.js';
 import { dispatchTask, dispatchEnabled, waitForTask, watchTask, maybeArchiveTask, spawnDetachedArchiveTask, checkArchiveGuard } from '../src/dispatch.js';
 import { exportAgySession, defaultAgySessionPath, archiveConversation } from '../src/agy.js';
 import { loadContextLedger, confirmDecision } from '../src/context.js';
@@ -36,8 +37,8 @@ const require = createRequire(import.meta.url);
 const VERSION = require('../package.json').version;
 
 function parseArgs(argv) {
-  const out = { _: [], ref: [], accept: [], constraint: [], field: [], client: [], allow: [], model: [] };
-  const multi = new Set(['ref', 'accept', 'constraint', 'field', 'client', 'allow', 'model']);
+  const out = { _: [], ref: [], accept: [], constraint: [], field: [], client: [], allow: [], model: [], preset: [], path: [] };
+  const multi = new Set(['ref', 'accept', 'constraint', 'field', 'client', 'allow', 'model', 'preset', 'path']);
 
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -106,7 +107,8 @@ function printHelp() {
     name: 'agentbus',
     version: VERSION,
     commands: [
-      'setup [--client <id>]... [--root <dir>] [--allow <dir>]... [--bin node|npx] [--home <dir>] [--role conductor|worker] [--allow-dispatch] [--repair] [--list] [--require-config-dir] [--dry-run]',
+      'setup [--client <id>]... [--root <dir>] [--allow <dir>]... [--bin node|npx] [--home <dir>] [--role conductor|worker] [--allow-dispatch] [--repair] [--list] [--require-config-dir] [--dry-run] [--no-adapt] [--auto]',
+      'adapt [--preset <id>]... [--path <file>]... [--format <fmt>] [--scan] [--root <dir>] [--allow <dir>]... [--home <dir>] [--role conductor|worker] [--allow-dispatch] [--dry-run] [--no-probe] [--force] [--list]   # 对未手测客户端按预设写配置并跑 MCP 联通测试',
       'doctor [--root <dir>] [--home <dir>] [--fix] [--bootstrap [--check-archive] [--port <port>] [--cwd <dir>]] [--allow <dir>]... [--role conductor|worker] [--allow-dispatch] [--json]',
       'version',
       'init [--root <dir>]',
@@ -232,9 +234,49 @@ async function main() {
     process.exit(code);
   }
 
+  if (cmd === 'adapt') {
+    if (args.list) {
+      const home = typeof args.home === 'string' ? args.home : os.homedir();
+      process.stdout.write(JSON.stringify({ ok: true, formats: PRESET_FORMATS, presets: listPresets({ home }) }, null, 2) + '\n');
+      process.exit(0);
+    }
+    try {
+      const rawRole = typeof args.role === 'string' ? args.role.trim().toLowerCase() : 'worker';
+      const role = rawRole === 'conductor' ? 'conductor' : 'worker';
+      const report = await adaptPresets({
+        home: typeof args.home === 'string' ? args.home : undefined,
+        root: rootOverride,
+        allowed: args.allow,
+        role,
+        allowDispatch: args['allow-dispatch'] === true,
+        ids: args.preset,
+        paths: args.path,
+        format: typeof args.format === 'string' ? args.format : undefined,
+        scan: args.scan === true,
+        dryRun: !!args['dry-run'],
+        probe: args['no-probe'] !== true,
+        force: args.force === true,
+      });
+      process.stdout.write(JSON.stringify(report, null, 2) + '\n');
+      if (!report.ok) {
+        const firstErr = report.presets.find((r) => !r.ok && r.status !== 'manual');
+        process.stderr.write(JSON.stringify({
+          error: firstErr?.error || 'adapt failed',
+          error_code: firstErr?.error_code || 'adapt_failed',
+          next: firstErr?.next || null,
+          code: 1,
+        }) + '\n');
+      }
+      process.exit(report.ok ? 0 : 1);
+    } catch (e) {
+      process.stderr.write(JSON.stringify({ error: String(e.message || e), error_code: e.code || null, code: 1 }) + '\n');
+      process.exit(1);
+    }
+  }
+
   if (cmd === 'setup') {
     if (args.list) {
-      process.stdout.write(JSON.stringify({ ok: true, clients: describeClients({ home: homeOverride }) }, null, 2) + '\n');
+      process.stdout.write(JSON.stringify({ ok: true, clients: describeClients({ home: homeOverride }), presets: listPresets({ home: homeOverride || os.homedir() }) }, null, 2) + '\n');
       process.exit(0);
     }
     if (args.repair === true) {
@@ -269,6 +311,23 @@ async function main() {
         requireConfigDir: !!args['require-config-dir'],
         dryRun: !!args['dry-run'],
       });
+      const autoAdapt = !args['no-adapt'] && args['dry-run'] !== true && (args.auto === true || !args.client || args.client.length === 0);
+      if (autoAdapt) {
+        try {
+          result.auto_adapt = await adaptPresets({
+            home: homeOverride || result.home || os.homedir(),
+            root: rootOverride || result.root || defaultRoot(),
+            allowed: args.allow && args.allow.length ? args.allow : (result.allowed_roots || []),
+            role,
+            allowDispatch,
+            probe: true,
+          });
+          if (!result.auto_adapt.ok) result.ok = false;
+        } catch (e) {
+          result.auto_adapt = { ok: false, error: String(e.message || e), error_code: e.code || 'adapt_failed' };
+          result.ok = false;
+        }
+      }
       process.stdout.write(JSON.stringify(result, null, 2) + '\n');
       if (!result.ok) {
         const firstErr = result.results.find((r) => !r.ok);

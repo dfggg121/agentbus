@@ -4,6 +4,19 @@ All notable changes to this project are documented here. Format follows [Keep a 
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-11-28
+
+### Added
+- `agentbus adapt` and automatic preset adaptation in `agentbus setup`:
+  - Presets for WorkBuddy, CodeBuddy, VS Code/Copilot, Trae, Qoder, OpenClaw, and Zed; each preset knows a config path and a JSON shape (`mcpServers`, `servers`, `mcp.servers`, `context_servers`, or OpenCode local).
+  - `agentbus setup` without `--client` writes detected preset clients and runs the MCP probe; `--no-adapt` disables, `--auto` also enables it with explicit `--client`.
+  - Global `npm install -g` runs a one-shot `postinstall-adapt.mjs` (presets only, never core configs); `AGENTBUS_NO_AUTO_ADAPT=1` opts out, `AGENTBUS_AUTO_ADAPT=1` forces it for local installs. Results land in `~/.agentbus/auto-adapt.json`; install failures never break npm.
+  - Every preset write is timestamped-backup protected. A failed MCP probe removes the newly created file or restores the backup, and reports `rolled_back: true`.
+  - Optional `--path <file> --format <fmt>` for unknown clients, and opt-in `--scan` for local `mcp*.json` discovery. JSONC/JSON5 configs are reported as manual and never rewritten.
+  - Probe performs a real stdio `initialize` + `tools/list` + role-safe tool call: worker must expose 9 tools, conductor 15.
+  - `setup --list` now includes read-only `presets` metadata.
+- Acceptance cases 150-155: preset catalog read-only, WorkBuddy write/backup/probe/idempotence, OpenClaw nested merge, failed-probe rollback, and setup auto-adapt/no-adapt.
+
 ## [0.3.0] — 2026-11-27
 
 ### Added

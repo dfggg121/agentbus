@@ -26,7 +26,7 @@ Copy the `.tgz` and its checksum to the target machine. On the target:
 
 ```bash
 node --version          # must be >= 22.13 (or >= 23.4)
-npm install -g ./agentbus-mcp-0.3.0.tgz
+npm install -g ./agentbus-mcp-0.4.0.tgz
 agentbus version
 agentbus setup --list
 ```
@@ -34,7 +34,7 @@ agentbus setup --list
 Project-local alternative:
 
 ```bash
-npm install --prefix ./agentbus-local ./agentbus-mcp-0.3.0.tgz
+npm install --prefix ./agentbus-local ./agentbus-mcp-0.4.0.tgz
 ./agentbus-local/node_modules/.bin/agentbus setup --list
 ```
 

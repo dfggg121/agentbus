@@ -6,7 +6,7 @@
 
 - Zero third-party dependencies; storage runs on Node's built-in `node:sqlite`.
 - One MCP stdio server (`15` tools for `conductor`, `9` least-privilege tools for `worker`) plus a matching CLI.
-- Works alongside Codex, Claude Code, Gemini CLI, Antigravity, Cursor, OpenCode, Claude Desktop, Windsurf, Kiro, LM Studio, Cline, DeepSeek Harness (DSH), and Hermes Agent via `agentbus setup`.
+- Works alongside Codex, Claude Code, Gemini CLI, Antigravity, Cursor, OpenCode, Claude Desktop, Windsurf, Kiro, LM Studio, Cline, DeepSeek Harness (DSH), and Hermes Agent via `agentbus setup`; unverified clients can be auto-adapted from presets (WorkBuddy, CodeBuddy, VS Code, Trae, Qoder, OpenClaw, Zed).
 - Keeps payloads on disk: registering a 4 MB file adds about 48 KB to SQLite and leaves the task envelope at 2,025 B.
 
 ## Task lifecycle
@@ -58,20 +58,22 @@ Requires **Node.js ≥ 22.13** (for `node:sqlite` without an experimental flag; 
 The package is not published to npm yet. Build or receive `agentbus-mcp-<version>.tgz`, copy it to the target machine, then:
 
 ```bash
-npm install -g ./agentbus-mcp-0.3.0.tgz
-agentbus setup --client codex
+npm install -g ./agentbus-mcp-0.4.0.tgz
+agentbus setup
 ```
+
+Without `--client`, `agentbus setup` configures the core clients and auto-adapts detected presets, then runs the MCP connectivity probe; pass `--client` to target one client only. A global `npm install -g` also runs `postinstall-adapt.mjs` once (presets only, never core configs; disable with `AGENTBUS_NO_AUTO_ADAPT=1`); the report is written to `~/.agentbus/auto-adapt.json`.
 
 If you do not want a global install, install into a project-local prefix:
 
 ```bash
-npm install --prefix ./agentbus-local ./agentbus-mcp-0.3.0.tgz
+npm install --prefix ./agentbus-local ./agentbus-mcp-0.4.0.tgz
 ./agentbus-local/node_modules/.bin/agentbus setup --client codex
 ```
 
 `npx agentbus-mcp ...` only works after the package is published to npm; it is intentionally not the primary install path in this release.
 
-`setup` writes the MCP server entry into the client's config (with a timestamped backup) and prints what it touched. Supported ids (core + optional):
+`setup` writes the MCP server entry into the client's config (with a timestamped backup) and prints what it touched. Without `--client`, it also auto-adapts detected preset clients and runs the MCP probe; `--no-adapt` disables that and `agentbus adapt` runs it separately. Supported ids (core + optional):
 
 ```
 Core:     codex  claude  gemini  antigravity  cursor  opencode  claude-desktop
@@ -86,11 +88,13 @@ agentbus setup --client codex --role conductor --allow-dispatch
 # Antigravity as conductor: the role lives in Antigravity's client-level MCP config, so every Antigravity conversation shares it.
 agentbus setup --client antigravity --role conductor --allow-dispatch
 agentbus setup --list   # id, label, format, config, installed, optional (read-only)
+agentbus adapt --list   # read-only preset catalog for untested clients
+agentbus adapt          # adapt detected presets + run the MCP probe
 agentbus doctor         # show what is configured
 agentbus clients        # ids only
 ```
 
-Optional clients are skipped by default if not installed (no directories created); pass `--client <id>` explicitly to initialize them. Full automatic & manual client matrix (including Trae, Qoder, CodeBuddy, VS Code, Zed, OpenClaw): [`docs/CLIENTS.md`](docs/CLIENTS.md).
+Optional clients are skipped by default if not installed (no directories created); pass `--client <id>` explicitly to initialize them. Full automatic & manual client matrix (including Trae, Qoder, CodeBuddy, VS Code, Zed, OpenClaw): [`docs/CLIENTS.md`](docs/CLIENTS.md). Untested clients use presets with backup + probe + rollback.
 
 By default the bus lives in `~/.agentbus` and only files inside it may be referenced. Pass `--allow` for the project you actually work in:
 

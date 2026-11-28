@@ -6406,6 +6406,112 @@ async function main() {
         Boolean(updatedPart149?.enrichment_dispatch) &&
         manualLabelOk149,
         `env=(${envPassDiag149}) delta=${applyDelta149.status}/enrich=${updatedPart149?.enrichment_task_id === origEnrichTaskId149}/${updatedPart149?.enrichment_status} manualLabel=${manualLabelOk149}`);
+
+      // 150. adapt --list 只读目录树 + 预设 catalog 字段
+      const presetHome150 = path.join(RUN_BASE, 'preset_list_150');
+      fs.mkdirSync(path.join(presetHome150, '.workbuddy'), { recursive: true });
+      fs.writeFileSync(path.join(presetHome150, '.workbuddy', 'mcp.json'), '{"keep":"yes"}\n', 'utf8');
+      const snapBefore150 = snapTree(presetHome150);
+      const list150 = runCli(['adapt', '--list', '--home', presetHome150]);
+      const snapAfter150 = snapTree(presetHome150);
+      const presetIds150 = ['workbuddy', 'codebuddy', 'vscode', 'trae', 'qoder', 'openclaw', 'zed'];
+      const listFields150 = (list150.json?.presets || []).every((p) =>
+        typeof p.id === 'string' && typeof p.format === 'string' && typeof p.config === 'string' && typeof p.detected === 'boolean'
+      );
+      assertCase(150, 'adapt --list 只读、输出 5 种格式与 7 个预设且字段完整',
+        list150.rc === 0 &&
+        Array.isArray(list150.json?.formats) && list150.json.formats.length === 5 &&
+        Array.isArray(list150.json?.presets) && list150.json.presets.length === 7 &&
+        presetIds150.every((id) => list150.json.presets.some((p) => p.id === id)) &&
+        listFields150 && snapBefore150 === snapAfter150,
+        `rc=${list150.rc} formats=${list150.json?.formats?.length} presets=${list150.json?.presets?.length} fields=${listFields150} readonly=${snapBefore150 === snapAfter150}`);
+
+      // 151. WorkBuddy 预设：写入、备份、真实 MCP probe（worker 9 tools）、保留其他键
+      const h151 = path.join(RUN_BASE, 'preset_wb_151');
+      const root151 = path.join(RUN_BASE, 'preset_wb_root_151');
+      fs.mkdirSync(path.join(h151, '.workbuddy'), { recursive: true });
+      fs.mkdirSync(root151, { recursive: true });
+      fs.writeFileSync(path.join(h151, '.workbuddy', 'mcp.json'), JSON.stringify({ keep: 'yes', mcpServers: { other: { command: 'echo' } } }, null, 2) + '\n', 'utf8');
+      const wb151 = runCli(['adapt', '--preset', 'workbuddy', '--home', h151], { root: root151, allowed: root151 });
+      const cfg151 = JSON.parse(fs.readFileSync(path.join(h151, '.workbuddy', 'mcp.json'), 'utf8'));
+      const backup151 = (wb151.json?.presets || []).find((p) => p.id === 'workbuddy')?.backup;
+      assertCase(151, 'WorkBuddy 预设写入 mcpServers.agentbus、保留既有键、备份并 probe 出 9 个 worker 工具',
+        wb151.rc === 0 &&
+        wb151.json?.presets?.[0]?.status === 'ok' &&
+        wb151.json?.presets?.[0]?.changed === true &&
+        Boolean(backup151) && fs.existsSync(backup151) &&
+        cfg151.keep === 'yes' && Boolean(cfg151.mcpServers?.other) &&
+        cfg151.mcpServers?.agentbus?.type === 'stdio' &&
+        cfg151.mcpServers?.agentbus?.env?.AGENTBUS_ROLE === 'worker' &&
+        wb151.json?.presets?.[0]?.probe?.ok === true &&
+        wb151.json?.presets?.[0]?.probe?.tool_count === 9,
+        `rc=${wb151.rc} status=${wb151.json?.presets?.[0]?.status} changed=${wb151.json?.presets?.[0]?.changed} keep=${cfg151.keep} backup=${Boolean(backup151)} probe=${wb151.json?.presets?.[0]?.probe?.tool_count}`);
+
+      // 152. 重复适配幂等：已存在 agentbus 条目时不覆盖，仍 probe 成功
+      const wb152 = runCli(['adapt', '--preset', 'workbuddy', '--home', h151], { root: root151, allowed: root151 });
+      const cfg152 = JSON.parse(fs.readFileSync(path.join(h151, '.workbuddy', 'mcp.json'), 'utf8'));
+      assertCase(152, '重复 adapt 幂等：不覆盖已有 agentbus 条目、无新备份、仍通过 probe',
+        wb152.rc === 0 &&
+        wb152.json?.presets?.[0]?.status === 'ok' &&
+        wb152.json?.presets?.[0]?.changed === false &&
+        wb152.json?.presets?.[0]?.backup == null &&
+        JSON.stringify(cfg151) === JSON.stringify(cfg152) &&
+        wb152.json?.presets?.[0]?.probe?.tool_count === 9,
+        `rc=${wb152.rc} status=${wb152.json?.presets?.[0]?.status} changed=${wb152.json?.presets?.[0]?.changed} probe=${wb152.json?.presets?.[0]?.probe?.tool_count}`);
+
+      // 153. OpenClaw 预设：mcp.servers 嵌套结构 + conductor 15 tools
+      const h153 = path.join(RUN_BASE, 'preset_oc_153');
+      const root153 = path.join(RUN_BASE, 'preset_oc_root_153');
+      fs.mkdirSync(path.join(h153, '.openclaw'), { recursive: true });
+      fs.mkdirSync(root153, { recursive: true });
+      fs.writeFileSync(path.join(h153, '.openclaw', 'openclaw.json'), JSON.stringify({ mcp: { servers: { keep: { transport: 'stdio', command: 'echo' } } } }, null, 2) + '\n', 'utf8');
+      const oc153 = runCli(['adapt', '--preset', 'openclaw', '--role', 'conductor', '--allow-dispatch', '--home', h153], { root: root153, allowed: root153 });
+      const ocCfg153 = JSON.parse(fs.readFileSync(path.join(h153, '.openclaw', 'openclaw.json'), 'utf8'));
+      assertCase(153, 'OpenClaw 预设写入 mcp.servers.agentbus（transport=stdio）、保留既有 server、probe 出 15 个 conductor 工具',
+        oc153.rc === 0 &&
+        oc153.json?.presets?.[0]?.status === 'ok' &&
+        Boolean(ocCfg153.mcp?.servers?.keep) &&
+        ocCfg153.mcp?.servers?.agentbus?.transport === 'stdio' &&
+        ocCfg153.mcp?.servers?.agentbus?.env?.AGENTBUS_ROLE === 'conductor' &&
+        oc153.json?.presets?.[0]?.probe?.tool_count === 15,
+        `rc=${oc153.rc} status=${oc153.json?.presets?.[0]?.status} keep=${Boolean(ocCfg153.mcp?.servers?.keep)} tools=${oc153.json?.presets?.[0]?.probe?.tool_count}`);
+
+      // 154. probe 失败自动回滚：不留下半写配置
+      const h154 = path.join(RUN_BASE, 'preset_fail_154');
+      const root154 = path.join(RUN_BASE, 'preset_fail_root_154');
+      fs.mkdirSync(path.join(h154, '.workbuddy'), { recursive: true });
+      fs.mkdirSync(root154, { recursive: true });
+      const orig154 = JSON.stringify({ keep: 'rollback' }, null, 2) + '\n';
+      fs.writeFileSync(path.join(h154, '.workbuddy', 'mcp.json'), orig154, 'utf8');
+      const fail154 = runCli(['adapt', '--preset', 'workbuddy', '--home', h154], {
+        root: root154,
+        allowed: root154,
+        envExtra: { AGENTBUS_MCP_COMMAND: 'definitely-not-a-real-command-154' },
+      });
+      const after154 = fs.readFileSync(path.join(h154, '.workbuddy', 'mcp.json'), 'utf8');
+      assertCase(154, 'probe 失败时回滚原配置、返回 failed/rolled_back 且退出码非 0',
+        fail154.rc !== 0 &&
+        fail154.json?.presets?.[0]?.status === 'failed' &&
+        fail154.json?.presets?.[0]?.rolled_back === true &&
+        after154 === orig154,
+        `rc=${fail154.rc} status=${fail154.json?.presets?.[0]?.status} rolled=${fail154.json?.presets?.[0]?.rolled_back} same=${after154 === orig154}`);
+
+      // 155. setup 默认自动适配，--no-adapt 关闭
+      const h155 = path.join(RUN_BASE, 'preset_setup_155');
+      const root155 = path.join(RUN_BASE, 'preset_setup_root_155');
+      fs.mkdirSync(path.join(h155, '.workbuddy'), { recursive: true });
+      fs.mkdirSync(root155, { recursive: true });
+      fs.writeFileSync(path.join(h155, '.workbuddy', 'mcp.json'), '{"keep":"setup"}\n', 'utf8');
+      const setup155 = runCli(['setup', '--home', h155], { root: root155, allowed: root155 });
+      const setup155No = runCli(['setup', '--no-adapt', '--home', h155], { root: root155, allowed: root155 });
+      assertCase(155, 'setup 默认对检测到的预设自动适配并 probe；--no-adapt 不产生 auto_adapt',
+        setup155.rc === 0 &&
+        setup155.json?.auto_adapt?.ok === true &&
+        setup155.json?.auto_adapt?.presets?.[0]?.status === 'ok' &&
+        setup155.json?.auto_adapt?.presets?.[0]?.probe?.ok === true &&
+        setup155No.rc === 0 &&
+        setup155No.json?.auto_adapt === undefined,
+        `auto=${setup155.json?.auto_adapt?.ok}/${setup155.json?.auto_adapt?.presets?.[0]?.status} no=${setup155No.rc}/${setup155No.json?.auto_adapt === undefined}`);
     } finally {
       await srvV3.close();
       if (prevAllowed125 === undefined) delete process.env.AGENTBUS_ALLOWED_ROOTS;

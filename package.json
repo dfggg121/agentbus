@@ -1,6 +1,6 @@
 {
   "name": "agentbus-mcp",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Pointer-based handoff bus for multi-agent workflows: pass references + SHA-256 instead of copying payloads. MCP stdio server + CLI, zero dependencies.",
   "type": "module",
   "license": "MIT",
@@ -13,16 +13,19 @@
   "files": [
     "bin/",
     "src/",
+    "scripts/",
     "test/accept.mjs",
     "docs/",
     "README.md",
     "README.zh-CN.md",
+    "README.en.md",
     "CONTRIBUTING.md",
     "LICENSE",
     "SECURITY.md",
     "CHANGELOG.md"
   ],
   "scripts": {
+    "postinstall": "node ./scripts/postinstall-adapt.mjs",
     "test": "node test/accept.mjs",
     "test:compat": "node test/accept.mjs",
     "setup": "node bin/bus.js setup",

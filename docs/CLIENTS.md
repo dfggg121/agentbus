@@ -1,8 +1,8 @@
 # Supported Clients
 
-`agentbus setup` automates MCP registration for 13 clients (7 core + 6 optional). Any stdio JSON-RPC 2.0 MCP client can also be configured manually.
+`agentbus setup` automates MCP registration for 13 clients (7 core + 6 optional), and can auto-adapt detected untested clients from presets. Any stdio JSON-RPC 2.0 MCP client can also be configured manually.
 
-> **Read-only inspection:** `agentbus setup --list [--home <dir>]` prints `id`, `label`, `format`, `config`, `optional`, and `installed` without creating directories or modifying files.
+> **Read-only inspection:** `agentbus setup --list [--home <dir>]` prints `id`, `label`, `format`, `config`, `optional`, and `installed` plus the preset catalog without creating directories or modifying files.
 
 ---
 
@@ -26,6 +26,56 @@ Core clients (`optional: false`) are always targeted when running `agentbus setu
 | `dsh` | DeepSeek Harness (DSH) | `~/.dsh/profiles/desktop/cordis.patch.yml` | `dsh-cordis` | Yes | **Yes** (`setup` never restarts DSH) | `agentbus setup --client dsh` |
 | `hermes` | Hermes Agent | Win: `%LOCALAPPDATA%\hermes\config.yaml` (fallback `%USERPROFILE%\.hermes\config.yaml`)<br>macOS/Linux: `~/.hermes/config.yaml`<br>Override: `$HERMES_HOME/config.yaml` (via `hermes mcp add`) | `hermes-cli` | Yes | No (next `hermes` run) | `agentbus setup --client hermes` |
 
+### Generic Presets & Auto-Adaptation
+
+Clients outside the matrix above use a **preset**: a known config path plus a
+known JSON shape. `agentbus setup` (without `--client`) auto-adapts detected
+presets and then probes them. Use `agentbus adapt` explicitly for one client,
+an arbitrary file, or a scan.
+
+| Preset id | Path | JSON shape | Auto trigger | Activation |
+|---|---|---|---|---|
+| `workbuddy` | `~/.workbuddy/mcp.json` | `mcpServers` | `~/.workbuddy` exists | UI: Connectors → Custom → My MCP → Save + Trust |
+| `codebuddy` | `~/.codebuddy/.mcp.json` | `mcpServers` | `~/.codebuddy` exists | Restart; JSONC configs stay manual |
+| `vscode` | `~/.copilot/mcp-config.json` | `mcpServers` | `~/.copilot` exists | Restart Copilot |
+| `trae` | `~/.trae/mcp.json` | `mcpServers` | `~/.trae` exists | Restart / enable project MCP |
+| `qoder` | `~/.qoder/mcp.json` | `mcpServers` | `~/.qoder` exists | Restart and confirm the server list |
+| `openclaw` | `~/.openclaw/openclaw.json` | `mcp.servers` | `~/.openclaw` exists | Restart / control UI |
+| `zed` | Windows `%APPDATA%/Zed/settings.json`; macOS `~/Library/Application Support/Zed/settings.json`; Linux `~/.config/zed/settings.json` | `context_servers` | parent directory exists | Restart; JSONC stays manual |
+
+Formats: `json-mcpServers`, `json-servers`, `json-opencode`,
+`json-openclaw`, and `json-zed-context`. Use `--path <file> --format <fmt>`
+for an unknown client. `--scan` is opt-in and only discovers local
+`mcp*.json` / `.mcp.json` / `mcp-config.json` files under `$HOME` (skipping
+`.ssh`, `.aws`, `.cache`, `.git`, and similar); it is a low-confidence
+fallback, not part of the default setup path.
+
+Every write is preceded by a timestamped `*.bak-<timestamp>` copy. Existing
+`agentbus` entries are **not** overwritten by automatic adaptation; they are
+probed as-is. Use `--force` only when you intentionally want to replace one.
+After writing, the command starts the configured server over stdio and runs a
+real handshake: `initialize` → `tools/list` → one role-safe tool call. A
+worker must expose 9 tools; a conductor 15. If the handshake fails, the new
+file is removed or the backup restored, and the preset reports
+`rolled_back: true`. A successful probe proves the MCP server is usable; the
+client may still need a restart or UI trust before its chat surface shows the
+tools. `--no-probe` skips the handshake explicitly. JSONC/JSON5 files are
+reported as `manual` and are never rewritten.
+
+```bash
+agentbus adapt --list                 # read-only: presets + formats
+agentbus adapt --preset workbuddy     # one detected client, write + probe
+agentbus adapt                        # all detected presets + probe
+agentbus adapt --path ./mcp.json --format json-mcpServers --force
+agentbus setup --no-adapt             # core clients only
+```
+
+A global `npm install -g` runs the same preset-only adaptation once through
+`postinstall-adapt.mjs`; it never touches the hand-tested core clients and
+never fails the install. Set `AGENTBUS_NO_AUTO_ADAPT=1` to opt out (or
+`AGENTBUS_AUTO_ADAPT=1` to force it for a local install); the JSON report is
+`~/.agentbus/auto-adapt.json`.
+
 ### Role & Dispatch Flags
 
 ```bash
@@ -48,7 +98,7 @@ agentbus doctor --fix
 
 ## Manual Support Matrix (GUI-only / JSONC / Ambiguous Paths)
 
-These clients either manage MCP through their GUI, use JSONC (comments/trailing commas), or support multiple ambiguous paths, so `setup` does not overwrite them automatically.
+These clients either manage MCP through their GUI, use JSONC (comments/trailing commas), or support multiple ambiguous paths, so `setup` does not overwrite them automatically. `adapt` may still fill a detected preset path when the file is plain JSON; JSONC/JSON5 remains manual.
 
 | Client | Where to Configure in UI / CLI | Config Shape / Docs |
 |---|---|---|

@@ -41,9 +41,11 @@
 当前版本通过离线 tarball 分发（暂未发布到 npm）。安装并接入客户端后，重启客户端即可加载 MCP 服务：
 
 ```bash
-npm install -g ./agentbus-mcp-0.3.0.tgz
+npm install -g ./agentbus-mcp-0.4.0.tgz
 agentbus setup --client codex --root ~/.agentbus --allow ~/projects/my-app
 ```
+
+不带 `--client` 时会自动探测 WorkBuddy / CodeBuddy / VS Code / Trae / Qoder / OpenClaw / Zed 等预设客户端，写入后跑一次真实 MCP 握手；详见 [`CLIENTS.md`](CLIENTS.md)。
 
 使用 CLI 跑通一次“登记资料 → 建任务 → 领取读盘 → 核验收工”：
 

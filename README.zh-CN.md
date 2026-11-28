@@ -6,7 +6,7 @@
 
 - 零第三方依赖，持久化使用 Node 内置的 `node:sqlite`。
 - 一个 MCP stdio 服务端（`conductor` 角色 15 个工具，`worker` 最小权限 9 个工具）外加同能力 CLI。
-- 通过 `agentbus setup` 接入 Codex、Claude Code、Gemini CLI、Antigravity、Cursor、OpenCode、Claude Desktop、Windsurf、Kiro、LM Studio、Cline、DeepSeek Harness (DSH) 与 Hermes Agent，保留各客户端原本的界面。
+- 通过 `agentbus setup` 接入 Codex、Claude Code、Gemini CLI、Antigravity、Cursor、OpenCode、Claude Desktop、Windsurf、Kiro、LM Studio、Cline、DeepSeek Harness (DSH) 与 Hermes Agent，保留各客户端原本的界面；未手测客户端可按预设自动适配 WorkBuddy、CodeBuddy、VS Code、Trae、Qoder、OpenClaw、Zed。
 - 不复制资料正文：登记一个 4 MB 文件，SQLite 只增约 48 KB，任务信封体积 2,025 B。
 
 ## 一条任务的生命周期
@@ -58,20 +58,22 @@
 包暂未发布到 npm。先在源机器执行 `npm pack` 得到 `agentbus-mcp-<version>.tgz`，拷到目标机器后：
 
 ```bash
-npm install -g ./agentbus-mcp-0.3.0.tgz
-agentbus setup --client codex
+npm install -g ./agentbus-mcp-0.4.0.tgz
+agentbus setup
 ```
+
+`agentbus setup` 不带 `--client` 时会配置核心客户端，并对已安装的预设客户端自动适配 + 跑联通测试；只想配某一个时再加 `--client`。全局 `npm install -g` 还会执行一次 `postinstall-adapt.mjs`（只处理预设客户端，不动核心配置；`AGENTBUS_NO_AUTO_ADAPT=1` 可关闭），结果写入 `~/.agentbus/auto-adapt.json`。
 
 不想全局安装时，用项目内前缀：
 
 ```bash
-npm install --prefix ./agentbus-local ./agentbus-mcp-0.3.0.tgz
+npm install --prefix ./agentbus-local ./agentbus-mcp-0.4.0.tgz
 ./agentbus-local/node_modules/.bin/agentbus setup --client codex
 ```
 
 `npx agentbus-mcp ...` 只有在包正式发布到 npm 后才可用；本版本不把它作为主安装路径。
 
-`setup` 会把 MCP 配置写进对应客户端的配置文件（先做带时间戳的备份），并打印改了哪些文件。支持的 id（核心 + 可选）：
+`setup` 会把 MCP 配置写进对应客户端的配置文件（先做带时间戳的备份），并打印改了哪些文件。不带 `--client` 时会自动对检测到的预设客户端（WorkBuddy / CodeBuddy / VS Code / Trae / Qoder / OpenClaw / Zed）尝试适配并跑 MCP 联通测试；`--no-adapt` 可关闭，`agentbus adapt` 可单独执行。支持的 id（核心 + 可选）：
 
 ```
 核心: codex  claude  gemini  antigravity  cursor  opencode  claude-desktop
@@ -86,6 +88,8 @@ agentbus setup --client codex --role conductor --allow-dispatch
 # 反重力当主控：角色写在 Antigravity 的客户端级 MCP 配置里，所有反重力对话共享
 agentbus setup --client antigravity --role conductor --allow-dispatch
 agentbus setup --list   # 看 id、label、format、路径、installed、optional；只读不写盘
+agentbus adapt --list   # 看未手测客户端预设；只读
+agentbus adapt          # 只对预设客户端适配并跑 MCP 联通测试
 agentbus doctor         # 看当前配置状态
 agentbus clients        # 只列 id
 ```
@@ -332,7 +336,7 @@ AGENTBUS_ARCHIVE_ON_DONE=1                          # 单次运行临时开启
 
 > **Hermes 配置路径：** Windows 默认 `%LOCALAPPDATA%\hermes\config.yaml`（不存在时回退 `%USERPROFILE%\.hermes\config.yaml`），macOS/Linux 为 `~/.hermes/config.yaml`，设置 `HERMES_HOME` 时优先使用 `$HERMES_HOME/config.yaml`。
 
-任何说 stdio JSON-RPC 的 MCP 客户端都能用；`setup` 自动化以上 13 家，Trae / Qoder / CodeBuddy / VS Code / Zed / OpenClaw 的手动步骤以及 DSH / Hermes 验证与回滚见 [`docs/CLIENTS.md`](docs/CLIENTS.md)。
+任何说 stdio JSON-RPC 的 MCP 客户端都能用；`setup` 自动化以上 13 家，未手测客户端走预设自动适配，Trae / Qoder / CodeBuddy / VS Code / Zed / OpenClaw 的手动步骤以及 DSH / Hermes 验证与回滚见 [`docs/CLIENTS.md`](docs/CLIENTS.md)。
 
 ---
 

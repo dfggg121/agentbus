@@ -199,6 +199,10 @@ function serverSpec({ root, allowed, bin = 'node', env: extraEnv, role, allowDis
   };
 }
 
+export function buildServerSpec(opts) {
+  return serverSpec(opts);
+}
+
 // ---------- TOML (codex) ----------
 
 function stripTomlComment(line) {
