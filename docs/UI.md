@@ -124,7 +124,7 @@ node bin/bus.js ui --port 0 --no-open --root var/test-root --home var/test-home
 | `POST /api/projects/:id/parts/:key/delete` | 写本地 | 从工作副本删除指定部分卡片并清理依赖引用 |
 | `POST /api/projects/:id/parts/reorder` | 写本地 | 按 `keys[]` 调整工作副本中部分卡片顺序 |
 | `POST /api/projects/:id/auto-route` | 写本地（`dry_run` 只读） | 按 `<root>/project-routing.json` 自动分配 Agent/模型，未命中回退主 Agent；默认保留用户手动覆盖项，显式 `overwrite_manual: true` 才覆盖 |
-| `POST /api/projects/:id/dispatch` | 写本地与任务库 | 为选中或全部 part 创建 `to = part.agent` 的真实任务并默认自动 `dispatch`；已有 `open/claimed` 活跃任务时自动跳过防重 |
+| `POST /api/projects/:id/dispatch` | 写本地与任务库 | 为选中或全部 part 创建 `to = part.agent` 的真实任务并默认自动 `dispatch`；传 `serial: true` 时按卡片顺序串行执行（前一张 `done` 后才派下一张）；已有 `open/claimed` 活跃任务时自动跳过防重 |
 | `GET /api/routing-rules` | 只读 | 读取 `<root>/project-routing.json` 与本机已安装 Agent 列表（损坏时显式报错不覆盖） |
 | `POST / PATCH /api/routing-rules` | 写本地 | 严格校验后备份并原子写入 `<root>/project-routing.json`（保留未知字段、拒绝未安装 Agent 与非法模型） |
 | `GET /api/modules` | 只读 | 返回技术模块清单与本地 `agents.json` 解析后的工作模型归属 |
@@ -134,6 +134,14 @@ node bin/bus.js ui --port 0 --no-open --root var/test-root --home var/test-home
 | `GET /api/client-config` | 只读 | 实时探测本机客户端安装状态、二进制/配置路径、当前角色与模型、配置错误 |
 | `POST /api/client-config/preview` | 只读 | 校验主从/模型配置并执行 `setupClients(..., { dryRun: true })` 预检，返回待改文件、备份计划、变更摘要与错误，不写盘 |
 | `POST /api/client-config/apply` | 写配置 | 预检通过后备份并原子更新 `agents.json`（保留未知字段）与目标客户端 MCP 配置，返回逐项 `changed / backup / warnings / restart_required` |
+| `GET /api/meetings?project_id=...` | 只读 | 列出方案擂台会议（`agentbus/meeting@1`）摘要与评分/答辩/决策状态（不建库、不写盘） |
+| `POST /api/meetings` | 写本地与任务库 | 创建方案会议并把 brief 登记为 `uri + sha256` 指针引用（校验 `proposer≠judge`、`quorum` 与 `rubric`） |
+| `GET /api/meetings/:id` | 只读 | 返回会议详情（支持 `?view=anonymous` 与 `?view=internal` 视图分离，匿名视图绝不暴露作者） |
+| `POST /api/meetings/:id/start` | 写本地与任务库 | 幂等为每个提案者创建隔离目录与独立提案任务（至少 2 个提案者、评委数 ≥ quorum） |
+| `POST /api/meetings/:id/sync` | 写本地与任务库 | 校验已完成提案（`agentbus/proposal@1` 与 `design_ref` SHA-256），转入匿名评审并创建评委任务 |
+| `POST /api/meetings/:id/votes` | 写本地 | 提交评委四维打分（禁止自评、拒绝伪造 `weighted_score`、防重复投票、分差不足触发答辩） |
+| `POST /api/meetings/:id/debate` | 写本地与任务库 | 开展最多一轮基于指针信封的答辩（`start` / `critique` / `summarize` / `timeout`） |
+| `POST /api/meetings/:id/decide` | 写本地与任务库 | 持久化 `agentbus/decision@1`，执行 `human_approved` 门控，批准后生成胜者实现任务并归档记录到 `dev-materials/meetings/<id>/` |
 
 ### 项目拆解契约 (`agentbus/project-plan@1`)
 
@@ -164,6 +172,7 @@ node bin/bus.js ui --port 0 --no-open --root var/test-root --home var/test-home
 - `paths` 必须为相对项目路径（禁止绝对路径、URI 与 `..`）。
 - 卡片在页面中编辑、新增、删除、排序或自动分配时，仅更新 `<root>/projects.json` 中的工作副本，绝不修改原始 `plan.json`。
 - 拆解任务处于 `open / claimed / blocked / failed` 或 Plan 校验失败时，看板会展示真实状态与报错，并提供“重试拆解”与“手动添加卡片”，绝不伪造拆解卡片或把 `open` 标成已派发。
+- **多卡派发顺序**：项目看板的“派发全部/派发选中”默认发送 `serial: true`，按卡片当前顺序串行执行：先启动第一张，等它真实 `done` 后才启动下一张；未轮到的卡片保持 `open` 并标记排队。需要并行时可调用 API 时显式传 `serial: false`。串行队列在 UI 进程内运行；进程退出后未派发卡片仍保持 `open`，可在看板手动继续派发。
 
 ---
 

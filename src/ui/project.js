@@ -9,7 +9,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { PKG_ROOT, openBus, openBusReadOnly } from '../db.js';
-import { dispatchTask, listAdapters } from '../dispatch.js';
+import { dispatchTask, listAdapters, waitForTask } from '../dispatch.js';
 import { listClients } from '../setup.js';
 import { createTask } from '../tasks.js';
 import { detectClientSetup } from './client.js';
@@ -119,19 +119,19 @@ const ALLOWED_COMPLETE_PART_KEYS = new Set(['auto_dispatch', 'wait_s', 'notes'])
 
 const ALLOWED_REORDER_KEYS = new Set(['keys']);
 const ALLOWED_AUTO_ROUTE_KEYS = new Set(['dry_run', 'overwrite_manual']);
-const ALLOWED_DISPATCH_KEYS = new Set(['part_keys', 'all', 'auto_dispatch', 'wait_s']);
+const ALLOWED_DISPATCH_KEYS = new Set(['part_keys', 'all', 'auto_dispatch', 'serial', 'wait_s']);
 const ALLOWED_RETRY_BOOTSTRAP_KEYS = new Set(['main_agent', 'main_model', 'auto_dispatch', 'wait_s', 'force_new']);
 const ALLOWED_SYNC_PLAN_KEYS = new Set(['force', 'auto_dispatch', 'wait_s']);
 
-function makeHttpError(status, code, message) {
+export function makeHttpError(status, code, message) {
   return Object.assign(new Error(message), { status, errorCode: code });
 }
 
-function isPlainObject(v) {
+export function isPlainObject(v) {
   return Boolean(v) && typeof v === 'object' && !Array.isArray(v);
 }
 
-function assertAllowedKeys(obj, allowedSet, context = '请求体') {
+export function assertAllowedKeys(obj, allowedSet, context = '请求体') {
   if (!isPlainObject(obj)) {
     throw makeHttpError(400, 'invalid_body', `${context}必须是 JSON 对象`);
   }
@@ -160,7 +160,7 @@ function backupIfExists(file) {
   return bak;
 }
 
-function writeAtomicJson(file, payload) {
+export function writeAtomicJson(file, payload) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.tmp-${process.pid}-${randomBytes(3).toString('hex')}`;
   try {
@@ -796,7 +796,7 @@ function saveProjectsStore(rootDir, storeState, nextProjects) {
   return { file: storeState.file, backup, updated_at: updatedAt };
 }
 
-function readTasksByIdsReadOnly(config, taskIds) {
+export function readTasksByIdsReadOnly(config, taskIds) {
   const map = new Map();
   const uniqueIds = Array.from(new Set((taskIds || []).filter((id) => typeof id === 'string' && id.trim())));
   if (uniqueIds.length === 0 || !fs.existsSync(config.dbPath)) {
@@ -1822,6 +1822,8 @@ function hydrateProjectRecord(project, { config, pkgRoot, clientById, taskMap, e
             last_message: pTask.last_message,
             dispatch_requested: part.last_dispatch?.dispatch_requested ?? null,
             dispatched: part.last_dispatch?.dispatched ?? null,
+            queued: part.last_dispatch?.queued === true,
+            queue_position: part.last_dispatch?.queue_position ?? null,
             dispatch_error: part.last_dispatch?.dispatch_error || null,
             dispatch_command: partDispatchCmd,
           }
@@ -1917,7 +1919,7 @@ function resolveDefaultMainAgent(setup) {
   return installed[0].id;
 }
 
-function validateAgentAndModel({ agent, model, clientById, knownSet, allowEmptyAgent = false }) {
+export function validateAgentAndModel({ agent, model, clientById, knownSet, allowEmptyAgent = false }) {
   const cleanAgent = typeof agent === 'string' ? agent.trim() : '';
   const cleanModel = typeof model === 'string' ? model.trim() : '';
 
@@ -2142,6 +2144,70 @@ async function runDispatchWithGuard(bus, dispatchFn, { taskId, pkgRoot, waitS, c
     explicitWaitS,
     env,
   });
+}
+
+// Serial project dispatch: the first task is started by the request, then the
+// remaining tasks are started only after the previous one reaches `done`.
+// This queue is in-memory; if the UI process exits, queued tasks stay `open`
+// and remain visible/retryable on the project board.
+const serialDispatchQueues = new Map();
+
+function startSerialDispatchQueue({
+  config,
+  projectId,
+  pkgRoot,
+  waitS,
+  entries,
+  env = process.env,
+  dispatchFn = dispatchTask,
+}) {
+  if (!Array.isArray(entries) || entries.length === 0) return { started: false };
+  if (serialDispatchQueues.has(projectId)) return { started: false, reason: 'already_running' };
+
+  const queue = (async () => {
+    const bus = openBus({ config });
+    try {
+      // The first entry was dispatched by the originating request. Wait for
+      // its real terminal state before starting the next card.
+      const first = entries[0];
+      if (first.initialState !== 'done') {
+        if (dispatchFn !== dispatchTask) return;
+        const waitedFirst = await waitForTask(bus, first.taskId, 3600, 500);
+        if (waitedFirst.state !== 'done') return;
+      }
+
+      for (const entry of entries.slice(1)) {
+        if (!isAgentDispatchable(entry.to, env)) return;
+        const dispatched = dispatchFn === dispatchTask
+          ? await dispatchTask(bus, {
+              id: entry.taskId,
+              cwd: entry.cwd || pkgRoot,
+              wait_s: waitS,
+            })
+          : await dispatchFn(bus, {
+              id: entry.taskId,
+              cwd: entry.cwd || pkgRoot,
+              wait_s: waitS,
+            });
+        if (dispatched.state === 'done') continue;
+        if (dispatched.state === 'failed') return;
+        if (dispatched.skipped || dispatched.dispatched === false) return;
+        if (dispatchFn !== dispatchTask) return;
+        const waited = await waitForTask(bus, entry.taskId, 3600, 500);
+        if (waited.state !== 'done') return;
+      }
+    } catch (err) {
+      // Keep the remaining tasks open for manual retry; never silently mark them done.
+      console.error(`[agentbus] 串行派发队列 ${projectId} 中止: ${err?.message || err}`);
+    } finally {
+      try { bus.close(); } catch {}
+      serialDispatchQueues.delete(projectId);
+    }
+  })();
+
+  serialDispatchQueues.set(projectId, queue);
+  queue.catch(() => {});
+  return { started: true, remaining: entries.length - 1 };
 }
 
 export function listProjectsHydrated({
@@ -3688,6 +3754,7 @@ export async function dispatchProjectParts({
   }
 
   const autoDispatch = body.auto_dispatch !== false;
+  const serial = body.serial === true;
   const explicitWaitS = body.wait_s !== undefined && body.wait_s !== null && Number.isFinite(Number(body.wait_s));
   const waitS = explicitWaitS
     ? Math.max(1, Math.min(600, Number(body.wait_s)))
@@ -3721,6 +3788,17 @@ export async function dispatchProjectParts({
   let dispatchedCount = 0;
   let skippedCount = 0;
   let errorCount = 0;
+  let queuedCount = 0;
+  let serialFirstDispatched = false;
+  let serialQueueInfo = null;
+  const serialEntries = [];
+  const serialFirstKey = serial && autoDispatch
+    ? (targetParts.find((part) => {
+        const existing = part.task_id ? taskMap.get(part.task_id) : null;
+        if (existing && (existing.state === 'open' || existing.state === 'claimed')) return false;
+        return isAgentDispatchable(part.agent, env);
+      })?.key || null)
+    : null;
 
   try {
     for (const part of targetParts) {
@@ -3779,18 +3857,62 @@ export async function dispatchProjectParts({
         idempotency_key: `proj:${nextProject.id}:part:${part.key}:r${round}`,
       });
       createdCount += 1;
+      const serialCapable = isAgentDispatchable(validatedTarget.agent, env);
+      const isSerialFirst = serial && autoDispatch && part.key === serialFirstKey;
+      const isSerialQueued = serial && autoDispatch && serialFirstKey !== null && !isSerialFirst && serialCapable;
+      const isSerialUnavailable = serial && autoDispatch && !serialCapable;
+      const dispatchCwd = nextProject.workspace_dir || pkgRoot;
 
-      let disp = { dispatchResult: null, dispatchError: null, dispatched: false };
+      let disp = { dispatchResult: null, dispatchError: null, dispatched: false, queued: false };
       if (autoDispatch) {
-        disp = await runDispatchWithGuard(bus, dispatchFn, {
-          taskId: created.id,
-          pkgRoot: nextProject.workspace_dir || pkgRoot,
-          waitS,
-          config,
-          toAgent: validatedTarget.agent,
-          explicitWaitS,
-          env,
-        });
+        if (isSerialUnavailable) {
+          disp = {
+            dispatchResult: null,
+            dispatchError: `没有 ${validatedTarget.agent} 的调用适配器，无法进入串行队列`,
+            dispatched: false,
+            queued: false,
+          };
+        } else if (isSerialQueued) {
+          queuedCount += 1;
+          disp = {
+            dispatchResult: {
+              id: created.id,
+              to: validatedTarget.agent,
+              state: 'queued',
+              dispatched: false,
+              queued: true,
+            },
+            dispatchError: null,
+            dispatched: false,
+            queued: true,
+          };
+          serialEntries.push({
+            taskId: created.id,
+            to: validatedTarget.agent,
+            cwd: dispatchCwd,
+            queuePosition: queuedCount,
+          });
+        } else {
+          disp = await runDispatchWithGuard(bus, dispatchFn, {
+            taskId: created.id,
+            pkgRoot: dispatchCwd,
+            waitS,
+            config,
+            toAgent: validatedTarget.agent,
+            explicitWaitS,
+            env,
+          });
+          if (isSerialFirst && disp.dispatched) {
+            serialFirstDispatched = true;
+            serialEntries.push({
+              taskId: created.id,
+              to: validatedTarget.agent,
+              cwd: dispatchCwd,
+              queuePosition: 0,
+              initialState: disp.dispatchResult?.state || created.state,
+            });
+          }
+        }
       }
       if (disp.dispatched) dispatchedCount += 1;
       if (disp.dispatchError) errorCount += 1;
@@ -3807,6 +3929,7 @@ export async function dispatchProjectParts({
           created_at: now,
           dispatch_requested: autoDispatch,
           dispatched: disp.dispatched,
+          queued: disp.queued === true,
           dispatch_error: disp.dispatchError,
         },
       ];
@@ -3816,6 +3939,8 @@ export async function dispatchProjectParts({
         to: validatedTarget.agent,
         dispatch_requested: autoDispatch,
         dispatched: disp.dispatched,
+        queued: disp.queued === true,
+        queue_position: disp.queued ? queuedCount : null,
         dispatch_error: disp.dispatchError,
       };
 
@@ -3834,6 +3959,8 @@ export async function dispatchProjectParts({
         dedup: created.dedup,
         dispatch_requested: autoDispatch,
         dispatched: disp.dispatched,
+        queued: disp.queued === true,
+        queue_position: disp.queued ? queuedCount : null,
         dispatch_command: cmdLine,
         ...(disp.dispatchError ? { dispatch_error: disp.dispatchError } : {}),
         ...(disp.dispatchResult ? { dispatch_result: disp.dispatchResult } : {}),
@@ -3849,17 +3976,32 @@ export async function dispatchProjectParts({
   nextProjects[idx] = nextProject;
   saveProjectsStore(config.rootDir, store, nextProjects);
 
+  if (serial && autoDispatch && serialFirstDispatched && serialEntries.length > 1) {
+    serialQueueInfo = startSerialDispatchQueue({
+      config,
+      projectId: nextProject.id,
+      pkgRoot,
+      waitS,
+      entries: serialEntries,
+      env,
+      dispatchFn,
+    });
+  }
+
   const taskMapAfter = readTasksByIdsReadOnly(config, collectProjectTaskIds([nextProject]));
   const hydrated = hydrateProjectRecord(nextProject, { config, pkgRoot, clientById, taskMap: taskMapAfter, env });
 
   return {
     ok: errorCount === 0,
     project_id: nextProject.id,
+    serial: Boolean(serial && autoDispatch),
+    serial_queue: serialQueueInfo,
     results,
     summary: {
       requested: targetParts.length,
       created: createdCount,
       dispatched: dispatchedCount,
+      queued: queuedCount,
       skipped: skippedCount,
       errors: errorCount,
     },

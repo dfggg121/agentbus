@@ -2701,11 +2701,12 @@
             const lines = (rep.results || []).map((r) => {
               if (r.skipped) return `<li><span class="mono">${escapeHtml(r.part_key)}</span> · 跳过 (${escapeHtml(r.message || r.reason)})</li>`;
               if (!r.ok && !r.task_id) return `<li class="st-danger"><span class="mono">${escapeHtml(r.part_key)}</span> · 失败 (${escapeHtml(r.error)})</li>`;
-              return `<li><span class="mono">${escapeHtml(r.part_key)}</span> -> <span class="mono">${escapeHtml(r.task_id)}</span> (${escapeHtml(r.to)} · ${escapeHtml(r.state)})${r.dispatch_error ? ` · <span class="st-danger">${escapeHtml(r.dispatch_error)}</span>` : ''}</li>`;
+              return `<li><span class="mono">${escapeHtml(r.part_key)}</span> -> <span class="mono">${escapeHtml(r.task_id)}</span> (${escapeHtml(r.to)} · ${escapeHtml(r.state)})${r.queued ? ' · 排队等待前序完成' : ''}${r.dispatch_error ? ` · <span class="st-danger">${escapeHtml(r.dispatch_error)}</span>` : ''}</li>`;
             }).join('');
             return `
               <div class="notice ${rep.ok ? 'is-ok' : 'is-warn'}">
-                <strong>派发结果：</strong>新建 ${sum.created || 0} · 派发 ${sum.dispatched || 0} · 跳过 ${sum.skipped || 0} · 异常 ${sum.errors || 0}
+                <strong>派发结果：</strong>新建 ${sum.created || 0} · 派发 ${sum.dispatched || 0} · 排队 ${sum.queued || 0} · 跳过 ${sum.skipped || 0} · 异常 ${sum.errors || 0}
+                ${rep.serial ? '<div class="field-hint">按卡片顺序串行派发：前一张完成后自动派发下一张。</div>' : ''}
                 <ul class="notice-list">${lines}</ul>
               </div>
             `;
@@ -2827,6 +2828,7 @@
                     <span>任务 <span class="mono">${escapeHtml(pt.id)}</span></span>
                     <span>接收方 <strong>${escapeHtml(pt.to)}</strong></span>
                     <span>状态 ${taskStateHtml(pt.state, pt.blocked)}</span>
+                    ${pt.queued && pt.state === 'open' ? `<span class="st-accent">排队等待前序完成${pt.queue_position ? `（第 ${escapeHtml(String(pt.queue_position))} 位）` : ''}</span>` : ''}
                     ${part.task_history_count > 1 ? `<span class="st-muted num">历史 ${part.task_history_count} 次</span>` : ''}
                     ${pt.dispatch_error ? `<span class="st-danger">${escapeHtml(pt.dispatch_error)}</span>` : ''}
                   </div>
@@ -4503,9 +4505,12 @@
         if (act === 'dispatch-selected' || act === 'dispatch-all') {
           projBtn.disabled = true;
           try {
+            const orderedKeys = (proj.parts || [])
+              .map((x) => x.key)
+              .filter((key) => state.selectedPartKeys.has(key));
             const body = act === 'dispatch-all'
-              ? { all: true, auto_dispatch: true }
-              : { part_keys: Array.from(state.selectedPartKeys), auto_dispatch: true };
+              ? { all: true, auto_dispatch: true, serial: true }
+              : { part_keys: orderedKeys, auto_dispatch: true, serial: true };
             const resp = await fetch(`/api/projects/${encodeURIComponent(proj.id)}/dispatch`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },

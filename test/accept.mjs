@@ -4612,6 +4612,7 @@ async function main() {
 
     const pbDispatchLog = [];
     let pbDispatchShouldFail = false;
+    let pbDispatchSerialDone = false;
     const prevAllowed120 = process.env.AGENTBUS_ALLOWED_ROOTS;
     const prevAgentsCfg120 = process.env.AGENTBUS_AGENTS_CONFIG;
     process.env.AGENTBUS_ALLOWED_ROOTS = pbAllowed;
@@ -4630,7 +4631,7 @@ async function main() {
         if (pbDispatchShouldFail) {
           throw new Error('simulated adapter offline');
         }
-        return { id: opts.id, to: shown?.to, state: shown?.state || 'open', dispatched: true };
+        return { id: opts.id, to: shown?.to, state: pbDispatchSerialDone ? 'done' : (shown?.state || 'open'), dispatched: true };
       },
     });
 
@@ -4948,6 +4949,50 @@ async function main() {
         modCond123.json?.to === 'codex' &&
         modCond123.json?.target_agent === 'antigravity',
         `fe=${feDisp123?.to} comm=${commDisp123?.to} dup=${feDup123?.reason} modDir=${modDirect123.json?.to} modCond=${modCond123.json?.to}/${modCond123.json?.target_agent}`);
+
+      // 156. 串行派发：多张卡按卡片顺序排他，前一张 done 后才派下一张。
+      // 用 mock dispatch 返回 done，验证请求只启动第一张，后台队列按顺序补齐其余卡片。
+      const serialProj156 = await pbFetch('/api/projects', 'POST', {
+        name: '串行派发测试',
+        goal: '验证项目卡片按顺序派发，不并发抢占同一执行端。',
+        main_agent: 'antigravity',
+        auto_dispatch: false,
+        auto_enrich: false,
+      });
+      const serialProjectId156 = serialProj156.json?.project?.id;
+      for (const [key, agent] of [['one', 'antigravity'], ['two', 'codex'], ['three', 'antigravity']]) {
+        await pbFetch(`/api/projects/${serialProjectId156}/parts`, 'POST', {
+          key,
+          title: `串行 ${key}`,
+          goal: `执行 ${key}`,
+          agent,
+          auto_dispatch: false,
+          auto_enrich: false,
+        });
+      }
+      pbDispatchSerialDone = true;
+      const serialLogStart156 = pbDispatchLog.length;
+      const serialDisp156 = await pbFetch(`/api/projects/${serialProjectId156}/dispatch`, 'POST', {
+        all: true,
+        auto_dispatch: true,
+        serial: true,
+      });
+      const serialTaskIds156 = (serialDisp156.json?.results || []).map((r) => r.task_id);
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const serialCalls156 = pbDispatchLog.slice(serialLogStart156).map((x) => x.id);
+      pbDispatchSerialDone = false;
+
+      assertCase(156, '串行派发：请求只启动第一张，后续卡片按卡片顺序在前一张 done 后才派发，不并发抢占',
+        serialProj156.status === 201 &&
+        serialDisp156.status === 200 &&
+        serialDisp156.json?.serial === true &&
+        serialDisp156.json?.summary?.created === 3 &&
+        serialDisp156.json?.summary?.dispatched === 1 &&
+        serialDisp156.json?.summary?.queued === 2 &&
+        serialTaskIds156.length === 3 &&
+        serialCalls156.length === 3 &&
+        serialCalls156.join(',') === serialTaskIds156.join(','),
+        `status=${serialDisp156.status} summary=${JSON.stringify(serialDisp156.json?.summary)} calls=${serialCalls156.length}/${serialTaskIds156.length}`);
     } finally {
       await srvPb.close();
       if (prevAllowed120 === undefined) delete process.env.AGENTBUS_ALLOWED_ROOTS;
