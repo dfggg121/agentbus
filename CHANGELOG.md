@@ -2,9 +2,10 @@
 
 All notable changes to this project are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [0.4.1] — 2026-11-28
 
 ### Added
+- Codex Desktop thread linking: prefer the Desktop-bundled Codex CLI on Windows and attach finished `codex exec` threads to the Desktop project (`src/agents.js`, `src/dispatch.js`, `src/codex-app.js`).
 - Project board serial dispatch: `POST /api/projects/:id/dispatch` accepts `serial: true`; the UI uses it for “派发全部/派发选中”. Only the first dispatchable card is started, and the remaining cards are queued in card order and started only after the previous task reaches `done`. The response reports `summary.queued` and each queued result has `state: "queued"` plus `queue_position`; parallel dispatch remains available with `serial: false`.
 
 ### Tests

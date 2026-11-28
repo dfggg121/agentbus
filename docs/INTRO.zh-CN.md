@@ -55,7 +55,7 @@
 需要 **Node.js ≥ 22.13**（或 `23.4+`，直接调用内置 `node:sqlite`，零第三方运行时依赖）。当前版本通过离线 tarball 分发（暂未发布到 npm）：
 
 ```bash
-npm install -g ./agentbus-mcp-0.4.0.tgz
+npm install -g ./agentbus-mcp-0.4.1.tgz
 agentbus setup
 ```
 
